@@ -1,4 +1,5 @@
 import json
+import threading
 from email.utils import getaddresses
 from typing import Annotated, Any
 
@@ -32,6 +33,7 @@ from app.agent.tools import (
     propose_cancel_calendar_event,
     propose_move_calendar_event,
     propose_trash_email,
+    run_skill_script,
     search_gmail,
     send_gmail_reply,
     send_new_email,
@@ -68,6 +70,7 @@ AGENT_TOOLS = [
     list_tasks,
     create_task,
     complete_task,
+    run_skill_script,
 ]
 TOOLS_BY_NAME = {agent_tool.name: agent_tool for agent_tool in AGENT_TOOLS}
 
@@ -97,6 +100,25 @@ PROPOSAL_TOOLS = {
 # Proposals whose new time is held locally until the owner decides (see app.calendar.holds).
 SLOT_HOLD_TYPES = {"book_meeting", "move_event"}
 
+# Owner mode: emails and Google Docs/Sheets writes wait for one tap too (developer
+# decision); the tool call becomes an approval request with the exact change.
+OWNER_GATED_TOOLS = {
+    "send_gmail_reply",
+    "send_new_email",
+    "create_document",
+    "append_to_document",
+    "create_spreadsheet",
+    "append_sheet_row",
+}
+
+# Tools that run directly when allowed and otherwise return {"proposal": ...}
+# (an owner-written skill script runs only once its exact content is approved).
+CONDITIONAL_PROPOSAL_TOOLS = {"run_skill_script"}
+
+# Supervisor workers run in parallel threads: checking a slot against the holds and
+# recording a new hold must happen as one step.
+_PROPOSAL_LOCK = threading.Lock()
+
 # Tools that must stay inside the thread being handled.
 THREAD_SCOPED_TOOLS = {"send_gmail_reply", "create_reply_draft"}
 
@@ -121,9 +143,13 @@ def _is_email_mode(state: "AgentState") -> bool:
 
 
 def _allowed_tools(state: "AgentState") -> list:
+    tools = AGENT_TOOLS
     if _is_email_mode(state):
-        return [agent_tool for agent_tool in AGENT_TOOLS if agent_tool.name in EMAIL_MODE_TOOLS]
-    return AGENT_TOOLS
+        tools = [agent_tool for agent_tool in tools if agent_tool.name in EMAIL_MODE_TOOLS]
+    # A supervisor worker only gets the tools its task was given.
+    if state.get("tools_allowed") is not None:
+        tools = [agent_tool for agent_tool in tools if agent_tool.name in set(state["tools_allowed"])]
+    return tools
 
 
 class AgentState(TypedDict, total=False):
@@ -140,6 +166,10 @@ class AgentState(TypedDict, total=False):
     participants: list[str]
     dry_run: bool
 
+    # Set by the supervisor for a worker subagent (owner mode, restricted tools).
+    tools_allowed: list[str]
+    worker: bool
+
 
 def call_model(state: AgentState):
     """Ask the LLM what to do next."""
@@ -148,7 +178,7 @@ def call_model(state: AgentState):
     llm_with_tools = llm.bind_tools(_allowed_tools(state))
 
     # The system prompt is not stored in state so it is always current.
-    mode = "email" if _is_email_mode(state) else "owner"
+    mode = "email" if _is_email_mode(state) else ("worker" if state.get("worker") else "owner")
     messages = [SystemMessage(content=build_system_prompt(mode))] + list(state["messages"])
     response = invoke_llm(llm_with_tools, messages)
     return {"messages": [response]}
@@ -197,6 +227,9 @@ def _scope_violation(tool_name: str, args: dict[str, Any], state: AgentState) ->
 
     if target_thread_id and tool_name not in EMAIL_MODE_TOOLS:
         return f"Refused: {tool_name} is not available while handling an incoming email."
+
+    if state.get("tools_allowed") is not None and tool_name not in state["tools_allowed"]:
+        return f"Refused: {tool_name} is not one of the tools given for this task."
 
     if target_thread_id and tool_name in THREAD_SCOPED_TOOLS and args.get("thread_id") != target_thread_id:
         return (
@@ -289,6 +322,82 @@ def _reply_proposal(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """
+    Validate an owner-mode email or Docs/Sheets write and describe it for approval.
+
+    The approval card shows exactly what will be sent or written (the state diff);
+    nothing happens until the owner taps Approve.
+    """
+
+    if tool_name == "send_gmail_reply":
+        from app.agent.tools import check_reply_target
+        from app.gmail.tools import get_thread_details
+
+        thread_id, message_id, to = args.get("thread_id", ""), args.get("message_id", ""), args.get("to", "")
+        check_reply_target(get_thread_details(thread_id), thread_id, message_id, to)
+        proposal = _reply_proposal(args)
+        proposal["reply"] = {"thread_id": thread_id, "message_id": message_id, "to": to, "body": proposal.pop("reply_body")}
+        proposal.pop("reason", None)
+        return proposal
+
+    if tool_name == "send_new_email":
+        recipients = [address for _, address in getaddresses([args.get("to") or ""]) if address]
+        invalid = [address for address in recipients if "@" not in address.strip("@")]
+        if not recipients or invalid:
+            raise ValueError(f"No valid recipient address was given{': ' + ', '.join(invalid) if invalid else ''}.")
+        proposal = _reply_proposal(args)  # validates the body and the attachments
+        return {
+            "type": "send_email",
+            "to": ", ".join(recipients),
+            "subject": (args.get("subject") or "").strip(),
+            "body": proposal["reply_body"],
+            "attachments": proposal.get("attachments", []),
+        }
+
+    if tool_name == "create_document":
+        if not (args.get("title") or "").strip():
+            raise ValueError("The document needs a title.")
+        return {"type": "create_document", "title": args["title"].strip(), "content": args.get("content") or ""}
+
+    if tool_name == "create_spreadsheet":
+        if not (args.get("title") or "").strip():
+            raise ValueError("The spreadsheet needs a title.")
+        return {"type": "create_spreadsheet", "title": args["title"].strip(), "headers": list(args.get("headers") or [])}
+
+    if tool_name == "append_to_document":
+        from app.workspace import docs
+
+        if not (args.get("text") or "").strip():
+            raise ValueError("Nothing to append.")
+        document = docs.read_document(args.get("document", ""))  # the document must exist and be readable
+        return {
+            "type": "append_document",
+            "document": args["document"],
+            "document_title": document.get("title", ""),
+            "text": args["text"],
+        }
+
+    if tool_name == "append_sheet_row":
+        from app.workspace import sheets
+
+        values = [str(value) for value in args.get("values") or []]
+        if not values:
+            raise ValueError("The row has no values.")
+        sheet = sheets.read_sheet(args.get("spreadsheet", ""), args.get("tab", ""))
+        header = sheet["rows"][0] if sheet.get("rows") else []
+        return {
+            "type": "append_sheet_row",
+            "document": args["spreadsheet"],
+            "document_title": sheet.get("title", ""),
+            "tab": sheet.get("tab", ""),
+            "header": header,
+            "values": values,
+        }
+
+    raise ValueError(f"{tool_name} cannot be proposed.")
+
+
 def _record_proposal(
     proposal: dict[str, Any],
     state: AgentState,
@@ -323,46 +432,50 @@ def _record_proposal(
                 "body": reply_body,
             }
 
-    # A slot already proposed for another email is held until that approval is decided.
-    if kind in SLOT_HOLD_TYPES:
-        held = overlapping_holds(
-            parse_ist(proposal["new_start"]), parse_ist(proposal["new_end"]),
-            ignore_message_id=state.get("target_message_id"), store=store,
-        )
-        if held:
-            refusal = (
-                f"Refused: that time is held for '{held[0]['label']}' (approval request "
-                f"#{held[0]['approval_id']}, waiting for the owner). Pick another free slot "
-                "from find_calendar_availability."
-            )
-            failures.append(f"{kind}: {refusal}")
-            return refusal
-
     summary = describe({"type": kind, "payload": proposal})
 
-    if dry_run:
-        actions.append({"type": kind, "status": "dry_run", "args": proposal})
-        return f"DRY RUN: would ask the owner to approve:\n{summary}"
+    with _PROPOSAL_LOCK:
+        # A slot already proposed for another email is held until that approval is decided.
+        if kind in SLOT_HOLD_TYPES:
+            held = overlapping_holds(
+                parse_ist(proposal["new_start"]), parse_ist(proposal["new_end"]),
+                ignore_message_id=state.get("target_message_id"), store=store,
+            )
+            if held:
+                refusal = (
+                    f"Refused: that time is held for '{held[0]['label']}' (approval request "
+                    f"#{held[0]['approval_id']}, waiting for the owner). Pick another free slot "
+                    "from find_calendar_availability."
+                )
+                failures.append(f"{kind}: {refusal}")
+                return refusal
 
-    approval_id = store.add_pending_approval(
-        kind,
-        summary,
-        proposal,
-        message_id=state.get("target_message_id"),
-        thread_id=state.get("target_thread_id"),
-    )
-    if kind in SLOT_HOLD_TYPES:
-        store.add_slot_hold(
-            approval_id, proposal["new_start"], proposal["new_end"],
-            label=proposal.get("title", ""), message_id=state.get("target_message_id"),
+        if dry_run:
+            actions.append({"type": kind, "status": "dry_run", "args": proposal})
+            return f"DRY RUN: would ask the owner to approve:\n{summary}"
+
+        approval_id = store.add_pending_approval(
+            kind,
+            summary,
+            proposal,
+            message_id=state.get("target_message_id"),
+            thread_id=state.get("target_thread_id"),
         )
+        if kind in SLOT_HOLD_TYPES:
+            store.add_slot_hold(
+                approval_id, proposal["new_start"], proposal["new_end"],
+                label=proposal.get("title", ""), message_id=state.get("target_message_id"),
+            )
 
     actions.append({"type": kind, "status": "proposed", "approval_id": approval_id, "args": proposal})
-    pending_approvals.append({"id": approval_id, "type": kind, "holds_reply": bool(proposal.get("reply"))})
+    # In email mode a held reply is THE reply for that email; owner-mode replies are independent.
+    holds_reply = bool(proposal.get("reply")) and _is_email_mode(state)
+    pending_approvals.append({"id": approval_id, "type": kind, "holds_reply": holds_reply})
 
     return (
         f"Approval request #{approval_id} sent to the owner. NOTHING has changed yet. "
-        + ("Do not send a reply now: your reply_body is sent automatically after approval. " if proposal.get("reply") else "")
+        + ("Do not send a reply now: your reply_body is sent automatically after approval. " if holds_reply else "")
+        + ("Do not call the tool again for this change. " if not _is_email_mode(state) else "")
         + "Say in your summary that this is waiting for the owner's approval."
     )
 
@@ -427,10 +540,12 @@ def execute_tools(state: AgentState):
             tool_results.append(_tool_message(refusal, tool_call))
             continue
 
-        # In email mode, every reply waits for the owner's approval.
-        if _is_email_mode(state) and tool_name == "send_gmail_reply":
+        # In email mode, every reply waits for the owner's approval; in owner mode,
+        # emails and Docs/Sheets writes do.
+        gated = tool_name == "send_gmail_reply" if _is_email_mode(state) else tool_name in OWNER_GATED_TOOLS
+        if gated:
             try:
-                proposal = _reply_proposal(args)
+                proposal = _reply_proposal(args) if _is_email_mode(state) else _owner_write_proposal(tool_name, args)
             except Exception as exc:
                 failures.append(f"{tool_name}: {exc}")
                 tool_results.append(_tool_message(f"Tool failed: {exc}", tool_call))
@@ -473,7 +588,7 @@ def execute_tools(state: AgentState):
             tool_results.append(_tool_message(message, tool_call))
             continue
 
-        if tool_name in PROPOSAL_TOOLS:
+        if tool_name in PROPOSAL_TOOLS or (tool_name in CONDITIONAL_PROPOSAL_TOOLS and isinstance(result, dict) and result.get("proposal")):
             message = _record_proposal(result["proposal"], state, store, dry_run, actions, pending_approvals, failures)
             tool_results.append(_tool_message(message, tool_call))
             continue

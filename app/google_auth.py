@@ -11,13 +11,14 @@ from pathlib import Path
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from app.google_api import refresh_credentials
+from app.google_api import credentials_locked, refresh_credentials
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CREDENTIALS_PATH = PROJECT_ROOT / "credentials.json"
 
 
+@credentials_locked
 def load_credentials(token_path: Path, scopes: list[str], *, allow_browser_login: bool, login_command: str) -> Credentials:
     """
     Load, refresh, or (if allowed) create OAuth credentials for the given scopes.

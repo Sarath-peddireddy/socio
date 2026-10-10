@@ -1,11 +1,10 @@
 # Socio
 
 **Your inbox and calendar, handled.** Socio is an AI assistant that reads
-your Gmail, decides what needs a response, and takes care of it: scheduling
-meetings, answering requests, sending the documents people ask for. Routine
-replies go out on their own; anything with a real blast radius (booking,
-moving, or cancelling a meeting, sending a file, deleting email) waits for
-one tap from you. You talk to it from Telegram.
+your Gmail, decides what needs a response, and prepares it: scheduling
+meetings, answering requests, sending the documents people ask for. Nothing
+reaches anyone else, and none of your files changes, until you tap once to
+approve it. It learns from those taps. You talk to it from Telegram.
 
 > Status: early access. Run it against a test Google account while you
 > evaluate it.
@@ -33,8 +32,28 @@ And from Telegram, you can just ask:
 - *"write a cover letter for Acme in a doc"*
 - *"remind me to send the invoice on Friday"*
 
+Several things in one message ("send my resume to X, add a row to my sheet,
+and remind me Friday") are split into separate tasks that run in parallel,
+and you get one combined report.
+
 When something needs you (a draft to review, a change to approve), Socio
 also adds it to **Google Tasks**, and completes it once you've acted.
+
+## It learns from you
+
+- **Preferences.** Every Approve, Reject, or Edit in Gmail is remembered.
+  After a Reject, Socio asks *why?*; your answer ("I never take calls before
+  noon") becomes a rule it recalls the next time it's relevant. Teach it
+  directly with `/remember`, see what it knows with `/memories`, and remove
+  something with `/forget`. Memories are stored on your machine and embedded
+  with a small local model, so they never leave it.
+- **Skills.** When a multi-step instruction works and looks like something
+  you'll ask again (a weekly sheet update, a regular vendor's invoice), Socio
+  saves the plan as a recipe in `skills/` and reuses it next time. Recipes are
+  plain Markdown, contain no code, and go through the same approvals. You can
+  also add your own Python scripts there; each one runs only after you've
+  approved its exact content. See [`skills/README.md`](skills/README.md).
+- Memory only informs Socio. It never skips an approval.
 
 ## Safety model
 
@@ -42,12 +61,13 @@ also adds it to **Google Tasks**, and completes it once you've acted.
 
   | Action | What Socio does |
   |---|---|
-  | Reply to an incoming email (with or without a file) | Asks you (*Approve & Send* / *Edit in Gmail* / *Reject*); *Edit in Gmail* saves it as a draft for you to change and send |
+  | Any email: replies to incoming email, and emails you ask for in Telegram | Asks you (*Approve & Send* / *Edit in Gmail* / *Reject*); *Edit in Gmail* saves it as a draft for you to change and send |
   | Booking a new meeting | Asks you; the booking and its confirmation reply go out together |
   | Moving or cancelling a meeting | Asks you; then updates the event and replies |
   | Moving email to Trash | Asks you (only when you asked for it) |
-  | Emails you ask for in Telegram ("send my resume to …") | Sends it (you asked) |
-  | Docs/Sheets appends, Tasks | Does it (your own files, append-only) |
+  | Creating or adding to Google Docs / Sheets | Asks you, showing exactly what will be added |
+  | Running one of your skill scripts for the first time (or after it changed) | Asks you, showing its code |
+  | Google Tasks | Does it |
 
   Approved actions are re-validated at the moment you tap (for example, the
   slot must still be free). Trash is never a permanent delete (Gmail keeps it
@@ -65,7 +85,8 @@ also adds it to **Google Tasks**, and completes it once you've acted.
   own, never ones others shared with you). It never emails a file to anyone
   without your approval.
 - **Append-only edits.** Socio can read Docs and Sheets and *add* to them
-  (append text, add rows) but never deletes or overwrites anything. Sheet
+  (append text, add rows, after your approval) but never deletes or
+  overwrites anything. Sheet
   values are written as plain text, so content from an email can never
   become a formula. Docs, Sheets, and Tasks are only available on your
   instructions, never while handling an incoming email. Files Socio creates
@@ -74,6 +95,10 @@ also adds it to **Google Tasks**, and completes it once you've acted.
   blindly; every outcome is recorded so a restart never repeats work. Only
   one inbox run happens at a time, even if you run the CLI while the bot is
   running.
+- **Parallel tasks stay fenced.** Each task of a split instruction runs with
+  only the tools it needs and none of your conversation, and its changes go
+  through the same approvals. If two tasks propose the same change, you get
+  one card.
 - **Owner-only bot.** The Telegram bot only responds to your chat id.
 
 ## Quick start
@@ -95,6 +120,10 @@ python -m app.main --google-login # one-time sign-in for Drive, Docs, Sheets, Ta
 python -m app.telegram_bot        # start the assistant
 ```
 
+The first time Socio needs its memory, it downloads a small embedding model
+(snowflake-arctic-embed-s, about 130 MB) into `.cache/fastembed`. After that
+everything runs offline on your CPU.
+
 ### Telegram setup
 
 1. In Telegram, message **@BotFather** → `/newbot` → copy the token into
@@ -104,7 +133,9 @@ python -m app.telegram_bot        # start the assistant
 3. Put it in `.env` as `TELEGRAM_OWNER_CHAT_ID` and restart the bot.
 
 Bot commands: `/run` (check inbox now), `/dryrun`, `/status`, `/approvals`,
-`/new`, `/help`. The inbox is also checked every `AGENT_POLL_MINUTES`.
+`/new`, `/remember TEXT`, `/memories`, `/forget ID`, `/skills`,
+`/forget_skill NAME`, `/help`. The inbox is also checked every
+`AGENT_POLL_MINUTES`.
 
 ## Configuration
 
@@ -121,6 +152,11 @@ See [`.env.example`](.env.example).
 | `TELEGRAM_OWNER_CHAT_ID` | The only chat allowed to use the bot |
 | `AGENT_POLL_MINUTES` | Inbox check interval for the bot (0 = off) |
 | `AGENT_INBOX_QUERY` | Which emails to process (default: inbox, last 7 days, not from you) |
+| `AGENT_MEMORY` | Learn from your decisions and recall them (default on; `0` = off) |
+| `AGENT_MAX_WORKERS` | Tasks of one instruction run in parallel (default 3) |
+| `AGENT_LLM_RPM` | Gemini requests per minute, shared by all tasks (default 14; free tier is 15) |
+| `AGENT_SKILLS_DIR` | Where skills live (default `./skills`) |
+| `AGENT_MODEL_CACHE` | Where the embedding model is stored (default `./.cache/fastembed`) |
 
 ## Command line
 
@@ -131,7 +167,11 @@ python -m app.main --status                # outcomes, open approvals, recent fa
 python -m app.main --ask "trash the Swiggy email"   # same as typing in Telegram
 python -m app.main --approve 3             # approve request #3
 python -m app.main --reject 3              # reject request #3 (nothing changes)
-python -m app.main --draft 3               # move held reply #3 to Gmail Drafts (not sent)
+python -m app.main --draft 3               # move held email #3 to Gmail Drafts (not sent)
+python -m app.main --remember "no calls before noon"   # teach a preference
+python -m app.main --memories              # what Socio has learned
+python -m app.main --forget 7              # forget memory #7
+python -m app.main --skills                # saved skills
 ```
 
 ## How it works
@@ -147,8 +187,14 @@ Schedule  ─┘                                         │
   action is needed, let the agent act, verify the result, record it.
 - **Decision**: Gmail metadata rules first (spam, promotions, mailing lists,
   auto-replies, no-reply senders) so obvious cases never reach the LLM.
-- **Agent**: a single LangGraph tool-calling agent (Gemini) with per-intent
+- **Agent**: a LangGraph tool-calling agent (Gemini) with per-intent
   playbooks for scheduling, information requests, documents, and follow-ups.
+- **Supervisor**: splits a multi-part instruction into a task graph, runs
+  independent tasks in parallel worker agents (each with a clean context and
+  only its tools), and merges their results into one report.
+- **Memory**: SQLite for short-term state; your learned preferences with local
+  embeddings (top 3 recalled per email or instruction); reusable skills in
+  `skills/`.
 - **Reliability**: timeouts and bounded retries on every Google API call,
   rate-limit handling for the LLM, and restart recovery from local state.
 
@@ -161,13 +207,15 @@ app/
   main.py           CLI entry point
   telegram_bot.py   Telegram interface: instructions, approvals, scheduled checks
   google_api.py     Shared Google API timeouts, retries, token refresh
-  agent/            Runner, LangGraph agent, decisions, prompts, approvals, state
+  agent/            Runner, LangGraph agent, supervisor + workers, decisions, prompts, approvals, state
+  memory/           Long-term memory (local embeddings), learning from decisions, skills
   gmail/            Gmail auth, messages, threads, drafts, parsing
   calendar/         Availability, booking, find/move/cancel events
   drive/            Google Drive client
   workspace/        Shared Workspace sign-in, Google Docs, Google Sheets
   tasks/            Google Tasks
   files/            Document search: Drive folder + local folder
+skills/             Saved procedures (recipes) and your own scripts; personal, gitignored
 docs/
   ARCHITECTURE.md
 ```

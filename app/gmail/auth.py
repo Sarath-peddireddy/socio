@@ -3,7 +3,7 @@ from pathlib import Path
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from app.google_api import refresh_credentials
+from app.google_api import credentials_locked, refresh_credentials
 
 
 # Gmail permissions required by this project.
@@ -19,6 +19,7 @@ CREDENTIALS_FILE = PROJECT_ROOT / "credentials.json"
 TOKEN_FILE = PROJECT_ROOT / "token.json"
 
 
+@credentials_locked
 def get_gmail_credentials() -> Credentials:
     """
     Authenticate the user with Google and return Gmail API credentials.

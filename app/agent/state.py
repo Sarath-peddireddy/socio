@@ -60,86 +60,191 @@ class AgentStateStore:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _initialize(self) -> None:
-        with self._connect() as conn:
+        """
+        Apply schema migrations in order (tracked with PRAGMA user_version).
+
+        Each migration runs once, inside a write transaction, so two processes
+        starting at the same time cannot both apply it.
+        """
+
+        conn = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
             # Write-ahead logging: readers never block the writer (persists in the file).
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS run_locks (name TEXT PRIMARY KEY, holder TEXT NOT NULL, expires_at TEXT NOT NULL)"
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS processed_messages (
-                    message_id TEXT PRIMARY KEY,
-                    thread_id TEXT,
-                    status TEXT NOT NULL,
-                    summary TEXT,
-                    metadata TEXT,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS actions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    type TEXT NOT NULL,
-                    target TEXT,
-                    payload TEXT,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS pending_approvals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    action_type TEXT NOT NULL,
-                    target TEXT,
-                    payload TEXT,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS failures (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
+            if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+                return
 
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS slot_holds (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    approval_id INTEGER NOT NULL,
-                    message_id TEXT,
-                    label TEXT,
-                    start_time TEXT NOT NULL,
-                    end_time TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    expires_at TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                for number, migrate in MIGRATIONS:
+                    if number > version:
+                        migrate(conn)
+                        conn.execute(f"PRAGMA user_version = {int(number)}")
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
 
-            self._ensure_column(conn, "processed_messages", "attempts", "INTEGER NOT NULL DEFAULT 0")
-            self._ensure_column(conn, "processed_messages", "updated_at", "TEXT")
-            self._ensure_column(conn, "actions", "message_id", "TEXT")
-            self._ensure_column(conn, "actions", "result", "TEXT")
-            self._ensure_column(conn, "pending_approvals", "message_id", "TEXT")
-            self._ensure_column(conn, "pending_approvals", "thread_id", "TEXT")
-            self._ensure_column(conn, "pending_approvals", "status", "TEXT NOT NULL DEFAULT 'open'")
-            self._ensure_column(conn, "pending_approvals", "resolution", "TEXT")
-            self._ensure_column(conn, "pending_approvals", "result", "TEXT")
-            self._ensure_column(conn, "pending_approvals", "notified", "INTEGER NOT NULL DEFAULT 0")
-            self._ensure_column(conn, "pending_approvals", "decided_at", "TEXT")
-            self._ensure_column(conn, "failures", "message_id", "TEXT")
+    @classmethod
+    def _migrate_v1_baseline(cls, conn: sqlite3.Connection) -> None:
+        """Tables from before versioned migrations (idempotent, so it also upgrades old files)."""
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS run_locks (name TEXT PRIMARY KEY, holder TEXT NOT NULL, expires_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_messages (
+                message_id TEXT PRIMARY KEY,
+                thread_id TEXT,
+                status TEXT NOT NULL,
+                summary TEXT,
+                metadata TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                target TEXT,
+                payload TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_approvals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_type TEXT NOT NULL,
+                target TEXT,
+                payload TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS failures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS slot_holds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                approval_id INTEGER NOT NULL,
+                message_id TEXT,
+                label TEXT,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        cls._ensure_column(conn, "processed_messages", "attempts", "INTEGER NOT NULL DEFAULT 0")
+        cls._ensure_column(conn, "processed_messages", "updated_at", "TEXT")
+        cls._ensure_column(conn, "actions", "message_id", "TEXT")
+        cls._ensure_column(conn, "actions", "result", "TEXT")
+        cls._ensure_column(conn, "pending_approvals", "message_id", "TEXT")
+        cls._ensure_column(conn, "pending_approvals", "thread_id", "TEXT")
+        cls._ensure_column(conn, "pending_approvals", "status", "TEXT NOT NULL DEFAULT 'open'")
+        cls._ensure_column(conn, "pending_approvals", "resolution", "TEXT")
+        cls._ensure_column(conn, "pending_approvals", "result", "TEXT")
+        cls._ensure_column(conn, "pending_approvals", "notified", "INTEGER NOT NULL DEFAULT 0")
+        cls._ensure_column(conn, "pending_approvals", "decided_at", "TEXT")
+        cls._ensure_column(conn, "failures", "message_id", "TEXT")
+
+    @staticmethod
+    def _migrate_v2_memory_and_runs(conn: sqlite3.Connection) -> None:
+        """Long-term memory, supervisor run checkpoints, and trusted skill scripts."""
+
+        # Semantic memory (app.memory.semantic): one (entity, preference, context) tuple
+        # per row with its embedding (float32 bytes, L2-normalized).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity TEXT NOT NULL,
+                preference TEXT NOT NULL,
+                context TEXT,
+                source TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                model TEXT NOT NULL,
+                hits INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        # Supervisor runs (app.agent.supervisor): the plan and every worker's fan-in payload.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS supervisor_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request TEXT NOT NULL,
+                plan TEXT,
+                status TEXT NOT NULL DEFAULT 'planning',
+                report TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS worker_tasks (
+                run_id INTEGER NOT NULL,
+                task_id TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                depends_on TEXT NOT NULL DEFAULT '[]',
+                tools_allowed TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'pending',
+                payload TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (run_id, task_id)
+            )
+            """
+        )
+        # Python skill scripts the owner approved, pinned to the exact file contents.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trusted_skill_scripts (
+                name TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                approval_id INTEGER,
+                approved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (name, sha256)
+            )
+            """
+        )
+        # Owner corrections asked for after a Reject / Edit in Gmail (Telegram reply prompt).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedback_requests (
+                chat_message_id INTEGER PRIMARY KEY,
+                approval_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
 
     # ----- processed messages -------------------------------------------------
 
@@ -442,3 +547,129 @@ class AgentStateStore:
                 "SELECT source, message, message_id, created_at FROM failures ORDER BY id DESC"
             ).fetchall()
             return [dict(row) for row in rows]
+
+    # ----- supervisor run checkpoints (see app.agent.supervisor) -----------------
+
+    def start_supervisor_run(self, request: str) -> int:
+        with self._connect() as conn:
+            return int(conn.execute("INSERT INTO supervisor_runs (request) VALUES (?)", (request[:4000],)).lastrowid)
+
+    def save_supervisor_plan(self, run_id: int, plan: list[dict[str, Any]]) -> None:
+        """Store the task DAG and create one 'pending' checkpoint row per worker task."""
+
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE supervisor_runs SET plan = ?, status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (json.dumps(plan), run_id),
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO worker_tasks (run_id, task_id, goal, depends_on, tools_allowed) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (run_id, task["task_id"], task["goal_contract"], json.dumps(task.get("depends_on", [])), json.dumps(task.get("tools_allowed", [])))
+                    for task in plan
+                ],
+            )
+
+    def update_worker_task(self, run_id: int, task_id: str, status: str, payload: dict[str, Any] | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE worker_tasks SET status = ?, payload = COALESCE(?, payload), updated_at = CURRENT_TIMESTAMP "
+                "WHERE run_id = ? AND task_id = ?",
+                (status, json.dumps(payload, default=str) if payload is not None else None, run_id, task_id),
+            )
+
+    def worker_tasks(self, run_id: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM worker_tasks WHERE run_id = ? ORDER BY rowid", (run_id,)).fetchall()
+        tasks = []
+        for row in rows:
+            task = dict(row)
+            task["depends_on"] = json.loads(task["depends_on"])
+            task["tools_allowed"] = json.loads(task["tools_allowed"])
+            task["payload"] = json.loads(task["payload"]) if task["payload"] else None
+            tasks.append(task)
+        return tasks
+
+    def finish_supervisor_run(self, run_id: int, status: str, report: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE supervisor_runs SET status = ?, report = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, report[:4000], run_id),
+            )
+
+    def get_supervisor_run(self, run_id: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM supervisor_runs WHERE id = ?", (run_id,)).fetchone()
+        if not row:
+            return None
+        run = dict(row)
+        run["plan"] = json.loads(run["plan"]) if run["plan"] else None
+        return run
+
+    def close_stale_supervisor_runs(self, minutes: int = RUN_LOCK_MINUTES) -> int:
+        """Mark runs left 'planning'/'running' by a stopped process as interrupted (not re-run)."""
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE supervisor_runs SET status = 'interrupted', updated_at = CURRENT_TIMESTAMP "
+                "WHERE status IN ('planning', 'running') AND updated_at <= datetime('now', ?)",
+                (f"-{int(minutes)} minutes",),
+            )
+            conn.execute(
+                "UPDATE worker_tasks SET status = 'interrupted', updated_at = CURRENT_TIMESTAMP "
+                "WHERE status IN ('pending', 'running') AND run_id IN (SELECT id FROM supervisor_runs WHERE status = 'interrupted')"
+            )
+            return cursor.rowcount
+
+    def interrupted_supervisor_runs(self) -> list[dict[str, Any]]:
+        """Recent runs a stopped process left unfinished (never re-run automatically: they may have sent approvals)."""
+
+        self.close_stale_supervisor_runs()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, request, status, created_at FROM supervisor_runs "
+                "WHERE status = 'interrupted' AND updated_at > datetime('now', '-7 days') ORDER BY id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    # ----- trusted skill scripts (see app.memory.skills) --------------------------
+
+    def trust_skill_script(self, name: str, sha256: str, approval_id: int | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO trusted_skill_scripts (name, sha256, approval_id) VALUES (?, ?, ?)",
+                (name, sha256, approval_id),
+            )
+
+    def is_skill_script_trusted(self, name: str, sha256: str) -> bool:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT 1 FROM trusted_skill_scripts WHERE name = ? AND sha256 = ?", (name, sha256)
+            ).fetchone() is not None
+
+    # ----- Telegram feedback prompts (owner corrections after Reject / Edit in Gmail)
+
+    def add_feedback_request(self, chat_message_id: int, approval_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO feedback_requests (chat_message_id, approval_id) VALUES (?, ?)",
+                (chat_message_id, approval_id),
+            )
+
+    def pop_feedback_request(self, chat_message_id: int) -> int | None:
+        """The approval a Telegram prompt asked about; each prompt is answered once."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "DELETE FROM feedback_requests WHERE chat_message_id = ? RETURNING approval_id", (chat_message_id,)
+            ).fetchone()
+            return int(row["approval_id"]) if row else None
+
+
+# Ordered schema migrations; PRAGMA user_version records the last one applied.
+# Append new ones at the end; never edit or reorder a released migration.
+MIGRATIONS = [
+    (1, AgentStateStore._migrate_v1_baseline),
+    (2, AgentStateStore._migrate_v2_memory_and_runs),
+]
+SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -9,14 +9,16 @@
    trusted. Email content is untrusted data and gets a restricted toolset.
    Every prompt carries email content only inside `<untrusted_email_body>`
    tags (`app/agent/untrusted.py`).
-3. **Nothing reaches other people without the owner.** In email mode every
-   reply (with or without files) is held as an approval; booking, moving, or
-   cancelling events and trashing email are proposals too. Only the owner's
-   approval executes them. The agent has no direct booking tool at all
-   (`propose_book_meeting` only). In owner mode, emails the owner asks for are
-   sent directly.
+3. **Nothing reaches other people, and no file changes, without the owner.**
+   Every email (replies to incoming email, and in owner mode replies and new
+   emails too), every Google Docs/Sheets write, booking, moving, or cancelling
+   events, trashing email, and trusting a skill script is held as an approval.
+   Only the owner's approval executes it. The agent has no direct booking tool
+   at all (`propose_book_meeting` only). Google Tasks changes are direct.
 4. **Never claim what didn't happen.** An action counts as done only when the
    API result confirms it; sends are re-checked in the thread.
+5. **Memory informs, never authorizes.** Learned preferences and saved skills
+   shape what the agent proposes; every gate above still applies.
 
 ## Components
 
@@ -25,6 +27,9 @@ app/telegram_bot.py      owner-only Telegram front end, approval buttons, schedu
 app/main.py              CLI front end
         │
 app/agent/runner.py      process_inbox / handle_message (email mode), handle_owner_command (owner mode)
+app/agent/supervisor.py  owner instructions: planner -> task DAG -> parallel workers -> fan-in report
+app/agent/workers.py     one worker subagent: clean context, restricted tools, strict JSON payload
+app/agent/taskgraph.py   plan validation (ids, tools, dependencies, cycles) and ordering
         │
 app/agent/decision.py    metadata rules → keyword pre-check → Gemini structured decision (+ intent)
 app/agent/graph.py       LangGraph: agent node ⇄ tools node; mode-specific toolsets and guards
@@ -32,6 +37,8 @@ app/agent/prompts.py     system prompts and per-intent playbooks
 app/agent/approvals.py   execute / reject approval requests (re-validated at execution time)
 app/agent/state.py       SQLite: message outcomes, attempts, actions, approvals, slot holds, failures
 app/agent/untrusted.py   sanitize + wrap email content in <untrusted_email_body> tags
+app/memory/              semantic.py (long-term memory), embeddings.py (local fastembed),
+                         learning.py (decisions -> memories), skills.py (procedural memory)
         │
 app/gmail/               read, search, reply, send, draft, trash (never permanent delete)
 app/calendar/            availability, create, find, move, cancel; holds.py: local soft holds
@@ -74,9 +81,49 @@ toolset and the approvals above.
 ## Owner mode (Telegram / `--ask`)
 
 Full toolset (search mail, send new email, calendar, documents, Google Docs,
-Sheets, and Tasks) plus `propose_trash_email`. Bookings, event changes, and
-trashing still go through approvals, so the owner sees the exact parsed time
-before anything is sent to attendees.
+Sheets, Tasks, skill scripts) plus `propose_trash_email`. Emails
+(`send_gmail_reply`, `send_new_email`), Docs/Sheets writes (`create_document`,
+`append_to_document`, `create_spreadsheet`, `append_sheet_row`), bookings,
+event changes, and trashing all become approvals (`OWNER_GATED_TOOLS` in
+`graph.py`), validated first (recipient addresses, reply target, attachments
+in the whitelist, the document must exist), so the card shows the exact email
+or the exact lines / cells to be added (`+ ` lines). Tasks stay direct.
+
+### Supervisor and workers (fan-out / fan-in)
+
+`handle_owner_command` goes through `supervisor.handle_owner_request`:
+
+```
+instruction ─► recall memories (top 3) + matching skills
+            ─► one-task request? ─► single owner agent (as before)
+            └► planner (1 LLM call): spawn_subagent(task_id, goal_contract, context_slice,
+               tools_allowed, depends_on) calls = a DAG, or use_skill(name, params)
+            ─► validate (≤ 6 tasks, known tools, no cycles) ─► checkpoint (supervisor_runs, worker_tasks)
+            ─► ThreadPoolExecutor (AGENT_MAX_WORKERS = 3): a task starts when its dependencies succeeded
+            ─► fan-in payloads ─► close duplicate approvals ─► one report ─► maybe save a skill
+```
+
+- Only instructions that look multi-part (or match a skill) pay for a planning
+  call; if the planner returns one task, the single agent runs instead.
+- A worker is a fresh graph run (`worker=True`, `tools_allowed=[...]`): its
+  only message is its goal, its context slice, and its dependencies' payloads.
+  Tools outside its list are neither bound nor executed.
+- Fan-in contract: `{"status": "SUCCESS"|"FAILED", "modified_entities": [...],
+  "diff_summary": "..."}`. Entities come from the actions the tools recorded
+  (the graph is streamed, so a worker that crashes still reports what it
+  changed); the status also fails on any failed/unknown action.
+- A failed task's dependents are not started; independent tasks continue; the
+  run is `done`, `partial`, or `failed`. Exceptions never reach the bot loop.
+- Overlaps: two workers proposing the same change (same event, document,
+  recipient + subject, slot) get one approval; the other is closed as a
+  duplicate. The slot-hold check and insert share one lock, so parallel
+  workers cannot hold the same time twice.
+- All workers share one Gemini rate limiter (`AGENT_LLM_RPM`, default 14/min)
+  and token refresh is serialized (`CREDENTIALS_LOCK`); Google clients are
+  built per call.
+- Runs left `running` by a stopped process are marked `interrupted` after 30
+  minutes and never re-run (they may already have created approvals).
+- Inbox emails are not fanned out (developer decision): they stay one at a time.
 
 ## Google Workspace
 
@@ -90,8 +137,8 @@ folder it creates and tags (`appProperties`), so it never writes into one of
 the owner's folders. Edits are append-only; Sheets values are written with
 `valueInputOption=RAW`.
 
-Sharing files by email: in email mode a reply with any attachment (Drive or
-local) becomes a `send_reply_with_attachment` approval (Telegram: Approve &
+Sharing files by email: any email with an attachment (Drive or local) is an
+approval (`send_reply_with_attachment` / `send_email`; Telegram: Approve &
 Send / Edit in Gmail / Reject).
 
 Follow-up tasks: when an email ends as `needs_review`, `needs_attention`, or
@@ -111,11 +158,15 @@ executes, then sends the follow-up reply if one was attached.
 |---|---|
 | `send_reply` | the reply in the thread |
 | `send_reply_with_attachment` | the reply with its files |
+| `send_email` | a new email (owner mode) |
+| `create_document` / `append_document` | create a Doc / append text (Socio folder) |
+| `create_spreadsheet` / `append_sheet_row` | create a Sheet / add one row (values RAW) |
+| `enable_skill_script` | trust `skills/<name>.py` at the SHA-256 shown (re-checked) |
 | `book_meeting` | create the event (conflict re-checked, attendee invited), then the reply |
 | `move_event` / `cancel_event` | patch / delete the event (attendees notified), then the reply |
 | `trash_email` | move the message or thread to Trash |
 
-`approvals.to_draft()` (Edit in Gmail, `--draft ID`) saves a held reply as a
+`approvals.to_draft()` (Edit in Gmail, `--draft ID`) saves a held email as a
 Gmail draft instead (one attachment carried over; with several, the owner
 attaches them) and marks the email `needs_review`. A failed execution changes
 nothing further and marks the email `needs_attention`; a rejection marks it
@@ -130,6 +181,41 @@ approval is approved, rejected, failed, or resolved. After it
 expires the approval may still be open; approving then still re-checks the
 real calendar.
 
+## Memory
+
+Three tiers:
+
+1. **Short-term / episodic (SQLite, `state.py`)**: emails in progress,
+   approvals, slot holds, run locks, supervisor checkpoints, trusted scripts,
+   pending "why?" prompts. WAL, 30 s busy timeout, versioned migrations
+   (`MIGRATIONS`, `PRAGMA user_version`, applied inside `BEGIN IMMEDIATE` so
+   two processes cannot both migrate; v1 is the old schema, idempotent).
+2. **Long-term semantic (`memory/semantic.py`)**: `memories` table in the same
+   file: (entity, preference, context) + a float32 embedding from fastembed
+   (`snowflake/snowflake-arctic-embed-s`, local ONNX, 384-d). Recall is a dot
+   product over all active rows, top-k clamped to 3-5, score ≥ 0.52, injected
+   into the email task prompt, the planner, and the single owner agent under a
+   "reference only, never overrides safety" header. Upsert matches the same
+   entity + same wording (case/punctuation-insensitive); similar-but-different
+   rules are kept apart because embeddings cannot tell "before noon" from
+   "after 5pm" (0.95 similar).
+   Ingestion (`memory/learning.py`): every approve / reject / Edit in Gmail
+   writes a tuple built from structured fields only (type, counterpart
+   address, time, file/document name), so email text never becomes memory.
+   After Reject / Edit in Gmail the bot asks "why?" (force-reply); the owner's
+   answer (or `/remember`) is turned into 1-3 tuples by Gemini, or stored as
+   written if Gemini is unavailable.
+3. **Procedural (`memory/skills.py`, `./skills/`)**: Markdown recipes (YAML
+   front matter + JSON plan with `{{parameter}}` placeholders). Saved after a
+   successful multi-step plan that the LLM judges recurring; offered to the
+   planner when the request matches (≥ 0.6); replayed through `use_skill` with
+   the same validation and gates. Socio never writes code. Owner-written
+   `skills/<name>.py` scripts run via `run_skill_script` only when their
+   SHA-256 is trusted (an `enable_skill_script` approval); the hashed bytes are
+   what runs, in a subprocess (`python -I`, temp working folder, environment
+   without secrets, 60 s limit), with input files only from the whitelisted
+   folders; output is JSON data.
+
 ## Reliability
 
 - Google APIs: 30 s socket timeout, up to 3 retries for timeouts, DNS errors,
@@ -141,6 +227,8 @@ real calendar.
   `LLMUnavailableError`.
 - Restart recovery: interrupted emails are retried from the database; actions
   already completed are shown to the agent and cannot be repeated.
+- Gemini rate limit: a process-wide sliding window (`AGENT_LLM_RPM`) attached to
+  the real model, so parallel workers queue instead of hitting 429s.
 - Concurrency: the Telegram bot is one sequential loop (messages, button taps,
   and scheduled inbox checks never overlap). Across processes (bot + CLI),
   SQLite runs in WAL mode with a 30 s busy timeout, and a live inbox run takes

@@ -3,8 +3,10 @@ Shared timeout, retry, and error handling for Google API calls
 (Gmail, Calendar, and OAuth token refresh).
 """
 
+import functools
 import logging
 import socket
+import threading
 import time
 
 import httplib2
@@ -19,6 +21,22 @@ logger = logging.getLogger(__name__)
 
 GOOGLE_API_TIMEOUT_SECONDS = 30
 MAX_GOOGLE_API_RETRIES = 3
+
+
+# Token files are read, refreshed, and rewritten by whichever thread needs a
+# client; supervisor workers run in parallel, so serialize that per process.
+CREDENTIALS_LOCK = threading.RLock()
+
+
+def credentials_locked(func):
+    """Run a credential load/refresh/save function under CREDENTIALS_LOCK."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with CREDENTIALS_LOCK:
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 class GoogleApiUnavailableError(RuntimeError):

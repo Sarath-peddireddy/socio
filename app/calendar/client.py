@@ -5,7 +5,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-from app.google_api import build_authorized_http, refresh_credentials
+from app.google_api import build_authorized_http, credentials_locked, refresh_credentials
 
 
 SCOPES = [
@@ -20,6 +20,7 @@ TOKEN_PATH = PROJECT_ROOT / "calendar_token.json"
 CREDENTIALS_PATH = PROJECT_ROOT / "credentials.json"
 
 
+@credentials_locked
 def get_calendar_service():
     """
     Authenticate with Google Calendar and return the API service.

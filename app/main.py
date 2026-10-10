@@ -10,7 +10,11 @@ Run Socio, the autonomous email and calendar agent.
     python -m app.main --google-login        # one-time sign-in for Drive, Docs, Sheets, Tasks
     python -m app.main --approve 4           # approve and execute request #4
     python -m app.main --reject 4            # reject request #4 (nothing changes)
-    python -m app.main --draft 4             # move held reply #4 to Gmail Drafts (not sent)
+    python -m app.main --draft 4             # move held email #4 to Gmail Drafts (not sent)
+    python -m app.main --remember "no calls before noon"   # teach a preference (long-term memory)
+    python -m app.main --memories            # list what Socio has learned
+    python -m app.main --forget 7            # forget memory #7
+    python -m app.main --skills              # list saved skills (./skills)
 
 Output shows sender, subject, and decisions only, never email bodies.
 """
@@ -69,12 +73,50 @@ def print_status() -> None:
         for line in describe(store.get_approval(approval["id"])).splitlines():
             print(f"     {line}")
     if approvals:
-        print("\n  Approve with --approve ID, reject with --reject ID, or move a reply to Drafts with --draft ID.")
+        print("\n  Approve with --approve ID, reject with --reject ID, or move an email to Drafts with --draft ID.")
+
+    interrupted_runs = store.interrupted_supervisor_runs()
+    if interrupted_runs:
+        print(f"\nInterrupted instructions (not re-run): {', '.join('#' + str(r['id']) for r in interrupted_runs)}")
 
     failures = store.failures()[:5]
     print(f"\nRecent failures: {len(failures)} shown")
     for failure in failures:
         print(f"  {failure['created_at']} {failure['source']}: {_short(failure['message'], 140)}")
+
+
+def _memory_command(args) -> int:
+    from app.memory import skills
+    from app.memory.learning import learn_from_owner_note
+    from app.memory.semantic import SemanticMemory, memory_enabled
+
+    if args.skills:
+        found = skills.list_skills()
+        print("Saved skills:" if found else f"No skills in {skills.skills_dir()}.")
+        for skill in found:
+            kind = f"script {skill.script}" if skill.script else f"{len(skill.plan)} steps"
+            print(f"  {skill.name} ({kind}, by {skill.author}): {skill.description}")
+        return 0
+
+    if not memory_enabled():
+        print("Memory is turned off (AGENT_MEMORY=0).")
+        return 1
+
+    memory = SemanticMemory()
+    if args.remember:
+        for item in learn_from_owner_note(args.remember):
+            print(f"{'Noted' if item['created'] else 'Updated'} [{item['id']}]: {item['entity']}: {item['preference']}")
+        return 0
+    if args.forget is not None:
+        forgotten = memory.forget(args.forget)
+        print(f"Memory #{args.forget} {'forgotten' if forgotten else 'not found'}.")
+        return 0 if forgotten else 1
+
+    memories = memory.all(limit=100)
+    print(f"Memories: {len(memories)}" + ("" if memories else " (reject or edit a request, or use --remember)"))
+    for item in memories:
+        print(f"  [{item.id}] {item.line()}  <{item.source}, x{item.hits}>")
+    return 0
 
 
 def main(argv=None) -> int:
@@ -86,8 +128,12 @@ def main(argv=None) -> int:
     parser.add_argument("--resolve", type=int, metavar="ID", help="Close pending approval #ID and exit")
     parser.add_argument("--approve", type=int, metavar="ID", help="Approve and execute pending approval #ID")
     parser.add_argument("--reject", type=int, metavar="ID", help="Reject pending approval #ID (nothing changes)")
-    parser.add_argument("--draft", type=int, metavar="ID", help="Move held reply #ID to Gmail Drafts instead of sending it")
+    parser.add_argument("--draft", type=int, metavar="ID", help="Move held email #ID to Gmail Drafts instead of sending it")
     parser.add_argument("--ask", metavar="TEXT", help="Give the agent a direct instruction (owner mode)")
+    parser.add_argument("--remember", metavar="TEXT", help="Teach Socio a preference (long-term memory)")
+    parser.add_argument("--memories", action="store_true", help="List what Socio has learned")
+    parser.add_argument("--forget", type=int, metavar="ID", help="Forget memory #ID")
+    parser.add_argument("--skills", action="store_true", help="List saved skills")
     parser.add_argument("--google-login", "--drive-login", dest="google_login", action="store_true",
                         help="Sign in to Google Drive, Docs, Sheets and Tasks, and list the Socio folder")
     args = parser.parse_args(argv)
@@ -136,6 +182,9 @@ def main(argv=None) -> int:
             outcome = to_draft(args.draft)
         print(outcome["message"])
         return 0 if outcome["ok"] else 1
+
+    if args.remember or args.memories or args.forget is not None or args.skills:
+        return _memory_command(args)
 
     if args.ask:
         result = handle_owner_command(args.ask, dry_run=args.dry_run)

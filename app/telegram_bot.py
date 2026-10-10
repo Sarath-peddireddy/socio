@@ -5,9 +5,12 @@ Telegram front end for Socio.
 
 - Only the owner's chat (TELEGRAM_OWNER_CHAT_ID) can use the bot. Until it is
   set, the bot only replies with the sender's chat id so it can be configured.
-- Plain messages are instructions for the agent (owner mode).
-- Approval requests arrive with Approve / Reject buttons (replies also get
+- Plain messages are instructions for the agent (owner mode); multi-part ones
+  are split across worker subagents (app.agent.supervisor).
+- Approval requests arrive with Approve / Reject buttons (emails also get
   Edit in Gmail, which saves them as a Gmail draft instead).
+- After a Reject or Edit in Gmail the bot asks why (optional); replying to that
+  question teaches Socio a preference (long-term memory). /remember does too.
 - The inbox is processed every AGENT_POLL_MINUTES (default 10, 0 = off).
 
 Uses the Telegram Bot API over HTTPS long polling (no webhook, nothing exposed).
@@ -18,17 +21,22 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 import time
 
 import requests
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.agent.approvals import EXECUTABLE_TYPES, REPLY_TYPES, approve, describe, reject, to_draft
+from app.agent.approvals import EMAIL_TYPES, EXECUTABLE_TYPES, approve, describe, reject, to_draft
 from app.agent.llm import LLMUnavailableError
 from app.agent.runner import BUSY_STATUS, DEFAULT_QUERY, handle_owner_command, process_inbox
 from app.agent.state import AgentStateStore
 from app.google_api import GoogleApiUnavailableError
+from app.memory import skills as skill_store
+from app.memory.embeddings import get_embedder
+from app.memory.learning import learn_from_owner_note
+from app.memory.semantic import SemanticMemory, memory_enabled
 
 
 load_dotenv()
@@ -43,6 +51,9 @@ HELP_TEXT = """Socio commands:
 /status - outcomes, open approvals, recent failures
 /approvals - show open approval requests again
 /new - forget the conversation context
+/remember TEXT - teach me a preference (e.g. no calls before noon)
+/memories - what I have learned; /forget ID removes one
+/skills - saved procedures; /forget_skill NAME archives one
 
 Or just type an instruction, e.g.
 - send my resume to hr@company.com
@@ -52,9 +63,12 @@ Or just type an instruction, e.g.
 - add Acme, PM, applied today to my applications sheet
 - write a cover letter for Acme in a doc
 - remind me to send the invoice on Friday
-Replies to incoming emails, booking, moving or cancelling meetings, and
-deleting email always ask for your approval first. A reply can also be moved
-to Gmail Drafts (Edit in Gmail) so you can change it before sending."""
+Every email, Docs/Sheets change, booking, moving or cancelling meetings, and
+deleting email asks for your approval first. An email can also be moved to
+Gmail Drafts (Edit in Gmail) so you can change it before sending. After you
+reject something, reply to my "why?" message and I'll remember it."""
+
+FEEDBACK_PROMPT = "💬 Why? Reply to this message and I'll remember it for next time (optional)."
 
 INTERESTING_STATUSES = {
     "replied": "✅ Replied",
@@ -101,11 +115,13 @@ class Bot:
 
     # ----- sending -------------------------------------------------------------
 
-    def send(self, text: str, buttons: list | None = None) -> None:
+    def send(self, text: str, buttons: list | None = None, force_reply: bool = False):
         params = {"chat_id": self.owner_chat_id, "text": _clip(text), "disable_web_page_preview": True}
         if buttons:
             params["reply_markup"] = {"inline_keyboard": buttons}
-        self.api.call("sendMessage", **params)
+        elif force_reply:
+            params["reply_markup"] = {"force_reply": True, "input_field_placeholder": "e.g. never book calls before noon"}
+        return self.api.call("sendMessage", **params)
 
     def notify_approvals(self, resend_open: bool = False) -> int:
         """Send approval requests the owner has not seen yet (or all open ones)."""
@@ -118,12 +134,11 @@ class Bot:
 
         for approval in approvals:
             approval_id = approval["id"]
-            if approval["type"] in REPLY_TYPES:
-                title = (
-                    f"📎 Send this reply with a file? #{approval_id}"
-                    if approval["type"] == "send_reply_with_attachment"
-                    else f"✉️ Send this reply? #{approval_id}"
-                )
+            if approval["type"] in EMAIL_TYPES:
+                title = {
+                    "send_reply_with_attachment": f"📎 Send this reply with a file? #{approval_id}",
+                    "send_email": f"✉️ Send this email? #{approval_id}",
+                }.get(approval["type"], f"✉️ Send this reply? #{approval_id}")
                 buttons = [
                     [{"text": "✅ Approve & Send", "callback_data": f"approve:{approval_id}"},
                      {"text": "✏️ Edit in Gmail", "callback_data": f"draft:{approval_id}"}],
@@ -216,6 +231,12 @@ class Bot:
             text=_clip(f"{original}\n\n{mark} {outcome['message']}"),
         )
 
+        # A rejection or a rewrite is a correction: ask why, so it can be remembered.
+        if outcome["ok"] and action in {"reject", "draft"} and memory_enabled():
+            prompt = self.send(FEEDBACK_PROMPT, force_reply=True)
+            if isinstance(prompt, dict) and prompt.get("message_id"):
+                self.store.add_feedback_request(int(prompt["message_id"]), int(raw_id))
+
     def _handle_message(self, message: dict) -> None:
         chat_id = message.get("chat", {}).get("id")
 
@@ -238,7 +259,16 @@ class Bot:
             self.send("Please send a text message.")
             return
 
+        # The owner answered a "why?" prompt: learn from it instead of running an instruction.
+        replied_to = (message.get("reply_to_message") or {}).get("message_id")
+        if replied_to is not None:
+            approval_id = self.store.pop_feedback_request(int(replied_to))
+            if approval_id is not None:
+                self._learn(text, self.store.get_approval(approval_id))
+                return
+
         command = text.split()[0].split("@")[0].lower()
+        argument = text[len(text.split()[0]):].strip()
 
         if command in {"/start", "/help"}:
             self.send(HELP_TEXT)
@@ -256,6 +286,24 @@ class Bot:
         elif command == "/new":
             self.history = []
             self.send("Okay, starting fresh.")
+        elif command == "/remember":
+            if argument:
+                self._learn(argument, None)
+            else:
+                self.send("Tell me what to remember, e.g. /remember no calls before 12:00")
+        elif command == "/memories":
+            self.send(self._memories_text())
+        elif command == "/forget":
+            ok = argument.isdigit() and SemanticMemory(self.store).forget(int(argument))
+            self.send(f"Forgot memory {argument}." if ok else "Usage: /forget ID (see /memories).")
+        elif command == "/skills":
+            self.send(self._skills_text())
+        elif command == "/forget_skill":
+            try:
+                ok = bool(argument) and skill_store.archive_skill(argument)
+            except skill_store.SkillError:
+                ok = False
+            self.send(f"Archived skill {argument} (skills/.archive)." if ok else "Usage: /forget_skill NAME (see /skills).")
         else:
             self._run_instruction(text)
 
@@ -267,10 +315,39 @@ class Bot:
         self.history += [HumanMessage(content=f"Instruction from the owner:\n{text}"), AIMessage(content=result.reply)]
         self.history = self.history[-2 * HISTORY_TURNS:]
 
+    def _learn(self, text: str, approval: dict | None) -> None:
+        if not memory_enabled():
+            self.send("Memory is turned off (AGENT_MEMORY=0).")
+            return
+        saved = learn_from_owner_note(text, approval, store=self.store)
+        lines = [f"{'🧠 Noted' if item['created'] else '🧠 Updated'} [{item['id']}]: {item['entity']}: {item['preference']}" for item in saved]
+        self.send("\n".join(lines) or "Nothing to remember.")
+
+    def _memories_text(self) -> str:
+        memories = SemanticMemory(self.store).all(limit=20)
+        if not memories:
+            return "I haven't learned anything yet. Reject or edit a request, or use /remember."
+        return "What I've learned (newest first):\n" + "\n".join(f"[{m.id}] {m.line()}" for m in memories)
+
+    def _skills_text(self) -> str:
+        skills = skill_store.list_skills()
+        if not skills:
+            return "No saved skills yet. Multi-step instructions that are likely to recur get saved here."
+        lines = []
+        for skill in skills:
+            kind = f"script {skill.script}" if skill.script else f"{len(skill.plan)} steps"
+            lines.append(f"- {skill.name} ({kind}, by {skill.author}): {skill.description}")
+        return "Saved skills:\n" + "\n".join(lines)
+
     def _status_text(self) -> str:
         counts = self.store.status_counts()
         lines = ["Email outcomes: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none yet")]
         lines.append(f"Open approval requests: {len(self.store.pending_approvals())} (/approvals to show)")
+        interrupted = self.store.interrupted_supervisor_runs()
+        if interrupted:
+            lines.append(f"Interrupted instructions (not re-run): {', '.join('#' + str(r['id']) for r in interrupted)}")
+        if memory_enabled():
+            lines.append(f"Memories: {SemanticMemory(self.store).count()} (/memories); skills: {len(skill_store.list_skills())} (/skills)")
         failures = self.store.failures()[:3]
         if failures:
             lines.append("Recent failures:")
@@ -321,6 +398,10 @@ class Bot:
     def run_forever(self) -> None:
         if self.owner_chat_id is not None:
             self.send("🤖 Socio is online. Send /help for commands.")
+
+        # Load the local embedding model in the background so the first recall is fast.
+        if memory_enabled():
+            threading.Thread(target=lambda: getattr(get_embedder(), "warm_up", lambda: None)(), daemon=True).start()
 
         while True:
             try:

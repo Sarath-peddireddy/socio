@@ -38,3 +38,10 @@ CLAUDE.md
 # Local tests and handoff notes (never published)
 tests/
 HANDOFF.md
+
+# Local embedding model download (fastembed)
+.cache/
+
+# Saved skills are personal (names, addresses); only the README is published
+skills/*
+!skills/README.md

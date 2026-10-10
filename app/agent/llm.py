@@ -1,10 +1,14 @@
+import asyncio
 import logging
 import os
 import re
+import threading
 import time
+from collections import deque
 
 import httpx
 from dotenv import load_dotenv
+from langchain_core.rate_limiters import BaseRateLimiter
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 
@@ -26,6 +30,51 @@ class LLMUnavailableError(RuntimeError):
     """Raised when the LLM cannot be used right now (quota exhausted or unreachable)."""
 
 
+class SlidingWindowRateLimiter(BaseRateLimiter):
+    """
+    At most `per_minute` Gemini requests in any 60 seconds, shared by every thread.
+
+    Supervisor workers call Gemini in parallel; without this they would burst past
+    the free-tier limit and spend their time waiting out 429s instead.
+    """
+
+    def __init__(self, per_minute: int):
+        self.per_minute = per_minute
+        self._sent: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def _try(self) -> float:
+        """Take a slot and return 0, or return how long to wait for the next one."""
+
+        with self._lock:
+            now = time.monotonic()
+            while self._sent and now - self._sent[0] >= 60:
+                self._sent.popleft()
+            if len(self._sent) < self.per_minute:
+                self._sent.append(now)
+                return 0.0
+            return 60 - (now - self._sent[0]) + 0.05
+
+    def acquire(self, *, blocking: bool = True) -> bool:
+        while (wait := self._try()) > 0:
+            if not blocking:
+                return False
+            time.sleep(wait)
+        return True
+
+    async def aacquire(self, *, blocking: bool = True) -> bool:
+        while (wait := self._try()) > 0:
+            if not blocking:
+                return False
+            await asyncio.sleep(wait)
+        return True
+
+
+# Free tier: 15 requests/minute; keep one in reserve. AGENT_LLM_RPM=0 turns it off.
+LLM_REQUESTS_PER_MINUTE = int(os.getenv("AGENT_LLM_RPM", "14"))
+RATE_LIMITER = SlidingWindowRateLimiter(LLM_REQUESTS_PER_MINUTE) if LLM_REQUESTS_PER_MINUTE > 0 else None
+
+
 def get_llm():
     """
     Create and return the Gemini LLM used by the agent.
@@ -45,6 +94,8 @@ def get_llm():
         # Bound each call so a network stall cannot hang the agent loop.
         timeout=LLM_TIMEOUT_SECONDS,
         max_retries=LLM_MAX_RETRIES,
+        # One limiter per process, shared by every model instance and thread.
+        rate_limiter=RATE_LIMITER,
     )
 
 

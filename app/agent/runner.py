@@ -24,11 +24,13 @@ from app.agent.followups import complete_followup_task, create_followup_task
 from app.agent.graph import create_agent_graph
 from app.agent.llm import LLMUnavailableError
 from app.agent.state import AgentStateStore
+from app.agent.supervisor import OwnerCommandResult, handle_owner_request
 from app.agent.tools import thread_participants
 from app.agent.untrusted import inline_untrusted, wrap_untrusted_email
 from app.gmail.messages import search_messages
 from app.gmail.tools import get_thread_details
 from app.google_api import GoogleApiUnavailableError
+from app.memory.semantic import format_memories, recall
 
 
 logger = logging.getLogger(__name__)
@@ -90,7 +92,7 @@ def _greeting_instruction(target: dict) -> str:
     )
 
 
-def _task_prompt(target: dict, thread: list[dict], decision, earlier_actions: list[dict] | None = None) -> str:
+def _task_prompt(target: dict, thread: list[dict], decision, earlier_actions: list[dict] | None = None, memories: list | None = None) -> str:
     reply_to = target.get("reply_to") or target.get("from", "")
 
     recovery = ""
@@ -111,7 +113,8 @@ def _task_prompt(target: dict, thread: list[dict], decision, earlier_actions: li
         f"Triage: intent={getattr(decision, 'intent', 'unknown')}, "
         f"confidence={decision.confidence}, reason={decision.reason}\n"
         f"{recovery}\n"
-        "Full thread, oldest first:\n\n"
+        + (f"{format_memories(memories)}\n\n" if memories else "")
+        + "Full thread, oldest first:\n\n"
         f"{_thread_transcript(thread)}"
     )
 
@@ -205,11 +208,14 @@ def handle_message(message_id: str, thread_id: str, *, dry_run: bool = False, st
                 if not action["type"].startswith("auto_task")
             ]
 
+            # The owner's learned preferences that fit this email (top 3, local embeddings).
+            memories = recall(f"{outcome.sender} {outcome.subject} {outcome.intent} {decision.reason}", store=store)
+
             # 4-5. Let the agent choose and execute tools; tools verify their own results.
             agent = create_agent_graph()
             result = agent.invoke(
                 {
-                    "messages": [HumanMessage(content=_task_prompt(target, thread, decision, earlier_actions))],
+                    "messages": [HumanMessage(content=_task_prompt(target, thread, decision, earlier_actions, memories))],
                     "processed_message_ids": [],
                     "actions": [],
                     "pending_approvals": [],
@@ -377,37 +383,15 @@ def _process_inbox(store: AgentStateStore, query: str, max_messages: int, dry_ru
     return outcomes
 
 
-@dataclass
-class OwnerCommandResult:
-    reply: str
-    actions: list[dict[str, Any]] = field(default_factory=list)
-    approval_ids: list[int] = field(default_factory=list)
-
-
 def handle_owner_command(text: str, *, dry_run: bool = False, history: list | None = None) -> OwnerCommandResult:
     """
-    Run the agent on a direct instruction from the owner (e.g. a Telegram message).
+    Run a direct instruction from the owner (e.g. a Telegram message).
 
-    The owner is trusted, so the full toolset is available; trashing email and
-    moving/cancelling events still only create approval requests.
+    The owner is trusted, so the full toolset is available; emails, Docs/Sheets
+    writes, calendar changes, and trashing still only create approval requests.
+    Multi-part instructions are split across worker subagents by the supervisor
+    (app.agent.supervisor); single tasks run the owner-mode agent directly.
     history is optional earlier HumanMessage/AIMessage turns for context.
     """
 
-    agent = create_agent_graph()
-    result = agent.invoke(
-        {
-            "messages": list(history or []) + [HumanMessage(content=f"Instruction from the owner:\n{text}")],
-            "processed_message_ids": [],
-            "actions": [],
-            "pending_approvals": [],
-            "failures": [],
-            "dry_run": dry_run,
-        },
-        config={"recursion_limit": AGENT_RECURSION_LIMIT},
-    )
-
-    return OwnerCommandResult(
-        reply=_final_text(result) or "Done.",
-        actions=result.get("actions", []),
-        approval_ids=[approval["id"] for approval in result.get("pending_approvals", []) if "id" in approval],
-    )
+    return handle_owner_request(text, dry_run=dry_run, history=history)
