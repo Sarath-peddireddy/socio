@@ -2,9 +2,10 @@
 
 **Your inbox and calendar, handled.** Socio is an AI assistant that reads
 your Gmail, decides what needs a response, and takes care of it: scheduling
-meetings, answering requests, sending the documents people ask for, and
-asking you first before anything is deleted or changed. You talk to it from
-Telegram.
+meetings, answering requests, sending the documents people ask for. Routine
+replies go out on their own; anything with a real blast radius (booking,
+moving, or cancelling a meeting, sending a file, deleting email) waits for
+one tap from you. You talk to it from Telegram.
 
 > Status: early access. Run it against a test Google account while you
 > evaluate it.
@@ -15,7 +16,7 @@ Telegram.
 
 | Incoming email | What Socio does |
 |---|---|
-| "Can we schedule a 30-min interview?" | Finds a free slot, books it with the sender invited, replies with the exact time |
+| "Can we schedule a 30-min interview?" | Finds a free slot and asks you on Telegram; once you approve, it books it with the sender invited and replies with the exact time |
 | "Could you send your resume?" | Finds it in your Google Drive and asks you on Telegram before sending it (tap *Always allow* once and it won't ask again) |
 | "What's your notice period?" (Socio doesn't know) | Saves a ready-to-send Gmail draft with the gaps marked for you |
 | "Can we move our call to Friday?" | Finds the meeting and asks you on Telegram; once you approve, it moves the event and replies |
@@ -36,19 +37,27 @@ also adds it to **Google Tasks**, and completes it once you've acted.
 
 ## Safety model
 
-- **You approve anything destructive.** Moving email to Trash and moving or
-  cancelling events are only *proposed*. They run after you tap **Approve** in
-  Telegram, and are re-validated at that moment. Trash is never a permanent
-  delete (Gmail keeps it 30 days, and Socio's Gmail permission cannot
-  permanently delete).
+- **Autonomous for routine work, your call for high-impact actions.**
+
+  | Action | What Socio does |
+  |---|---|
+  | Plain reply in the sender's own thread | Sends it |
+  | Reply with a file attached | Asks you (Send / Reject / *Send & always allow this file*) |
+  | Booking a new meeting | Asks you; the booking and its confirmation reply go out together |
+  | Moving or cancelling a meeting | Asks you; then updates the event and replies |
+  | Moving email to Trash | Asks you (only when you asked for it) |
+  | Docs/Sheets appends, Tasks | Does it (your own files, append-only) |
+
+  Approved actions are re-validated at the moment you tap (for example, the
+  slot must still be free). Trash is never a permanent delete (Gmail keeps it
+  30 days, and Socio's Gmail permission cannot permanently delete).
 - **Emails are untrusted.** When handling an incoming email, Socio gets a
   restricted toolset: it can only reply inside that conversation, only to
   people already in it, and can never delete, search your other mail, or
   email new people.
 - **Your Drive, your call.** Socio searches your whole Drive (only files you
-  own, never ones others shared with you). It never sends a Drive file to
-  someone who emailed asking for it without your approval, unless you've
-  marked that file *Always allow*.
+  own, never ones others shared with you). It never emails a file to anyone
+  without your approval, unless you've marked that file *Always allow*.
 - **Append-only edits.** Socio can read Docs and Sheets and *add* to them
   (append text, add rows) but never deletes or overwrites anything. Sheet
   values are written as plain text, so content from an email can never

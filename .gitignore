@@ -31,3 +31,7 @@ workspace_token.json
 # Local AI-assistant notes (never published)
 CLAUDE.md
 .claude/
+
+# Local tests and handoff notes (never published)
+tests/
+HANDOFF.md

@@ -9,7 +9,7 @@ from app.google_auth import PROJECT_ROOT, load_credentials
 
 
 WORKSPACE_SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",  # find and read files in the Socio folder
+    "https://www.googleapis.com/auth/drive.readonly",  # find and read the owner's files (whole Drive)
     "https://www.googleapis.com/auth/drive.file",      # move files Socio creates into the Socio folder
     "https://www.googleapis.com/auth/documents",       # read / append to Google Docs
     "https://www.googleapis.com/auth/spreadsheets",    # read / append rows to Google Sheets

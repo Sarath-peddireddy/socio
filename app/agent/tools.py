@@ -323,6 +323,49 @@ def propose_move_calendar_event(
 
 
 @tool
+def propose_book_meeting(
+    title: str,
+    start_time: str,
+    end_time: str,
+    reason: str,
+    attendee_email: str = "",
+    description: str = "",
+    meeting_link: str = "",
+    reply_body: str = "",
+) -> dict:
+    """
+    Ask the owner to approve booking a new calendar event (meeting, interview, call).
+
+    Nothing is booked until the owner approves; the slot is checked again
+    then. start_time/end_time are ISO 8601 (naive times are IST) and must be
+    free. attendee_email (optional) is invited by Google. meeting_link is
+    added to the description. reply_body is the email reply to send in this
+    thread AFTER the booking is approved, stating the exact time; do not send
+    a separate reply yourself.
+    """
+
+    start, end = parse_ist(start_time), parse_ist(end_time)
+    validate_new_time(start, end)
+
+    attendee = attendee_email.strip().lower()
+
+    return {
+        "proposal": {
+            "type": "book_meeting",
+            "title": title,
+            "new_start": start.isoformat(),
+            "new_end": end.isoformat(),
+            "attendee_email": attendee,
+            "other_attendees": [attendee] if attendee else [],
+            "description": description,
+            "meeting_link": meeting_link,
+            "reason": reason,
+            "reply_body": reply_body,
+        }
+    }
+
+
+@tool
 def propose_cancel_calendar_event(event_id: str, reason: str, reply_body: str = "") -> dict:
     """
     Ask the owner to approve cancelling (deleting) an existing calendar event.

@@ -7,9 +7,10 @@
    judgement: classifying intent, choosing tools, writing emails.
 2. **Two trust levels.** Instructions from the owner (Telegram / CLI) are
    trusted. Email content is untrusted data and gets a restricted toolset.
-3. **Human-in-the-loop for destructive changes.** Trashing email and
-   moving/cancelling events are proposals; only the owner's approval executes
-   them.
+3. **Human-in-the-loop by blast radius.** Plain in-thread replies are sent
+   autonomously. Booking, moving, or cancelling events, trashing email, and
+   sending attachments are proposals; only the owner's approval executes them.
+   The agent has no direct booking tool at all (`propose_book_meeting` only).
 4. **Never claim what didn't happen.** An action counts as done only when the
    API result confirms it; sends are re-checked in the thread.
 
@@ -49,14 +50,17 @@ Guards in the tools node:
 - only the conversation being handled can be replied to, only to its participants
 - calendar invites only to conversation participants
 - an event can only be moved/cancelled on request of one of its attendees
-- one booking / reply / draft per email, even across restarts
+- one reply / draft per email, even across restarts
+- once a reply is held in an approval (booking, attachment), no other reply can
+  be sent for that email
 - no Trash, no new emails, no mailbox search
 
 ## Owner mode (Telegram / `--ask`)
 
 Full toolset (search mail, send new email, calendar, documents, Google Docs,
-Sheets, and Tasks) plus `propose_trash_email`. Destructive changes still go
-through approvals.
+Sheets, and Tasks) plus `propose_trash_email`. Bookings, event changes, and
+trashing still go through approvals, so the owner sees the exact parsed time
+before anything is sent to attendees.
 
 ## Google Workspace
 
@@ -70,10 +74,10 @@ folder it creates and tags (`appProperties`), so it never writes into one of
 the owner's folders. Edits are append-only; Sheets values are written with
 `valueInputOption=RAW`.
 
-Sharing files by email: when the agent (email mode) replies with a Drive
-attachment the owner has not marked *Always allow*, the reply becomes a
-`send_reply_with_attachment` approval (Telegram: Send / Reject / Send & always
-allow). Files in the local shareable folder are sent directly.
+Sharing files by email: when the agent (email mode) replies with any
+attachment (Drive or local) the owner has not marked *Always allow*, the reply
+becomes a `send_reply_with_attachment` approval (Telegram: Send / Reject /
+Send & always allow).
 
 Follow-up tasks: when an email ends as `needs_review`, `needs_attention`, or
 `awaiting_approval`, a Google Task is created (once per email) and completed
@@ -86,6 +90,16 @@ when the owner approves, rejects, or resolves it. Failures never affect email ha
 Approve / Reject buttons. `approvals.approve()` claims the request atomically
 (so a double tap cannot run it twice), re-validates (event exists, new slot
 still free), executes, then sends the follow-up reply if one was attached.
+
+| Type | Executes |
+|---|---|
+| `book_meeting` | create the event (conflict re-checked, attendee invited), then the reply |
+| `move_event` / `cancel_event` | patch / delete the event (attendees notified), then the reply |
+| `send_reply_with_attachment` | the reply with its files |
+| `trash_email` | move the message or thread to Trash |
+
+A failed execution changes nothing further and marks the email
+`needs_attention`; a rejection marks it `needs_review` for the owner.
 
 ## Reliability
 

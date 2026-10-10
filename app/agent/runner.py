@@ -153,10 +153,6 @@ def _outcome_status(actions: list[dict], failures: list[str]) -> str:
     if any(a["status"] == "completed" for a in by_type.get("create_reply_draft", [])):
         return "needs_review"
 
-    if any(a["status"] == "completed" for a in by_type.get("create_calendar_event", [])):
-        # An event exists but the sender was not told about it.
-        return "needs_attention"
-
     if failures:
         return "failed"
 

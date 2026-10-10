@@ -18,6 +18,7 @@ from app.agent.tools import (
     create_spreadsheet,
     create_task,
     list_tasks,
+    propose_book_meeting,
     read_document,
     read_sheet,
     create_reply_draft,
@@ -33,7 +34,7 @@ from app.agent.tools import (
     send_gmail_reply,
     send_new_email,
 )
-from app.calendar.tools import create_calendar_event, find_calendar_availability
+from app.calendar.tools import find_calendar_availability
 from app.google_api import is_retryable_error
 
 
@@ -46,11 +47,11 @@ AGENT_TOOLS = [
     check_reply_needed,
     find_calendar_availability,
     find_calendar_events,
-    create_calendar_event,
     find_documents,
     send_gmail_reply,
     send_new_email,
     create_reply_draft,
+    propose_book_meeting,
     propose_move_calendar_event,
     propose_cancel_calendar_event,
     propose_trash_email,
@@ -70,7 +71,6 @@ TOOLS_BY_NAME = {agent_tool.name: agent_tool for agent_tool in AGENT_TOOLS}
 SIDE_EFFECT_TOOLS = {
     "send_gmail_reply",
     "send_new_email",
-    "create_calendar_event",
     "create_reply_draft",
     "create_document",
     "append_to_document",
@@ -81,7 +81,14 @@ SIDE_EFFECT_TOOLS = {
 }
 
 # Tools that only create an approval request for the owner (see app.agent.approvals).
-PROPOSAL_TOOLS = {"propose_move_calendar_event", "propose_cancel_calendar_event", "propose_trash_email"}
+# High-blast-radius actions always go through one: booking, moving, or cancelling
+# meetings, trashing email (and sending attachments, see _needs_share_approval).
+PROPOSAL_TOOLS = {
+    "propose_book_meeting",
+    "propose_move_calendar_event",
+    "propose_cancel_calendar_event",
+    "propose_trash_email",
+}
 
 # Tools that must stay inside the thread being handled.
 THREAD_SCOPED_TOOLS = {"send_gmail_reply", "create_reply_draft"}
@@ -93,10 +100,10 @@ EMAIL_MODE_TOOLS = {
     "get_thread",
     "find_calendar_availability",
     "find_calendar_events",
-    "create_calendar_event",
     "find_documents",
     "send_gmail_reply",
     "create_reply_draft",
+    "propose_book_meeting",
     "propose_move_calendar_event",
     "propose_cancel_calendar_event",
 }
@@ -173,8 +180,6 @@ def _action_target(tool_name: str, args: dict[str, Any]) -> str:
         return args.get("spreadsheet", "")
     if tool_name == "complete_task":
         return args.get("task_id", "")
-    if tool_name == "create_calendar_event":
-        return f"{args.get('title', '')} @ {args.get('start_time', '')}"
     return ""
 
 
@@ -195,7 +200,7 @@ def _scope_violation(tool_name: str, args: dict[str, Any], state: AgentState) ->
     participants = {address.lower() for address in state.get("participants", [])}
     attendee = (args.get("attendee_email") or "").strip().lower()
 
-    if tool_name == "create_calendar_event" and participants and attendee and attendee not in participants:
+    if tool_name == "propose_book_meeting" and target_thread_id and participants and attendee and attendee not in participants:
         return (
             f"Refused: {attendee} is not part of this conversation, "
             "so they cannot be invited."
@@ -214,9 +219,6 @@ def _dry_run_result(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         ),
     }
 
-    if tool_name == "create_calendar_event":
-        result.update(start=args.get("start_time"), end=args.get("end_time"), title=args.get("title"))
-
     return result
 
 
@@ -226,15 +228,13 @@ def _tool_message(content: Any, tool_call: dict[str, Any]) -> ToolMessage:
 
 def _needs_share_approval(args: dict[str, Any], store: AgentStateStore) -> bool:
     """
-    True if a reply attaches a Drive file the owner has not marked as always shareable.
+    True if a reply attaches any file the owner has not marked as always shareable.
 
-    Files in the local shareable folder (documents/) were put there to be shared.
+    A sent file cannot be unsent, so every attachment asks the owner first,
+    unless they chose "Send & always allow this file" for it before.
     """
 
-    return any(
-        path.startswith("drive:") and not store.is_file_shareable(path)
-        for path in args.get("attachment_paths") or []
-    )
+    return any(not store.is_file_shareable(path) for path in args.get("attachment_paths") or [])
 
 
 def _attachment_share_proposal(args: dict[str, Any]) -> dict[str, Any]:
@@ -256,7 +256,7 @@ def _attachment_share_proposal(args: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "send_reply_with_attachment",
         "attachments": attachments,
-        "reason": "The sender asked for a document from your Drive.",
+        "reason": "The reply includes a file.",
         "reply_body": args.get("body", ""),
     }
 
@@ -309,7 +309,7 @@ def _record_proposal(
         thread_id=state.get("target_thread_id"),
     )
     actions.append({"type": kind, "status": "proposed", "approval_id": approval_id, "args": proposal})
-    pending_approvals.append({"id": approval_id, "type": kind})
+    pending_approvals.append({"id": approval_id, "type": kind, "holds_reply": bool(proposal.get("reply"))})
 
     return (
         f"Approval request #{approval_id} sent to the owner. NOTHING has changed yet. "
@@ -359,6 +359,14 @@ def execute_tools(state: AgentState):
                     f"Refused: {tool_name} was already completed for this email "
                     f"(result: {earlier[-1]['result']}). Do not repeat it; use that result."
                 )
+
+        # A reply that waits for approval (booking, file) is the reply for this email.
+        held = next((p for p in pending_approvals if p.get("holds_reply")), None)
+        if refusal is None and held and tool_name in {"send_gmail_reply", "create_reply_draft"}:
+            refusal = (
+                f"Not sent: the reply for this email is waiting for the owner's approval "
+                f"(request #{held['id']}). Do not send another one."
+            )
 
         if refusal:
             failures.append(f"{tool_name}: {refusal}")

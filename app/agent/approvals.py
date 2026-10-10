@@ -1,8 +1,9 @@
 """
 Human-in-the-loop approvals.
 
-The agent never trashes email or moves/cancels events directly. Its propose_*
-tools record an approval request; only approve() below executes it, after the
+High-blast-radius actions are never done by the agent directly: booking,
+moving, or cancelling meetings, trashing email, and sending attachments. The
+agent records an approval request; only approve() below executes it, after the
 owner says yes (Telegram button or `python -m app.main --approve ID`).
 Everything is re-validated at execution time.
 """
@@ -16,6 +17,7 @@ from typing import Any
 from app.agent.followups import complete_followup_task
 from app.agent.state import AgentStateStore
 from app.calendar.events import cancel_event, move_event, parse_ist
+from app.calendar.tools import create_calendar_event
 from app.files.local import resolve_shareable_file
 from app.gmail.messages import send_reply, trash_message
 
@@ -23,7 +25,7 @@ from app.gmail.messages import send_reply, trash_message
 logger = logging.getLogger(__name__)
 
 # Approvals that perform an action when approved.
-EXECUTABLE_TYPES = {"trash_email", "move_event", "cancel_event", "send_reply_with_attachment"}
+EXECUTABLE_TYPES = {"trash_email", "book_meeting", "move_event", "cancel_event", "send_reply_with_attachment"}
 # Approvals that only ask the owner to look at something; approving closes them.
 REVIEW_TYPES = {"review_draft", "review_decision"}
 
@@ -48,6 +50,14 @@ def describe(approval: dict[str, Any]) -> str:
     if kind == "trash_email":
         scope = "the whole conversation" if payload.get("whole_thread") else "the email"
         text = f"Move {scope} to Trash (recoverable for 30 days):\n'{payload.get('subject', '')}' from {payload.get('sender', '')}"
+    elif kind == "book_meeting":
+        text = (
+            f"Book '{payload.get('title')}'\n"
+            f"{format_time(payload.get('new_start'))} - {format_time(payload.get('new_end'))}\n"
+            f"Invite: {payload.get('attendee_email') or 'nobody'}"
+        )
+        if payload.get("meeting_link"):
+            text += f"\nLink: {payload['meeting_link']}"
     elif kind == "move_event":
         text = (
             f"Move calendar event '{payload.get('title')}'\n"
@@ -63,7 +73,7 @@ def describe(approval: dict[str, Any]) -> str:
     elif kind == "send_reply_with_attachment":
         names = ", ".join(a["name"] for a in payload.get("attachments", []))
         to = (payload.get("reply") or {}).get("to", "the sender")
-        text = f"{to} asked for a file from your Drive.\nSend: {names}"
+        text = f"Reply to {to} with: {names}\nMessage:\n\"{(payload.get('reply') or {}).get('body', '')}\""
     elif kind == "review_draft":
         text = f"A reply draft is waiting in Gmail Drafts.\nWhat to check: {payload.get('target') or approval.get('target', '')}"
     elif kind == "review_decision":
@@ -75,7 +85,7 @@ def describe(approval: dict[str, Any]) -> str:
         text += f"\nWhy: {payload['reason']}"
 
     reply = payload.get("reply")
-    if reply:
+    if reply and kind != "send_reply_with_attachment":
         text += f"\nThen reply to {reply.get('to')}:\n\"{reply.get('body')}\""
 
     return text
@@ -111,8 +121,21 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
         )
         return {"reply": sent, "attachments": [a["name"] for a in payload["attachments"]]}
 
-    if kind == "move_event":
-        result: dict[str, Any] = {
+    if kind == "book_meeting":
+        # create_calendar_event re-checks that the slot is still free.
+        event = create_calendar_event.invoke({
+            "title": payload["title"],
+            "start_time": payload["new_start"],
+            "end_time": payload["new_end"],
+            "description": payload.get("description", ""),
+            "attendee_email": payload.get("attendee_email", ""),
+            "meeting_link": payload.get("meeting_link", ""),
+        })
+        if not event.get("verified"):
+            raise RuntimeError(f"Google did not confirm the event: {event}")
+        result: dict[str, Any] = {"event": event}
+    elif kind == "move_event":
+        result = {
             "event": move_event(payload["event_id"], parse_ist(payload["new_start"]), parse_ist(payload["new_end"]))
         }
     elif kind == "cancel_event":
@@ -206,7 +229,7 @@ def reject(approval_id: int, store: AgentStateStore | None = None) -> dict[str, 
     store.finish_approval(approval_id, "rejected", f"Rejected by owner at {datetime.now().isoformat(timespec='seconds')}")
     complete_followup_task(store, approval.get("message_id"))
 
-    if approval.get("message_id") and approval["type"] in {"move_event", "cancel_event"}:
+    if approval.get("message_id") and approval["type"] in {"book_meeting", "move_event", "cancel_event", "send_reply_with_attachment"}:
         store.mark_processed(
             approval["message_id"], approval.get("thread_id"), status="needs_review",
             summary="Owner rejected the proposed change; handle this email manually.",

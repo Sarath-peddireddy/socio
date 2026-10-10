@@ -51,7 +51,8 @@ Or just type an instruction, e.g.
 - add Acme, PM, applied today to my applications sheet
 - write a cover letter for Acme in a doc
 - remind me to send the invoice on Friday
-Deleting email and moving/cancelling events always ask for your approval first."""
+Booking, moving or cancelling meetings, deleting email, and sending files
+always ask for your approval first. Plain replies are sent on their own."""
 
 INTERESTING_STATUSES = {
     "replied": "✅ Replied",
