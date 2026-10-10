@@ -29,7 +29,7 @@ app/agent/state.py       SQLite: message outcomes, attempts, actions, approvals,
         │
 app/gmail/               read, search, reply, send, draft, trash (never permanent delete)
 app/calendar/            availability, create, find, move, cancel
-app/drive/, app/files/   documents from one Drive folder or a local folder
+app/drive/, app/files/   document search: owner's Drive (owned files) + local shareable folder
 app/workspace/           shared Workspace sign-in; Google Docs and Sheets (append-only)
 app/tasks/               Google Tasks; app/agent/followups.py adds tasks when the owner is needed
 app/google_auth.py       shared OAuth credential loading
@@ -63,9 +63,17 @@ through approvals.
 Drive, Docs, Sheets, and Tasks share one OAuth token (`workspace_token.json`,
 `python -m app.main --google-login`); Gmail and Calendar keep their own.
 Scopes: `drive.readonly`, `drive.file`, `documents`, `spreadsheets`, `tasks`.
-Because the Docs/Sheets scopes cover the whole Drive, the code restricts every
-read and edit to the configured Socio folder (`files/drive.resolve_folder_file`).
-Edits are append-only; Sheets values are written with `valueInputOption=RAW`.
+Socio searches the owner's whole Drive by default (`'me' in owners`, so files
+shared by others are never offered as the owner's); `AGENT_DRIVE_FOLDER`
+optionally limits it to one folder. Files Socio creates go into a "Socio"
+folder it creates and tags (`appProperties`), so it never writes into one of
+the owner's folders. Edits are append-only; Sheets values are written with
+`valueInputOption=RAW`.
+
+Sharing files by email: when the agent (email mode) replies with a Drive
+attachment the owner has not marked *Always allow*, the reply becomes a
+`send_reply_with_attachment` approval (Telegram: Send / Reject / Send & always
+allow). Files in the local shareable folder are sent directly.
 
 Follow-up tasks: when an email ends as `needs_review`, `needs_attention`, or
 `awaiting_approval`, a Google Task is created (once per email) and completed

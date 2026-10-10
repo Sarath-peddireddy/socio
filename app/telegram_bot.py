@@ -115,7 +115,14 @@ class Bot:
 
         for approval in approvals:
             approval_id = approval["id"]
-            if approval["type"] in EXECUTABLE_TYPES:
+            if approval["type"] == "send_reply_with_attachment":
+                title = f"📎 Share a file? #{approval_id}"
+                buttons = [
+                    [{"text": "✅ Send", "callback_data": f"approve:{approval_id}"},
+                     {"text": "❌ Reject", "callback_data": f"reject:{approval_id}"}],
+                    [{"text": "✅ Send & always allow this file", "callback_data": f"always:{approval_id}"}],
+                ]
+            elif approval["type"] in EXECUTABLE_TYPES:
                 title = f"🔐 Approval needed #{approval_id}"
                 buttons = [[
                     {"text": "✅ Approve", "callback_data": f"approve:{approval_id}"},
@@ -175,15 +182,20 @@ class Bot:
             return
 
         action, _, raw_id = (query.get("data") or "").partition(":")
-        if action not in {"approve", "reject"} or not raw_id.isdigit():
+        if action not in {"approve", "always", "reject"} or not raw_id.isdigit():
             self.api.call("answerCallbackQuery", callback_query_id=query["id"], text="Unknown button.")
             return
 
-        outcome = approve(int(raw_id), self.store) if action == "approve" else reject(int(raw_id), self.store)
+        if action == "reject":
+            outcome = reject(int(raw_id), self.store)
+        else:
+            outcome = approve(int(raw_id), self.store, always_allow=(action == "always"))
+            if action == "always" and outcome["ok"]:
+                outcome["message"] += " This file will be sent without asking next time."
         self.api.call("answerCallbackQuery", callback_query_id=query["id"], text=outcome["message"][:190])
 
         original = query.get("message", {}).get("text", "")
-        mark = "✅" if outcome["ok"] and action == "approve" else ("❌" if action == "reject" else "⚠️")
+        mark = "❌" if action == "reject" else ("✅" if outcome["ok"] else "⚠️")
         self.api.call(
             "editMessageText",
             chat_id=chat_id,

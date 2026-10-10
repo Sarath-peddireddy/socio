@@ -16,13 +16,14 @@ from typing import Any
 from app.agent.followups import complete_followup_task
 from app.agent.state import AgentStateStore
 from app.calendar.events import cancel_event, move_event, parse_ist
+from app.files.local import resolve_shareable_file
 from app.gmail.messages import send_reply, trash_message
 
 
 logger = logging.getLogger(__name__)
 
 # Approvals that perform an action when approved.
-EXECUTABLE_TYPES = {"trash_email", "move_event", "cancel_event"}
+EXECUTABLE_TYPES = {"trash_email", "move_event", "cancel_event", "send_reply_with_attachment"}
 # Approvals that only ask the owner to look at something; approving closes them.
 REVIEW_TYPES = {"review_draft", "review_decision"}
 
@@ -59,6 +60,10 @@ def describe(approval: dict[str, Any]) -> str:
             f"Cancel calendar event '{payload.get('title')}' at {format_time(payload.get('old_start'))}\n"
             f"Attendees are notified by Google: {', '.join(payload.get('other_attendees', [])) or 'none'}"
         )
+    elif kind == "send_reply_with_attachment":
+        names = ", ".join(a["name"] for a in payload.get("attachments", []))
+        to = (payload.get("reply") or {}).get("to", "the sender")
+        text = f"{to} asked for a file from your Drive.\nSend: {names}"
     elif kind == "review_draft":
         text = f"A reply draft is waiting in Gmail Drafts.\nWhat to check: {payload.get('target') or approval.get('target', '')}"
     elif kind == "review_decision":
@@ -97,6 +102,15 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
     if kind == "trash_email":
         return {"trash": trash_message(payload["message_id"], whole_thread=bool(payload.get("whole_thread")))}
 
+    if kind == "send_reply_with_attachment":
+        reply = payload["reply"]
+        attachments = [str(resolve_shareable_file(a["path"])) for a in payload["attachments"]]
+        sent = send_reply(
+            thread_id=reply["thread_id"], message_id=reply["message_id"], to=reply["to"],
+            subject="", body=reply["body"], attachment_paths=attachments,
+        )
+        return {"reply": sent, "attachments": [a["name"] for a in payload["attachments"]]}
+
     if kind == "move_event":
         result: dict[str, Any] = {
             "event": move_event(payload["event_id"], parse_ist(payload["new_start"]), parse_ist(payload["new_end"]))
@@ -115,8 +129,13 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str, Any]:
-    """Execute an approval. Safe to call twice: only the first call acts."""
+def approve(approval_id: int, store: AgentStateStore | None = None, always_allow: bool = False) -> dict[str, Any]:
+    """
+    Execute an approval. Safe to call twice: only the first call acts.
+
+    always_allow (file shares only): also remember the attached files as
+    shareable, so future email requests for them are sent without asking.
+    """
 
     store = store or AgentStateStore()
     approval = store.get_approval(approval_id)
@@ -139,6 +158,10 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
         return {"ok": False, "message": f"Approval #{approval_id} is already being handled."}
 
     message_id, thread_id = approval.get("message_id"), approval.get("thread_id")
+
+    if always_allow and approval["type"] == "send_reply_with_attachment":
+        for attachment in approval["payload"].get("attachments", []):
+            store.allow_shared_file(attachment["path"], attachment["name"])
 
     try:
         result = _execute(approval)

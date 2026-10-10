@@ -95,6 +95,16 @@ class AgentStateStore:
                 """
             )
 
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS shared_files (
+                    path TEXT PRIMARY KEY,
+                    name TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
             self._ensure_column(conn, "processed_messages", "attempts", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "processed_messages", "updated_at", "TEXT")
             self._ensure_column(conn, "actions", "message_id", "TEXT")
@@ -333,6 +343,20 @@ class AgentStateStore:
     def mark_approval_notified(self, approval_id: int) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE pending_approvals SET notified = 1 WHERE id = ?", (approval_id,))
+
+    # ----- files the owner allowed Socio to send without asking -------------------
+
+    def is_file_shareable(self, path: str) -> bool:
+        with self._connect() as conn:
+            return conn.execute("SELECT 1 FROM shared_files WHERE path = ?", (path,)).fetchone() is not None
+
+    def allow_shared_file(self, path: str, name: str = "") -> None:
+        with self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO shared_files (path, name) VALUES (?, ?)", (path, name))
+
+    def shared_files(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT path, name, created_at FROM shared_files ORDER BY name")]
 
     # ----- failures -------------------------------------------------------------
 

@@ -80,25 +80,30 @@ def _query_tokens(query: str) -> set[str]:
 
 def search_documents(query: str, max_results: int = 5) -> list[dict]:
     """
-    Search the Google Drive folder (if configured) and local shareable folders.
+    Search the owner's Google Drive and the local shareable folders.
 
-    Results are ranked by how many query words match the file or folder name.
-    If Drive is configured but unavailable, a {"note": ...} entry explains why.
+    Drive is searched by name and content (whole Drive, or only the
+    AGENT_DRIVE_FOLDER folder if set). Results are ranked by how many query
+    words match the file name, then by most recently modified. If Drive is
+    unavailable, a {"note": ...} entry explains why.
     """
 
     matches = search_local_files(query, max_results=max_results)
     notes = []
 
-    from app.files.drive import drive_configured, list_drive_documents
+    from app.files.drive import drive_available, folder_limited, search_drive
 
-    if drive_configured():
+    if drive_available():
         try:
+            from app.agent.state import AgentStateStore
+
+            store = AgentStateStore()
             query_tokens = _query_tokens(query)
-            for document in list_drive_documents(ALLOWED_EXTENSIONS):
-                name_tokens = _tokens(f"{document['folder']} {Path(document['name']).stem}")
-                score = len(query_tokens & name_tokens)
-                if score == 0 and query_tokens:
-                    continue
+
+            for document in search_drive(query_tokens, ALLOWED_EXTENSIONS):
+                name_score = len(query_tokens & _tokens(f"{document['folder']} {Path(document['name']).stem}"))
+                if name_score == 0 and folder_limited():
+                    continue  # folder listing has no content search; keep only name matches
                 matches.append(
                     {
                         "path": document["path"],
@@ -107,14 +112,16 @@ def search_documents(query: str, max_results: int = 5) -> list[dict]:
                         "source": "google_drive",
                         "size_kb": round(document["size_bytes"] / 1024, 1),
                         "modified": document["modified"],
-                        "match_score": score,
+                        # 0.5 = Drive matched the words inside the file, not in its name.
+                        "match_score": name_score or 0.5,
                         "too_large_to_attach": document["size_bytes"] > MAX_ATTACHMENT_BYTES,
+                        "email_share_needs_approval": not store.is_file_shareable(document["path"]),
                     }
                 )
         except Exception as exc:
             notes.append({"note": f"Google Drive could not be searched: {exc}"})
 
-    matches.sort(key=lambda match: (-match["match_score"], match["source"] != "google_drive", match["name"].lower()))
+    matches.sort(key=lambda match: (-match["match_score"], match["modified"] and -int(match["modified"].replace("-", "")) or 0, match["name"].lower()))
     return matches[:max_results] + notes
 
 

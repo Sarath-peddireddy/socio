@@ -85,6 +85,7 @@ def main(argv=None) -> int:
     parser.add_argument("--resolve", type=int, metavar="ID", help="Close pending approval #ID and exit")
     parser.add_argument("--approve", type=int, metavar="ID", help="Approve and execute pending approval #ID")
     parser.add_argument("--reject", type=int, metavar="ID", help="Reject pending approval #ID (nothing changes)")
+    parser.add_argument("--always-allow", action="store_true", help="With --approve on a file share: always allow sending that file")
     parser.add_argument("--ask", metavar="TEXT", help="Give the agent a direct instruction (owner mode)")
     parser.add_argument("--google-login", "--drive-login", dest="google_login", action="store_true",
                         help="Sign in to Google Drive, Docs, Sheets and Tasks, and list the Socio folder")
@@ -112,22 +113,21 @@ def main(argv=None) -> int:
 
     if args.google_login:
         from app.drive.client import get_drive_service
-        from app.files.drive import drive_configured, list_drive_documents
+        from app.files.drive import folder_limited, list_drive_documents
         from app.files.local import ALLOWED_EXTENSIONS
 
-        get_drive_service(allow_browser_login=True)
-        print("Google Drive, Docs, Sheets and Tasks connected.")
-        if not drive_configured():
-            print("Set AGENT_DRIVE_FOLDER=<folder name> in .env to choose the documents folder.")
-            return 1
-        documents = list_drive_documents(ALLOWED_EXTENSIONS)
-        print(f"The agent can see {len(documents)} file(s):")
-        for document in documents:
-            print(f"  {document['folder'] + '/' if document['folder'] else ''}{document['name']}")
+        service = get_drive_service(allow_browser_login=True)
+        user = service.about().get(fields="user(displayName, emailAddress)").execute()["user"]
+        print(f"Google Drive, Docs, Sheets and Tasks connected for {user['emailAddress']}.")
+        if folder_limited():
+            documents = list_drive_documents(ALLOWED_EXTENSIONS)
+            print(f"Limited to the AGENT_DRIVE_FOLDER folder: {len(documents)} file(s) visible.")
+        else:
+            print("Socio can search your whole Drive. Files Socio creates go into a 'Socio' folder.")
         return 0
 
     if args.approve is not None or args.reject is not None:
-        outcome = approve(args.approve) if args.approve is not None else reject(args.reject)
+        outcome = approve(args.approve, always_allow=args.always_allow) if args.approve is not None else reject(args.reject)
         print(outcome["message"])
         return 0 if outcome["ok"] else 1
 

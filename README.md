@@ -16,7 +16,7 @@ Telegram.
 | Incoming email | What Socio does |
 |---|---|
 | "Can we schedule a 30-min interview?" | Finds a free slot, books it with the sender invited, replies with the exact time |
-| "Could you send your resume?" | Finds it in your Google Drive documents folder and replies with it attached |
+| "Could you send your resume?" | Finds it in your Google Drive and asks you on Telegram before sending it (tap *Always allow* once and it won't ask again) |
 | "What's your notice period?" (Socio doesn't know) | Saves a ready-to-send Gmail draft with the gaps marked for you |
 | "Can we move our call to Friday?" | Finds the meeting and asks you on Telegram; once you approve, it moves the event and replies |
 | Newsletters, promotions, receipts, "thanks!", FYIs | Nothing. No reply is sent |
@@ -45,12 +45,16 @@ also adds it to **Google Tasks**, and completes it once you've acted.
   restricted toolset: it can only reply inside that conversation, only to
   people already in it, and can never delete, search your other mail, or
   email new people.
-- **One folder, append-only.** Socio only sees one Google Drive folder you
-  choose. It can read Docs and Sheets there and *add* to them (append text,
-  add rows) but never deletes or overwrites anything. Sheet values are
-  written as plain text, so content from an email can never become a formula.
-  Docs, Sheets, and Tasks are only available on your instructions, never
-  while handling an incoming email.
+- **Your Drive, your call.** Socio searches your whole Drive (only files you
+  own, never ones others shared with you). It never sends a Drive file to
+  someone who emailed asking for it without your approval, unless you've
+  marked that file *Always allow*.
+- **Append-only edits.** Socio can read Docs and Sheets and *add* to them
+  (append text, add rows) but never deletes or overwrites anything. Sheet
+  values are written as plain text, so content from an email can never
+  become a formula. Docs, Sheets, and Tasks are only available on your
+  instructions, never while handling an incoming email. Files Socio creates
+  go into a "Socio" folder it creates in your Drive.
 - **No duplicates.** Sends, bookings, and drafts are never retried
   blindly; every outcome is recorded so a restart never repeats work.
 - **Owner-only bot.** The Telegram bot only responds to your chat id.
@@ -93,7 +97,7 @@ See [`.env.example`](.env.example).
 |---|---|
 | `GEMINI_API_KEY` | LLM used for decisions and writing |
 | `AGENT_OWNER_NAME` | Name used to sign emails |
-| `AGENT_DRIVE_FOLDER` | The one Google Drive folder Socio may use (documents, Docs, Sheets) |
+| `AGENT_DRIVE_FOLDER` | Optional: limit Socio to one Drive folder (default: your whole Drive) |
 | `AGENT_AUTO_TASKS` | Add a Google Task when something needs you (default on; `0` = off) |
 | `AGENT_FILES_DIR` | Optional local documents folder (default `./documents`) |
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |

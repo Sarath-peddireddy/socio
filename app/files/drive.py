@@ -1,12 +1,19 @@
 """
 Google Drive as a document source.
 
-Only files inside one configured folder (AGENT_DRIVE_FOLDER name, or
-AGENT_DRIVE_FOLDER_ID) are visible to the agent. Files are downloaded to a
-local cache only when they are about to be attached.
+By default Socio searches the owner's whole Drive (read-only). Setting
+AGENT_DRIVE_FOLDER (name) or AGENT_DRIVE_FOLDER_ID optionally limits it to one
+folder and its subfolders.
+
+Files Socio creates (Docs, Sheets) go into a "Socio" folder that Socio creates
+and tags itself, so it never writes into one of the owner's own folders.
+
+Reading is unrestricted for the owner; *sending* a Drive file to someone who
+emailed asking for it needs the owner's approval (see app.agent.approvals).
 """
 
 import os
+import re
 from pathlib import Path, PureWindowsPath
 
 from app.drive.client import get_drive_service
@@ -18,6 +25,7 @@ CACHE_DIR = PROJECT_ROOT / "downloads" / "drive_cache"
 DRIVE_PREFIX = "drive:"
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
+SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 # Google-native files are exported to a normal file type when attached.
 EXPORTS = {
     "application/vnd.google-apps.document": ("application/pdf", ".pdf"),
@@ -27,14 +35,33 @@ EXPORTS = {
         ".xlsx",
     ),
 }
+FILE_FIELDS = "id, name, mimeType, size, modifiedTime, parents, trashed"
 MAX_FILES = 300
 
+OUTPUT_FOLDER_NAME = "Socio"
+OUTPUT_FOLDER_TAG = {"socio": "output"}
 
-def drive_configured() -> bool:
+
+# ----- configuration -----------------------------------------------------------
+
+
+def drive_available() -> bool:
+    """True when the owner has signed in to Google Workspace (or set a folder)."""
+
+    from app.workspace.client import TOKEN_PATH
+
+    return TOKEN_PATH.exists() or folder_limited()
+
+
+def folder_limited() -> bool:
     return bool(os.getenv("AGENT_DRIVE_FOLDER_ID", "").strip() or os.getenv("AGENT_DRIVE_FOLDER", "").strip())
 
 
-def _root_folder_id(service) -> str:
+# Backwards-compatible name used elsewhere in the codebase.
+drive_configured = drive_available
+
+
+def _limit_folder_id(service) -> str:
     folder_id = os.getenv("AGENT_DRIVE_FOLDER_ID", "").strip()
     if folder_id:
         return folder_id
@@ -57,6 +84,9 @@ def _root_folder_id(service) -> str:
     return folders[0]["id"]
 
 
+# ----- helpers -------------------------------------------------------------------
+
+
 def _display_name(file: dict) -> str:
     name = file["name"]
     export = EXPORTS.get(file["mimeType"])
@@ -65,11 +95,43 @@ def _display_name(file: dict) -> str:
     return name
 
 
+def _is_document(file: dict, allowed_extensions: set[str]) -> bool:
+    if file["mimeType"] in (FOLDER_MIME, SHORTCUT_MIME) or file.get("trashed"):
+        return False
+    return file["mimeType"] in EXPORTS or Path(_display_name(file)).suffix.lower() in allowed_extensions
+
+
+def _as_document(file: dict, folder: str = "") -> dict:
+    return {
+        "path": f"{DRIVE_PREFIX}{file['id']}",
+        "name": _display_name(file),
+        "folder": folder,
+        "size_bytes": int(file.get("size", 0) or 0),
+        "modified": (file.get("modifiedTime") or "")[:10],
+        "mime_type": file["mimeType"],
+        "source": "google_drive",
+    }
+
+
+def _file_id_from_reference(reference: str) -> str:
+    """Accept "drive:<id>", a Google Docs/Sheets/Drive URL, or a bare file id."""
+
+    reference = reference.strip()
+    if reference.startswith(DRIVE_PREFIX):
+        return reference[len(DRIVE_PREFIX):]
+
+    match = re.search(r"/d/([A-Za-z0-9_-]+)", reference) or re.search(r"[?&]id=([A-Za-z0-9_-]+)", reference)
+    return match.group(1) if match else reference
+
+
+# ----- listing and search -----------------------------------------------------------
+
+
 def list_drive_documents(allowed_extensions: set[str]) -> list[dict]:
-    """All shareable files in the configured folder and its subfolders."""
+    """All documents in the limiting folder and its subfolders (folder-limited mode only)."""
 
     service = get_drive_service()
-    queue = [(_root_folder_id(service), "")]
+    queue = [(_limit_folder_id(service), "")]
     documents = []
 
     while queue and len(documents) < MAX_FILES:
@@ -80,7 +142,7 @@ def list_drive_documents(allowed_extensions: set[str]) -> list[dict]:
             response = execute_with_retry(
                 service.files().list(
                     q=f"'{folder_id}' in parents and trashed = false",
-                    fields="nextPageToken, files(id, name, mimeType, size, modifiedTime)",
+                    fields=f"nextPageToken, files({FILE_FIELDS})",
                     pageSize=100,
                     pageToken=page_token,
                 ),
@@ -90,23 +152,8 @@ def list_drive_documents(allowed_extensions: set[str]) -> list[dict]:
             for file in response.get("files", []):
                 if file["mimeType"] == FOLDER_MIME:
                     queue.append((file["id"], f"{folder_path}{file['name']}/"))
-                    continue
-
-                name = _display_name(file)
-                if file["mimeType"] not in EXPORTS and Path(name).suffix.lower() not in allowed_extensions:
-                    continue
-
-                documents.append(
-                    {
-                        "path": f"{DRIVE_PREFIX}{file['id']}",
-                        "name": name,
-                        "folder": folder_path.rstrip("/"),
-                        "size_bytes": int(file.get("size", 0) or 0),
-                        "modified": (file.get("modifiedTime") or "")[:10],
-                        "mime_type": file["mimeType"],
-                        "source": "google_drive",
-                    }
-                )
+                elif _is_document(file, allowed_extensions):
+                    documents.append(_as_document(file, folder_path.rstrip("/")))
 
             page_token = response.get("nextPageToken")
             if not page_token:
@@ -115,31 +162,83 @@ def list_drive_documents(allowed_extensions: set[str]) -> list[dict]:
     return documents
 
 
+def search_drive(words: set[str], allowed_extensions: set[str], max_results: int = 25) -> list[dict]:
+    """
+    Search documents by name and content.
+
+    Whole Drive by default (Drive's own search index), or the limiting folder
+    when AGENT_DRIVE_FOLDER is set.
+    """
+
+    if folder_limited():
+        return list_drive_documents(allowed_extensions)
+
+    words = [word for word in words if word]
+    if not words:
+        return []
+
+    clauses = " or ".join(
+        f"name contains '{w}' or fullText contains '{w}'" for w in (word.replace("'", "\\'") for word in words)
+    )
+    # Only files the owner owns: "Shared with me" contains other people's
+    # documents (e.g. their resumes), which must never be offered as "mine".
+    response = execute_with_retry(
+        get_drive_service().files().list(
+            q=f"({clauses}) and 'me' in owners and trashed = false and mimeType != '{FOLDER_MIME}'",
+            fields=f"files({FILE_FIELDS})",
+            pageSize=max(1, min(max_results, 100)),
+            spaces="drive",
+        ),
+        operation_name="drive_search",
+    )
+
+    return [_as_document(file) for file in response.get("files", []) if _is_document(file, allowed_extensions)]
+
+
+def get_drive_document(reference: str, allowed_extensions: set[str]) -> dict:
+    """Metadata for one document by reference, enforcing the folder limit if one is set."""
+
+    file_id = _file_id_from_reference(reference)
+
+    if folder_limited():
+        match = next((d for d in list_drive_documents(allowed_extensions) if d["path"] == f"{DRIVE_PREFIX}{file_id}"), None)
+        if match is None:
+            raise ValueError("That file is outside the Drive folder Socio is limited to (AGENT_DRIVE_FOLDER).")
+        return match
+
+    try:
+        file = execute_with_retry(
+            get_drive_service().files().get(fileId=file_id, fields=FILE_FIELDS),
+            operation_name="drive_get_file",
+        )
+    except Exception as exc:
+        raise ValueError(f"Drive file not found or not accessible: {reference}") from exc
+
+    if not _is_document(file, allowed_extensions):
+        raise ValueError(f"'{file.get('name')}' is not a supported document type.")
+
+    return _as_document(file)
+
+
+# ----- download (for attachments) ------------------------------------------------------
+
+
 def download_drive_document(path: str, allowed_extensions: set[str], max_bytes: int) -> Path:
-    """
-    Download a Drive document (by "drive:<id>") into the local cache and return its path.
+    """Download a Drive document (by "drive:<id>") into the local cache and return its path."""
 
-    The id must belong to the configured folder, so an email cannot make the
-    agent fetch arbitrary files from the owner's Drive.
-    """
-
-    file_id = path[len(DRIVE_PREFIX):]
-    match = next((d for d in list_drive_documents(allowed_extensions) if d["path"] == path), None)
-
-    if match is None:
-        raise ValueError(f"Refusing to attach {path}: it is not in the shareable Drive folder.")
+    match = get_drive_document(path, allowed_extensions)
+    file_id = match["path"][len(DRIVE_PREFIX):]
 
     if match["size_bytes"] > max_bytes:
         raise ValueError(f"Refusing to attach {match['name']}: larger than {max_bytes // (1024 * 1024)} MB.")
 
     service = get_drive_service()
     export = EXPORTS.get(match["mime_type"])
-
-    if export:
-        request = service.files().export(fileId=file_id, mimeType=export[0])
-    else:
-        request = service.files().get_media(fileId=file_id)
-
+    request = (
+        service.files().export(fileId=file_id, mimeType=export[0])
+        if export
+        else service.files().get_media(fileId=file_id)
+    )
     data = execute_with_retry(request, operation_name="drive_download")
 
     if len(data) > max_bytes:
@@ -153,50 +252,61 @@ def download_drive_document(path: str, allowed_extensions: set[str], max_bytes: 
     return target
 
 
-def socio_folder_id() -> str:
-    """Id of the configured Socio Drive folder."""
-
-    if not drive_configured():
-        raise RuntimeError("No Socio Drive folder configured. Set AGENT_DRIVE_FOLDER in .env.")
-    return _root_folder_id(get_drive_service())
+# ----- Docs / Sheets support ----------------------------------------------------------------
 
 
-def _file_id_from_reference(reference: str) -> str:
-    """Accept "drive:<id>", a Google Docs/Sheets URL, or a bare file id."""
-
-    reference = reference.strip()
-    if reference.startswith(DRIVE_PREFIX):
-        return reference[len(DRIVE_PREFIX):]
-
-    marker = "/d/"
-    if marker in reference:
-        return reference.split(marker, 1)[1].split("/", 1)[0].split("?", 1)[0]
-
-    return reference
-
-
-def resolve_folder_file(reference: str, mime_type: str) -> dict:
-    """
-    Resolve a reference to a file of mime_type inside the Socio folder.
-
-    Socio's Docs/Sheets permissions cover the whole Drive, so this check is
-    what keeps reads and edits inside the folder the owner chose.
-    """
+def resolve_drive_file(reference: str, mime_type: str) -> dict:
+    """Resolve a reference to a Google Doc/Sheet the owner can access (respecting any folder limit)."""
 
     from app.files.local import ALLOWED_EXTENSIONS
 
-    file_id = _file_id_from_reference(reference)
-    for document in list_drive_documents(ALLOWED_EXTENSIONS):
-        if document["path"] == f"{DRIVE_PREFIX}{file_id}":
-            if document["mime_type"] != mime_type:
-                raise ValueError(f"'{document['name']}' is not a {mime_type.rsplit('.', 1)[-1]}.")
-            return {"id": file_id, "name": document["name"], "folder": document["folder"]}
+    document = get_drive_document(reference, ALLOWED_EXTENSIONS)
+    if document["mime_type"] != mime_type:
+        kind = "document" if "document" in mime_type else "spreadsheet"
+        raise ValueError(f"'{document['name']}' is not a Google {kind}.")
 
-    raise ValueError("That file is not in the Socio Drive folder. Use find_documents to locate it first.")
+    return {"id": document["path"][len(DRIVE_PREFIX):], "name": document["name"], "folder": document["folder"]}
 
 
-def move_into_socio_folder(file_id: str) -> None:
-    """Move a file Socio just created (in My Drive) into the Socio folder."""
+def output_folder_id() -> str:
+    """
+    Folder where Socio puts files it creates.
+
+    The limiting folder if one is set; otherwise a "Socio" folder that Socio
+    created and tagged itself (created on first use).
+    """
+
+    service = get_drive_service()
+
+    if folder_limited():
+        return _limit_folder_id(service)
+
+    key, value = next(iter(OUTPUT_FOLDER_TAG.items()))
+    existing = execute_with_retry(
+        service.files().list(
+            q=f"appProperties has {{ key='{key}' and value='{value}' }} and mimeType = '{FOLDER_MIME}' and trashed = false",
+            fields="files(id)",
+            pageSize=1,
+        ),
+        operation_name="drive_find_output_folder",
+    ).get("files", [])
+
+    if existing:
+        return existing[0]["id"]
+
+    folder = execute_with_retry(
+        service.files().create(
+            body={"name": OUTPUT_FOLDER_NAME, "mimeType": FOLDER_MIME, "appProperties": OUTPUT_FOLDER_TAG},
+            fields="id",
+        ),
+        operation_name="drive_create_output_folder",
+        retry=False,
+    )
+    return folder["id"]
+
+
+def move_into_output_folder(file_id: str) -> None:
+    """Move a file Socio just created (in My Drive) into Socio's output folder."""
 
     service = get_drive_service()
     current = execute_with_retry(
@@ -206,9 +316,9 @@ def move_into_socio_folder(file_id: str) -> None:
     execute_with_retry(
         service.files().update(
             fileId=file_id,
-            addParents=socio_folder_id(),
+            addParents=output_folder_id(),
             removeParents=",".join(current.get("parents", [])),
             fields="id, parents",
         ),
-        operation_name="drive_move_to_folder",
+        operation_name="drive_move_to_output_folder",
     )

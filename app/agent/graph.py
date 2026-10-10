@@ -224,6 +224,43 @@ def _tool_message(content: Any, tool_call: dict[str, Any]) -> ToolMessage:
     return ToolMessage(content=str(content), tool_call_id=tool_call.get("id"))
 
 
+def _needs_share_approval(args: dict[str, Any], store: AgentStateStore) -> bool:
+    """
+    True if a reply attaches a Drive file the owner has not marked as always shareable.
+
+    Files in the local shareable folder (documents/) were put there to be shared.
+    """
+
+    return any(
+        path.startswith("drive:") and not store.is_file_shareable(path)
+        for path in args.get("attachment_paths") or []
+    )
+
+
+def _attachment_share_proposal(args: dict[str, Any]) -> dict[str, Any]:
+    """Validate the attachments and describe the reply for the owner's approval."""
+
+    from pathlib import Path
+
+    from app.files.drive import get_drive_document
+    from app.files.local import ALLOWED_EXTENSIONS, resolve_shareable_file
+
+    attachments = []
+    for path in args.get("attachment_paths") or []:
+        if path.startswith("drive:"):
+            name = get_drive_document(path, ALLOWED_EXTENSIONS)["name"]
+        else:
+            name = Path(resolve_shareable_file(path)).name
+        attachments.append({"path": path, "name": name})
+
+    return {
+        "type": "send_reply_with_attachment",
+        "attachments": attachments,
+        "reason": "The sender asked for a document from your Drive.",
+        "reply_body": args.get("body", ""),
+    }
+
+
 def _record_proposal(
     proposal: dict[str, Any],
     state: AgentState,
@@ -242,7 +279,7 @@ def _record_proposal(
     if _is_email_mode(state):
         # A sender may only ask to change an event they are part of.
         participants = {address.lower() for address in state.get("participants", [])}
-        if not set(proposal.get("other_attendees", [])) & participants:
+        if kind in {"move_event", "cancel_event"} and not set(proposal.get("other_attendees", [])) & participants:
             refusal = (
                 "Refused: nobody from this email conversation is an attendee of that event, "
                 "so it cannot be changed on their request. Use create_reply_draft instead."
@@ -326,6 +363,18 @@ def execute_tools(state: AgentState):
         if refusal:
             failures.append(f"{tool_name}: {refusal}")
             tool_results.append(_tool_message(refusal, tool_call))
+            continue
+
+        # In email mode, sending a Drive file the owner has not allowed needs approval.
+        if _is_email_mode(state) and tool_name == "send_gmail_reply" and _needs_share_approval(args, store):
+            try:
+                proposal = _attachment_share_proposal(args)
+            except Exception as exc:
+                failures.append(f"{tool_name}: {exc}")
+                tool_results.append(_tool_message(f"Tool failed: {exc}", tool_call))
+                continue
+            message = _record_proposal(proposal, state, store, dry_run, actions, pending_approvals, failures)
+            tool_results.append(_tool_message(message, tool_call))
             continue
 
         if dry_run and tool_name in SIDE_EFFECT_TOOLS:

@@ -2,11 +2,12 @@
 Google Sheets: read, append rows, and create. Nothing is ever deleted or overwritten.
 
 Values are written as RAW text (never USER_ENTERED), so content that came from
-an email can never become a formula. Reads and edits are limited to the
-Socio Drive folder; new spreadsheets are created there.
+an email can never become a formula. Works on any Sheet the owner can access
+(or only the AGENT_DRIVE_FOLDER folder if set); new spreadsheets go into
+Socio's own "Socio" folder. Owner mode only.
 """
 
-from app.files.drive import move_into_socio_folder, resolve_folder_file
+from app.files.drive import move_into_output_folder, resolve_drive_file
 from app.google_api import execute_with_retry
 from app.workspace.client import get_workspace_service
 
@@ -36,9 +37,9 @@ def _tab_names(spreadsheet_id: str) -> list[str]:
 
 
 def read_sheet(reference: str, tab: str = "") -> dict:
-    """Rows of one tab (default: the first) of a spreadsheet in the Socio folder."""
+    """Rows of one tab (default: the first) of a spreadsheet."""
 
-    file = resolve_folder_file(reference, SHEET_MIME)
+    file = resolve_drive_file(reference, SHEET_MIME)
     tabs = _tab_names(file["id"])
     tab = tab or (tabs[0] if tabs else "Sheet1")
     if tab not in tabs:
@@ -68,7 +69,7 @@ def append_sheet_row(reference: str, values: list[str], tab: str = "") -> dict:
     if not values:
         raise ValueError("The row is empty.")
 
-    file = resolve_folder_file(reference, SHEET_MIME)
+    file = resolve_drive_file(reference, SHEET_MIME)
     tabs = _tab_names(file["id"])
     tab = tab or (tabs[0] if tabs else "Sheet1")
     if tab not in tabs:
@@ -96,7 +97,7 @@ def append_sheet_row(reference: str, values: list[str], tab: str = "") -> dict:
 
 
 def create_spreadsheet(title: str, headers: list[str] | None = None) -> dict:
-    """Create a spreadsheet (optionally with a header row) inside the Socio folder."""
+    """Create a spreadsheet (optionally with a header row) in Socio's folder."""
 
     if not title.strip():
         raise ValueError("A spreadsheet needs a title.")
@@ -116,5 +117,5 @@ def create_spreadsheet(title: str, headers: list[str] | None = None) -> dict:
     )
     sheet_id = spreadsheet["spreadsheetId"]
 
-    move_into_socio_folder(sheet_id)
+    move_into_output_folder(sheet_id)
     return {"spreadsheet_id": sheet_id, "title": title.strip(), "url": _sheet_url(sheet_id), "verified": True}

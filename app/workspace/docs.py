@@ -1,11 +1,11 @@
 """
 Google Docs: read, create, and append. Nothing is ever deleted or overwritten.
 
-Reads and edits are limited to the Socio Drive folder; new documents are
-created there.
+Works on any Doc the owner can access (or only the AGENT_DRIVE_FOLDER folder
+if set); new documents go into Socio's own "Socio" folder. Owner mode only.
 """
 
-from app.files.drive import move_into_socio_folder, resolve_folder_file
+from app.files.drive import move_into_output_folder, resolve_drive_file
 from app.google_api import execute_with_retry
 from app.workspace.client import get_workspace_service
 
@@ -36,9 +36,9 @@ def _text_from_elements(elements: list[dict]) -> str:
 
 
 def read_document(reference: str) -> dict:
-    """Plain text of a Google Doc in the Socio folder (truncated for very long docs)."""
+    """Plain text of a Google Doc (truncated for very long docs)."""
 
-    file = resolve_folder_file(reference, DOC_MIME)
+    file = resolve_drive_file(reference, DOC_MIME)
     document = execute_with_retry(_service().documents().get(documentId=file["id"]), operation_name="docs_get")
     text = _text_from_elements(document.get("body", {}).get("content", []))
 
@@ -52,7 +52,7 @@ def read_document(reference: str) -> dict:
 
 
 def create_document(title: str, content: str) -> dict:
-    """Create a Google Doc with the given text inside the Socio folder."""
+    """Create a Google Doc with the given text in Socio's folder."""
 
     if not title.strip():
         raise ValueError("A document needs a title.")
@@ -77,17 +77,17 @@ def create_document(title: str, content: str) -> dict:
             retry=False,
         )
 
-    move_into_socio_folder(doc_id)
+    move_into_output_folder(doc_id)
     return {"doc_id": doc_id, "title": title.strip(), "url": _doc_url(doc_id), "verified": True}
 
 
 def append_to_document(reference: str, text: str) -> dict:
-    """Append text to the end of a Google Doc in the Socio folder (existing content is untouched)."""
+    """Append text to the end of a Google Doc (existing content is untouched)."""
 
     if not text:
         raise ValueError("Nothing to append.")
 
-    file = resolve_folder_file(reference, DOC_MIME)
+    file = resolve_drive_file(reference, DOC_MIME)
     service = _service()
 
     # endOfSegmentLocation appends at the end of the body without touching existing content.

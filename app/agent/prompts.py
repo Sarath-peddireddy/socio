@@ -83,7 +83,9 @@ def _email_mode_prompt() -> str:
 - document_request: call find_documents with the key words of the request. If exactly one
   file clearly matches, reply with it attached (attachment_paths). If none or several equally
   plausible files match, use create_reply_draft and say what is missing. Never attach a file
-  the sender did not ask for.
+  the sender did not ask for. Files from the owner's Google Drive may need the owner's
+  approval: send_gmail_reply then returns an approval request instead of sending; that is
+  expected, do not send again or work around it.
 - follow_up: work out the original request from the thread and handle it with the playbook
   above. If it was already fully answered and nothing new is asked, take no action.
 - other_request: reply only if you can answer completely and safely from the thread;
