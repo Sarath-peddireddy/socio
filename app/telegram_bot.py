@@ -26,7 +26,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from app.agent.approvals import EXECUTABLE_TYPES, REPLY_TYPES, approve, describe, reject, to_draft
 from app.agent.llm import LLMUnavailableError
-from app.agent.runner import DEFAULT_QUERY, handle_owner_command, process_inbox
+from app.agent.runner import BUSY_STATUS, DEFAULT_QUERY, handle_owner_command, process_inbox
 from app.agent.state import AgentStateStore
 from app.google_api import GoogleApiUnavailableError
 
@@ -149,6 +149,12 @@ class Bot:
     def run_inbox(self, dry_run: bool = False, announce: bool = False) -> None:
         query = os.getenv("AGENT_INBOX_QUERY", DEFAULT_QUERY)
         outcomes = process_inbox(query=query, dry_run=dry_run)
+
+        if outcomes and outcomes[0].status == BUSY_STATUS:
+            # Another process (e.g. the CLI) is processing the inbox; the scheduled check stays quiet.
+            if announce:
+                self.send(f"⏳ {outcomes[0].reason}")
+            return
 
         lines = []
         quiet = 0

@@ -28,6 +28,13 @@ RETRYABLE_STATUSES = ("in_progress", "failed")
 # How long a slot proposed for a booking/move stays held while the owner decides.
 SLOT_HOLD_HOURS = 24
 
+# How long a process waits for another one's write before giving up.
+BUSY_TIMEOUT_SECONDS = 30
+
+# Lease on a run lock; renewed while the run makes progress, so a crashed
+# process cannot block later runs for longer than this.
+RUN_LOCK_MINUTES = 30
+
 
 class AgentStateStore:
     """Persist agent progress so a restarted run does not repeat completed work."""
@@ -38,7 +45,9 @@ class AgentStateStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        # The bot and the CLI can run at the same time: wait for a writer instead of
+        # failing with "database is locked".
+        conn = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_SECONDS)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -52,6 +61,11 @@ class AgentStateStore:
 
     def _initialize(self) -> None:
         with self._connect() as conn:
+            # Write-ahead logging: readers never block the writer (persists in the file).
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS run_locks (name TEXT PRIMARY KEY, holder TEXT NOT NULL, expires_at TEXT NOT NULL)"
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS processed_messages (
@@ -388,6 +402,30 @@ class AgentStateStore:
 
         with self._connect() as conn:
             conn.execute("UPDATE slot_holds SET status = 'released' WHERE approval_id = ? AND status = 'active'", (approval_id,))
+
+    # ----- run locks (one inbox run at a time across processes) -----------------
+
+    def acquire_lock(self, name: str, holder: str, minutes: int = RUN_LOCK_MINUTES) -> bool:
+        """Take (or renew) a named lease. False if another holder has a lease that has not expired."""
+
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO run_locks (name, holder, expires_at) VALUES (?, '', datetime('now', '-1 second'))",
+                (name,),
+            )
+            cursor = conn.execute(
+                "UPDATE run_locks SET holder = ?, expires_at = datetime('now', ?) "
+                "WHERE name = ? AND (holder = ? OR expires_at <= CURRENT_TIMESTAMP)",
+                (holder, f"+{int(minutes)} minutes", name, holder),
+            )
+            return cursor.rowcount > 0
+
+    def release_lock(self, name: str, holder: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE run_locks SET holder = '', expires_at = datetime('now', '-1 second') WHERE name = ? AND holder = ?",
+                (name, holder),
+            )
 
     # ----- failures -------------------------------------------------------------
 

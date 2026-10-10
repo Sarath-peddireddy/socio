@@ -71,7 +71,9 @@ also adds it to **Google Tasks**, and completes it once you've acted.
   instructions, never while handling an incoming email. Files Socio creates
   go into a "Socio" folder it creates in your Drive.
 - **No duplicates.** Sends, bookings, and drafts are never retried
-  blindly; every outcome is recorded so a restart never repeats work.
+  blindly; every outcome is recorded so a restart never repeats work. Only
+  one inbox run happens at a time, even if you run the CLI while the bot is
+  running.
 - **Owner-only bot.** The Telegram bot only responds to your chat id.
 
 ## Quick start

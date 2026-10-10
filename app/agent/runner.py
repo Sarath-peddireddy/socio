@@ -11,9 +11,11 @@ Deterministic steps (fetching, deciding, recording) are plain Python; only
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from email.utils import parseaddr
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
 
@@ -277,15 +279,41 @@ def reconcile_pending_approvals(store: AgentStateStore) -> int:
     return closed
 
 
+INBOX_LOCK = "inbox"
+BUSY_STATUS = "skipped_busy"
+
+
 def process_inbox(query: str = DEFAULT_QUERY, max_messages: int = 10, dry_run: bool = False) -> list[MessageOutcome]:
     """
     Process unhandled emails matching a Gmail search query.
 
     Only the newest listed message of each thread is handled; the thread
     context covers the older ones. Stops early if Google is unreachable.
+    Only one live run at a time (across the bot and the CLI); a second one
+    returns a single BUSY_STATUS outcome. Dry runs change nothing and need no lock.
     """
 
     store = AgentStateStore()
+
+    if dry_run:
+        return _process_inbox(store, query, max_messages, dry_run=True)
+
+    holder = f"pid {os.getpid()} {uuid4().hex[:8]}"
+    busy = [MessageOutcome("-", status=BUSY_STATUS, reason="Another inbox run is in progress (bot or CLI). Try again in a few minutes.")]
+
+    if not store.acquire_lock(INBOX_LOCK, holder):
+        return busy
+
+    try:
+        outcomes = _process_inbox(store, query, max_messages, dry_run=False, renew_lock=lambda: store.acquire_lock(INBOX_LOCK, holder))
+        return outcomes if outcomes is not None else busy
+    finally:
+        store.release_lock(INBOX_LOCK, holder)
+
+
+def _process_inbox(store: AgentStateStore, query: str, max_messages: int, dry_run: bool, renew_lock=None) -> list[MessageOutcome] | None:
+    """The inbox run itself. Returns None if the lock was lost before any email was handled."""
+
     newest_per_thread: dict[str, str] = {}
     older_in_thread: dict[str, list[str]] = {}
 
@@ -315,6 +343,11 @@ def process_inbox(query: str = DEFAULT_QUERY, max_messages: int = 10, dry_run: b
     outcomes: list[MessageOutcome] = []
 
     for thread_id, message_id in newest_per_thread.items():
+        # Renew the lease; if it lapsed and another run took over, stop here.
+        if renew_lock is not None and not renew_lock():
+            logger.warning("Inbox lock lost; stopping this run.")
+            return outcomes or None
+
         try:
             outcome = handle_message(message_id, thread_id, dry_run=dry_run, store=store)
         except (GoogleApiUnavailableError, LLMUnavailableError) as exc:

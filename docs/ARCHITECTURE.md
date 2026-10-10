@@ -141,9 +141,17 @@ real calendar.
   `LLMUnavailableError`.
 - Restart recovery: interrupted emails are retried from the database; actions
   already completed are shown to the agent and cannot be repeated.
+- Concurrency: the Telegram bot is one sequential loop (messages, button taps,
+  and scheduled inbox checks never overlap). Across processes (bot + CLI),
+  SQLite runs in WAL mode with a 30 s busy timeout, and a live inbox run takes
+  a 30-minute lease (`run_locks` table, renewed per email, released at the
+  end or on a crash's expiry). A second live run returns `skipped_busy`; dry
+  runs need no lock. Approvals are claimed atomically, so a double tap from
+  Telegram and the CLI cannot execute twice.
 
 ## Outcome statuses
 
 `replied`, `replied_unverified`, `no_action`, `needs_review`,
 `needs_attention`, `awaiting_approval`, `superseded`, `failed` (retried),
-`failed_permanently`.
+`failed_permanently`. A run that found another one in progress reports
+`skipped_busy` (not stored).
