@@ -23,6 +23,7 @@ __pycache__/
 downloads/
 documents/
 *.log
+logs/
 
 # Local test files
 test_*.py

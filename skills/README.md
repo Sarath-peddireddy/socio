@@ -5,10 +5,14 @@ README is gitignored: skills can contain names, addresses, and file names.
 
 ## Recipes (`*.md`)
 
-Socio saves a recipe when a multi-step instruction succeeded and is likely to
-recur (a weekly report, a regular vendor's invoice). The next time a matching
-instruction arrives, the supervisor reuses the plan instead of planning from
-scratch.
+Socio never saves a recipe on its own. After a multi-step instruction
+succeeds, send `/save_skill NAME` in Telegram (or run
+`python -m app.main --save-skill NAME`): the last successful plan is saved
+here, with names, dates, and similar details turned into `{{parameters}}` by
+Gemini (or exactly as it ran if Gemini is unavailable). After you've run the
+same kind of workflow 3 times, the report suggests it once. The next time a
+matching instruction arrives (a weekly report, a regular vendor's invoice),
+the supervisor reuses the plan instead of planning from scratch.
 
 ```markdown
 ---

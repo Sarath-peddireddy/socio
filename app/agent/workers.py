@@ -12,6 +12,7 @@ Fan-in contract: a worker never returns its conversation, only
 
 modified_entities come from what the tools actually recorded (never from the
 model's own claims), so a worker that crashes halfway still reports what changed.
+A crash is logged in full (app.errors); diff_summary only carries a fixed message.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from typing import Any, Callable
 from langchain_core.messages import AIMessage, HumanMessage
 
 from app.agent.graph import SIDE_EFFECT_TOOLS, create_agent_graph
+from app.errors import plain_message, report_failure
 
 
 logger = logging.getLogger(__name__)
@@ -159,7 +161,7 @@ def run_worker(
             last = snapshot
     except Exception as exc:
         error = exc
-        logger.warning("Worker %s stopped: %s: %s", task["task_id"], type(exc).__name__, exc)
+        report_failure(exc, "worker", task_id=task["task_id"], tools=",".join(task["tools_allowed"]))
 
     actions = last.get("actions", [])
     entities = modified_entities(actions)
@@ -167,7 +169,7 @@ def run_worker(
     reported, summary = _final_report(_message_text(messages[-1]) if messages else "")
 
     if error is not None:
-        summary = f"Stopped by an error: {type(error).__name__}: {error}"
+        summary = f"Stopped by an error. {plain_message(error)}"
         if entities:
             summary += f". Recorded before it stopped: {len(entities)} change(s)."
         failed = True

@@ -10,7 +10,9 @@ Supervisor-worker harness for owner instructions (fan-out / fan-in).
          all share one Gemini rate limiter), each in a clean context
       -> fan-in: strict JSON payloads -> aggregator closes duplicate approvals,
          checkpoints the run in SQLite, and writes one report
-      -> a successful multi-step plan that is likely to recur is saved as a skill
+      -> skills are never saved automatically: /save_skill NAME packages the last
+         successful plan, and after the same tool graph succeeds 3 times the report
+         offers it once
 
 A one-task instruction (or a follow-up that needs the conversation) runs the
 single owner-mode agent as before. Inbox emails are never fanned out
@@ -19,6 +21,7 @@ single owner-mode agent as before. Inbox emails are never fanned out
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -33,10 +36,12 @@ from pydantic import BaseModel, Field
 from app.agent.graph import AGENT_TOOLS, create_agent_graph
 from app.agent.llm import get_llm, invoke_llm
 from app.agent.state import AgentStateStore
-from app.agent.taskgraph import MAX_TASKS, PlanError, normalize_plan, parallel_width
+from app.agent.taskgraph import MAX_TASKS, PlanError, normalize_plan, parallel_width, topological_order
 from app.agent.workers import run_worker
-from app.memory.semantic import Memory, format_memories, memory_enabled, recall
-from app.memory.skills import Skill, SkillError, expand_skill, find_skills, save_recipe, similar_skill
+from app.errors import plain_message, report_failure
+from app.memory.episodic import notes_block
+from app.memory.semantic import Memory, format_memories, recall
+from app.memory.skills import Skill, SkillError, expand_skill, find_skills, get_skill, save_recipe, slugify
 
 
 logger = logging.getLogger(__name__)
@@ -149,7 +154,7 @@ def plan_request(
 ) -> Plan:
     """One planner call. Raises PlanError (or SkillError) if the result cannot be run."""
 
-    memory_block = format_memories(memories or [])
+    memory_block = "\n\n".join(block for block in (format_memories(memories or []), notes_block()) if block)
     system = PLANNER_PROMPT.format(
         max_tasks=MAX_TASKS,
         tools=_tool_catalog(),
@@ -242,7 +247,8 @@ def run_plan(
                 try:
                     payload = future.result()
                 except Exception as exc:  # a worker function that raised anyway
-                    payload = {"status": "FAILED", "modified_entities": [], "diff_summary": f"Worker crashed: {type(exc).__name__}: {exc}"}
+                    report_failure(exc, "worker.crash", run_id=run_id, task_id=task_id)
+                    payload = {"status": "FAILED", "modified_entities": [], "diff_summary": f"Worker crashed. {plain_message(exc)}"}
                 if not dry_run and payload["status"] == "FAILED":
                     store.add_failure(f"worker:{task_id}", payload["diff_summary"])
                 finish(task_id, payload)
@@ -308,55 +314,120 @@ def build_report(tasks: list[dict[str, Any]], results: dict[str, dict[str, Any]]
     return "\n".join(lines)
 
 
-# ----- procedural memory: save a successful plan as a skill ----------------------------------
+# ----- procedural memory: skills are saved only when the owner asks -------------------------
+
+SUGGEST_AFTER_SUCCESSES = 3
+
+
+def workflow_signature(tasks: list[dict[str, Any]]) -> str:
+    """
+    The shape of a plan: each task's tools and its dependencies, in dependency order.
+
+    Goals and task ids are left out, so "weekly prep for week 41" and "... week 42"
+    count as the same workflow.
+    """
+
+    order = topological_order(tasks)
+    position = {task_id: index for index, task_id in enumerate(order)}
+    by_id = {task["task_id"]: task for task in tasks}
+    shape = [
+        [sorted(by_id[task_id]["tools_allowed"]), sorted(position[d] for d in by_id[task_id]["depends_on"])]
+        for task_id in order
+    ]
+    return hashlib.sha256(json.dumps(shape).encode()).hexdigest()[:16]
+
+
+_NAME_STOPWORDS = {
+    "a", "an", "the", "and", "then", "also", "to", "for", "of", "in", "on", "my", "me", "please", "with",
+    "it", "this", "that", "i", "is", "at", "from", "by", "as", "plus", "after",
+}
+
+
+def suggest_skill_name(request: str, tasks: list[dict[str, Any]]) -> str:
+    """A short kebab-case name from the request's first meaningful words (no LLM call)."""
+
+    words = [w for w in re.findall(r"[a-z]+", (request or "").lower()) if w not in _NAME_STOPWORDS and len(w) > 2]
+    tools = sorted({tool for task in tasks for tool in task["tools_allowed"]})
+    for candidate in ("-".join(words[:3]), "-".join(tools[:2])):
+        try:
+            return slugify(candidate)
+        except SkillError:
+            continue
+    return "my-workflow"
+
+
+def note_workflow_success(tasks: list[dict[str, Any]], request: str, run_id: int, store: AgentStateStore) -> str:
+    """Count a successful multi-step run; on the third success of the same shape, offer /save_skill once."""
+
+    try:
+        signature = workflow_signature(tasks)
+        stats = store.record_workflow_success(signature, run_id)
+        if stats["successes"] >= SUGGEST_AFTER_SUCCESSES and not stats["suggested"] and store.mark_workflow_suggested(signature):
+            name = suggest_skill_name(request, tasks)
+            return f"\n💡 You've run this workflow {stats['successes']} times. Save as a skill? [/save_skill {name}]"
+    except Exception as exc:
+        logger.warning("Could not count the workflow: %s", exc)
+    return ""
 
 
 class SkillDraft(BaseModel):
-    save: bool = Field(description="True only if this procedure is likely to be repeated.")
-    name: str = Field(default="", description="Short kebab-case name, e.g. weekly-applications-update.")
-    description: str = Field(default="", description="One sentence: when to use this skill.")
+    description: str = Field(description="One sentence: when to use this skill.")
     parameters: list[str] = Field(default_factory=list, description="snake_case names of the parts that change each time.")
-    plan_json: str = Field(default="[]", description="The plan as a JSON list of tasks, with {{parameter}} placeholders.")
+    plan_json: str = Field(description="The plan as a JSON list of tasks, with {{parameter}} placeholders.")
 
 
-SKILL_PROMPT = """The owner's instruction below was split into tasks and every task succeeded.
-Decide whether this procedure is likely to be repeated (for example a weekly report, a regular
-vendor's invoice, a recurring spreadsheet update). If it is a one-off, set save to false.
-If it will recur, generalize it: replace the parts that change each time (dates, names,
-amounts, addresses) with {{{{parameter}}}} placeholders, list those parameters, and keep each
-task's task_id, tools_allowed, and depends_on unchanged.
+SKILL_PROMPT = """The owner asked to save the procedure below as a reusable skill.
+Generalize it: replace the parts that change each time (dates, names, amounts, addresses,
+subjects) with {{{{parameter}}}} placeholders, list those parameters, and keep each task's
+task_id, tools_allowed, and depends_on unchanged. Do not add or remove tasks.
 
 Instruction: {request}
 Plan: {plan}"""
 
 
-def maybe_save_skill(request: str, tasks: list[dict[str, Any]], run_id: int) -> str | None:
-    """Ask the LLM to generalize a successful multi-step plan into a recipe. Returns its name."""
+@dataclass
+class SavedSkill:
+    name: str
+    parameters: list[str]
+    generalized: bool
+    tasks: int
 
-    if len(tasks) < 2 or not memory_enabled():
-        return None
 
+def save_last_plan(name: str, store: AgentStateStore | None = None) -> SavedSkill:
+    """
+    /save_skill NAME: package the last fully successful multi-step plan as skills/NAME.md.
+
+    One Gemini call turns concrete values into {{parameters}}; if that fails or the
+    result does not validate, the plan is saved exactly as it ran. Raises SkillError
+    (with a message for the owner) when there is nothing to save or the name is taken.
+    """
+
+    store = store or AgentStateStore()
+    slug = slugify(name)
+    if get_skill(slug) is not None:
+        raise SkillError(f"A skill named {slug} already exists. Pick another name or /forget_skill {slug} first.")
+
+    run = store.last_successful_plan_run()
+    if run is None:
+        raise SkillError("There is no successful multi-step instruction to save yet.")
+
+    request, plan = run["request"], run["plan"]
+    notes = f"Saved by the owner from: {request[:300]}"
     try:
         draft = invoke_llm(
             get_llm().with_structured_output(SkillDraft),
-            SKILL_PROMPT.format(request=request, plan=json.dumps(tasks, ensure_ascii=False)),
+            SKILL_PROMPT.format(request=request, plan=json.dumps(plan, ensure_ascii=False)),
         )
-        if not draft or not draft.save:
-            return None
-        existing = similar_skill(draft.description)
-        if existing is not None and existing.name != draft.name:
-            logger.info("Not saving a skill: '%s' already covers it.", existing.name)
-            return None
-        skill = save_recipe(
-            draft.name, draft.description, draft.parameters, json.loads(draft.plan_json),
-            WORKER_TOOLS, source_run=run_id, notes=f"Learned from: {request[:300]}",
-        )
-        return skill.name
-    except (SkillError, PlanError, json.JSONDecodeError) as exc:
-        logger.info("Not saving a skill: %s", exc)
+        generalized = json.loads(draft.plan_json)
+        if not isinstance(generalized, list) or len(generalized) != len(plan):
+            raise PlanError("The generalized plan changed the number of tasks.")
+        skill = save_recipe(slug, draft.description or request, draft.parameters, generalized, WORKER_TOOLS, notes=notes, source_run=run["id"])
+        return SavedSkill(skill.name, skill.parameters, True, len(skill.plan))
     except Exception as exc:
-        logger.warning("Skill saving failed: %s", exc)
-    return None
+        logger.warning("Saving the plan as it ran (generalizing failed: %s)", exc)
+
+    skill = save_recipe(slug, request, [], plan, WORKER_TOOLS, notes=notes, source_run=run["id"])
+    return SavedSkill(skill.name, [], False, len(skill.plan))
 
 
 # ----- entry point -----------------------------------------------------------------------------
@@ -366,9 +437,9 @@ def run_single_agent(text: str, *, history: list | None = None, dry_run: bool = 
     """The plain owner-mode agent (one context, full owner toolset)."""
 
     instruction = f"Instruction from the owner:\n{text}"
-    memory_block = format_memories(memories or [])
-    if memory_block:
-        instruction += f"\n\n{memory_block}"
+    for block in (format_memories(memories or []), notes_block()):
+        if block:
+            instruction += f"\n\n{block}"
 
     result = create_agent_graph().invoke(
         {
@@ -414,7 +485,7 @@ def handle_owner_request(text: str, *, dry_run: bool = False, history: list | No
 
     store.close_stale_supervisor_runs()
     run_id = store.start_supervisor_run(text)
-    store.save_supervisor_plan(run_id, plan.tasks)
+    store.save_supervisor_plan(run_id, plan.tasks, skill=plan.skill)
 
     results = run_plan(plan.tasks, run_id=run_id, store=store, dry_run=dry_run)
     notes = resolve_overlaps(results, store, dry_run=dry_run)
@@ -424,9 +495,7 @@ def handle_owner_request(text: str, *, dry_run: bool = False, history: list | No
     run_status = "done" if statuses == {"SUCCESS"} else ("failed" if statuses == {"FAILED"} else "partial")
 
     if run_status == "done" and not plan.skill and not dry_run:
-        saved = maybe_save_skill(text, plan.tasks, run_id)
-        if saved:
-            report += f"\n🧩 Saved as skill '{saved}': next time I'll reuse this plan (/skills to see it)."
+        report += note_workflow_success(plan.tasks, text, run_id, store)
 
     store.finish_supervisor_run(run_id, "dry_run" if dry_run else run_status, report)
 

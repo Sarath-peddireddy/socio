@@ -100,7 +100,8 @@ instruction ─► recall memories (top 3) + matching skills
                tools_allowed, depends_on) calls = a DAG, or use_skill(name, params)
             ─► validate (≤ 6 tasks, known tools, no cycles) ─► checkpoint (supervisor_runs, worker_tasks)
             ─► ThreadPoolExecutor (AGENT_MAX_WORKERS = 3): a task starts when its dependencies succeeded
-            ─► fan-in payloads ─► close duplicate approvals ─► one report ─► maybe save a skill
+            ─► fan-in payloads ─► close duplicate approvals ─► one report
+            ─► count the workflow's success (3rd time: suggest /save_skill once)
 ```
 
 - Only instructions that look multi-part (or match a skill) pay for a planning
@@ -124,6 +125,8 @@ instruction ─► recall memories (top 3) + matching skills
 - Runs left `running` by a stopped process are marked `interrupted` after 30
   minutes and never re-run (they may already have created approvals).
 - Inbox emails are not fanned out (developer decision): they stay one at a time.
+- A worker crash is logged in full by the error gateway; its `diff_summary`
+  carries only a predefined message, so the report never shows raw errors.
 
 ## Google Workspace
 
@@ -170,7 +173,13 @@ executes, then sends the follow-up reply if one was attached.
 Gmail draft instead (one attachment carried over; with several, the owner
 attaches them) and marks the email `needs_review`. A failed execution changes
 nothing further and marks the email `needs_attention`; a rejection marks it
-`needs_review` for the owner.
+`needs_review` for the owner. In Telegram a rejection ends silently: the card
+is edited to "❌ Proposal rejected. No changes were made." with an optional
+`+ Add Permanent Rule` button (also after Edit in Gmail), and nothing is
+learned unless the owner taps it (see Memory). Failure messages on the card
+keep our own validation reasons (e.g. "overlaps 'Dentist'"); anything else is
+a predefined message, while `pending_approvals.resolution`, `failures`, and
+`logs/agent.log` keep the full error.
 
 Soft holds: when a `book_meeting` or `move_event` approval is recorded, its new
 time goes into `slot_holds` for 24 hours (`SLOT_HOLD_HOURS`).
@@ -187,9 +196,14 @@ Three tiers:
 
 1. **Short-term / episodic (SQLite, `state.py`)**: emails in progress,
    approvals, slot holds, run locks, supervisor checkpoints, trusted scripts,
-   pending "why?" prompts. WAL, 30 s busy timeout, versioned migrations
-   (`MIGRATIONS`, `PRAGMA user_version`, applied inside `BEGIN IMMEDIATE` so
-   two processes cannot both migrate; v1 is the old schema, idempotent).
+   pending rule prompts (`feedback_requests`), workflow success counts
+   (`workflow_stats`), and situational owner notes (`episodic_notes`, 24 h,
+   `memory/episodic.py`; injected into the email, planner, and owner prompts
+   under a "notes for today, reference only" header while active). WAL, 30 s
+   busy timeout, versioned migrations (`MIGRATIONS`, `PRAGMA user_version`,
+   applied inside `BEGIN IMMEDIATE` so two processes cannot both migrate; v1 is
+   the old schema, idempotent; v3 adds the notes, workflow counts, and
+   `supervisor_runs.skill`).
 2. **Long-term semantic (`memory/semantic.py`)**: `memories` table in the same
    file: (entity, preference, context) + a float32 embedding from fastembed
    (`snowflake/snowflake-arctic-embed-s`, local ONNX, 384-d). Recall is a dot
@@ -199,17 +213,26 @@ Three tiers:
    entity + same wording (case/punctuation-insensitive); similar-but-different
    rules are kept apart because embeddings cannot tell "before noon" from
    "after 5pm" (0.95 similar).
-   Ingestion (`memory/learning.py`): every approve / reject / Edit in Gmail
-   writes a tuple built from structured fields only (type, counterpart
-   address, time, file/document name), so email text never becomes memory.
-   After Reject / Edit in Gmail the bot asks "why?" (force-reply); the owner's
-   answer (or `/remember`) is turned into 1-3 tuples by Gemini, or stored as
-   written if Gemini is unavailable.
+   Ingestion (`memory/learning.py`) is explicit only; a decision alone writes
+   nothing. `/remember` text is turned into 1-3 tuples by Gemini (stored as
+   written if Gemini is unavailable). `+ Add Permanent Rule` sends one
+   force-reply prompt; the answer goes through one Gemini call that classifies
+   it (`STANDING_POLICY` → upsert as `owner_rule`, confirmed "✓ Rule saved: …";
+   `SITUATIONAL` → `episodic_notes` for 24 h, confirmed "Understood for
+   today.") and extracts the tuples. Without Gemini a keyword check decides
+   (never/always/only/before/after → standing; today/already/tired → situational;
+   unsure → standing, since the owner asked for a permanent rule). Request
+   context comes from structured fields only, so email text never becomes memory.
 3. **Procedural (`memory/skills.py`, `./skills/`)**: Markdown recipes (YAML
-   front matter + JSON plan with `{{parameter}}` placeholders). Saved after a
-   successful multi-step plan that the LLM judges recurring; offered to the
-   planner when the request matches (≥ 0.6); replayed through `use_skill` with
-   the same validation and gates. Socio never writes code. Owner-written
+   front matter + JSON plan with `{{parameter}}` placeholders). Never saved
+   automatically: `/save_skill NAME` / `--save-skill NAME`
+   (`supervisor.save_last_plan`) packages the newest `done` run with ≥ 2 tasks
+   that was not itself a skill replay; one Gemini call generalizes it into
+   parameters (validated; saved verbatim if that fails). `workflow_stats` counts
+   successes per tool-graph signature (each task's tools + dependency edges,
+   goals ignored); on the 3rd success the report suggests `/save_skill` once.
+   Offered to the planner when the request matches (≥ 0.6); replayed through
+   `use_skill` with the same validation and gates. Socio never writes code. Owner-written
    `skills/<name>.py` scripts run via `run_skill_script` only when their
    SHA-256 is trusted (an `enable_skill_script` approval); the hashed bytes are
    what runs, in a subprocess (`python -I`, temp working folder, environment
@@ -236,6 +259,32 @@ Three tiers:
   end or on a crash's expiry). A second live run returns `skipped_busy`; dry
   runs need no lock. Approvals are claimed atomically, so a double tap from
   Telegram and the CLI cannot execute twice.
+
+## Error gateway (`app/errors.py`)
+
+Every Telegram update and button handler, the scheduled inbox check, the poll
+loop, workers and the supervisor's fan-out, approval execution, the inbox
+runner, and graph tool calls go through `report_failure(exc, where, **ids)`. It
+writes the stack trace, the location, the ids (never email bodies or tool
+argument values), and a timestamp to `logs/agent.log` (`AGENT_LOG_DIR`;
+rotating, 2 MB x 3) and returns one predefined message:
+
+| Exception | Message |
+|---|---|
+| Google `HttpError` 429/5xx, `GoogleApiUnavailableError`, OAuth/DNS transport errors | ⚠️ Google services are busy or unreachable right now. Please try again in a few minutes. |
+| `sqlite3.OperationalError` (locked / busy) | ⚠️ System is handling another task. Please try again in a moment. |
+| Gemini timeout / unreachable / rate limit (`LLMUnavailableError`, `httpx.TimeoutException`) | ⚠️ The AI model took too long to respond. Please tap /run or retry. |
+| Gemini daily quota exhausted | ⚠️ The AI model's daily limit is used up. Please try again later. |
+| anything else | ⚠️ Unable to complete that task right now. I've logged the issue for review. |
+
+The wording only promises what happens (developer decision): nothing is
+queued or re-run behind the owner's back, except that an email interrupted by
+an outage is retried on the next inbox check (its reason says so). Our own
+validation errors (`ValueError` family, e.g. "that slot overlaps 'Dentist'")
+keep their message on approval cards and in tool results the model sees;
+everything else is replaced. `/status` shows only a failure count, and
+`Bot.send` drops any traceback-looking line as a last line of defence. The CLI
+still prints `detail (local only)` for failed approvals.
 
 ## Outcome statuses
 

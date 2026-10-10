@@ -41,19 +41,29 @@ also adds it to **Google Tasks**, and completes it once you've acted.
 
 ## It learns from you
 
-- **Preferences.** Every Approve, Reject, or Edit in Gmail is remembered.
-  After a Reject, Socio asks *why?*; your answer ("I never take calls before
-  noon") becomes a rule it recalls the next time it's relevant. Teach it
-  directly with `/remember`, see what it knows with `/memories`, and remove
-  something with `/forget`. Memories are stored on your machine and embedded
-  with a small local model, so they never leave it.
-- **Skills.** When a multi-step instruction works and looks like something
-  you'll ask again (a weekly sheet update, a regular vendor's invoice), Socio
-  saves the plan as a recipe in `skills/` and reuses it next time. Recipes are
-  plain Markdown, contain no code, and go through the same approvals. You can
-  also add your own Python scripts there; each one runs only after you've
-  approved its exact content. See [`skills/README.md`](skills/README.md).
+- **Only when you say so.** Approving, rejecting, or editing a request
+  teaches Socio nothing by itself. A rejection ends quietly ("❌ Proposal
+  rejected. No changes were made.") with an optional **+ Add Permanent Rule**
+  button. Tap it and type why: a lasting rule ("I never take calls before
+  noon") is saved and recalled whenever it's relevant; a one-off reason
+  ("already talked to him", "I'm tired today") is kept for 24 hours only.
+  Teach it directly with `/remember`, see what it knows with `/memories`, and
+  remove something with `/forget`. Memories are stored on your machine and
+  embedded with a small local model, so they never leave it.
+- **Skills.** After a multi-step instruction works, `/save_skill NAME` saves
+  its plan as a recipe in `skills/` (Gemini turns the names and dates into
+  parameters), and a matching request reuses it. Socio never saves one on its
+  own; after you've run the same kind of workflow 3 times it suggests it once.
+  Recipes are plain Markdown, contain no code, and go through the same
+  approvals. You can also add your own Python scripts there; each one runs
+  only after you've approved its exact content. See
+  [`skills/README.md`](skills/README.md).
 - Memory only informs Socio. It never skips an approval.
+
+When something fails, Telegram only gets a short message (for example
+"⚠️ Google services are busy or unreachable right now. Please try again in a
+few minutes."). The full error with its stack trace goes to `logs/agent.log`
+on your computer.
 
 ## Safety model
 
@@ -133,8 +143,8 @@ everything runs offline on your CPU.
 3. Put it in `.env` as `TELEGRAM_OWNER_CHAT_ID` and restart the bot.
 
 Bot commands: `/run` (check inbox now), `/dryrun`, `/status`, `/approvals`,
-`/new`, `/remember TEXT`, `/memories`, `/forget ID`, `/skills`,
-`/forget_skill NAME`, `/help`. The inbox is also checked every
+`/new`, `/remember TEXT`, `/memories`, `/forget ID`, `/save_skill NAME`,
+`/skills`, `/forget_skill NAME`, `/help`. The inbox is also checked every
 `AGENT_POLL_MINUTES`.
 
 ## Configuration
@@ -152,11 +162,12 @@ See [`.env.example`](.env.example).
 | `TELEGRAM_OWNER_CHAT_ID` | The only chat allowed to use the bot |
 | `AGENT_POLL_MINUTES` | Inbox check interval for the bot (0 = off) |
 | `AGENT_INBOX_QUERY` | Which emails to process (default: inbox, last 7 days, not from you) |
-| `AGENT_MEMORY` | Learn from your decisions and recall them (default on; `0` = off) |
+| `AGENT_MEMORY` | Remember the rules you add and recall them (default on; `0` = off) |
 | `AGENT_MAX_WORKERS` | Tasks of one instruction run in parallel (default 3) |
 | `AGENT_LLM_RPM` | Gemini requests per minute, shared by all tasks (default 14; free tier is 15) |
 | `AGENT_SKILLS_DIR` | Where skills live (default `./skills`) |
 | `AGENT_MODEL_CACHE` | Where the embedding model is stored (default `./.cache/fastembed`) |
+| `AGENT_LOG_DIR` | Where `agent.log` goes (default `./logs`, gitignored) |
 
 ## Command line
 
@@ -172,6 +183,7 @@ python -m app.main --remember "no calls before noon"   # teach a preference
 python -m app.main --memories              # what Socio has learned
 python -m app.main --forget 7              # forget memory #7
 python -m app.main --skills                # saved skills
+python -m app.main --save-skill weekly-prep   # save the last successful multi-step instruction
 ```
 
 ## How it works
@@ -197,6 +209,8 @@ Schedule  ─┘                                         │
   `skills/`.
 - **Reliability**: timeouts and bounded retries on every Google API call,
   rate-limit handling for the LLM, and restart recovery from local state.
+  An error gateway logs full details to `logs/agent.log` and shows the owner
+  only predefined messages.
 
 Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -207,8 +221,9 @@ app/
   main.py           CLI entry point
   telegram_bot.py   Telegram interface: instructions, approvals, scheduled checks
   google_api.py     Shared Google API timeouts, retries, token refresh
+  errors.py         Error gateway: logs/agent.log + short owner-facing messages
   agent/            Runner, LangGraph agent, supervisor + workers, decisions, prompts, approvals, state
-  memory/           Long-term memory (local embeddings), learning from decisions, skills
+  memory/           Long-term memory (local embeddings), 24 h notes, owner rules, skills
   gmail/            Gmail auth, messages, threads, drafts, parsing
   calendar/         Availability, booking, find/move/cancel events
   drive/            Google Drive client
@@ -216,6 +231,7 @@ app/
   tasks/            Google Tasks
   files/            Document search: Drive folder + local folder
 skills/             Saved procedures (recipes) and your own scripts; personal, gitignored
+logs/               agent.log (full error details); gitignored
 docs/
   ARCHITECTURE.md
 ```

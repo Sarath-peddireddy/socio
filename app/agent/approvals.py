@@ -10,8 +10,9 @@ says yes (Telegram button or `python -m app.main --approve ID`). A held email
 can instead be moved to Gmail Drafts for editing (to_draft). Everything is
 re-validated at execution time.
 
-Every decision (approve, reject, Edit in Gmail) is also recorded in long-term
-memory (app.memory.learning), so later runs can follow the owner's preferences.
+A decision teaches Socio nothing by itself; the owner can turn a rejection or an
+edit into a rule explicitly ("+ Add Permanent Rule", see app.memory.learning).
+Failures are logged in full (app.errors) and reported with a short fixed message.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from app.calendar.tools import create_calendar_event
 from app.files.local import resolve_shareable_file
 from app.gmail.drafts import create_draft, create_reply_draft
 from app.gmail.messages import send_new_email, send_reply, trash_message
-from app.memory.learning import learn_from_decision
+from app.errors import report_failure, safe_error_text
 
 
 logger = logging.getLogger(__name__)
@@ -222,7 +223,9 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
     try:
         result["reply"] = _send_follow_up_reply(payload)
     except Exception as exc:
+        report_failure(exc, "approval.follow_up_reply", approval_id=approval.get("id"), type=kind)
         result["reply_error"] = f"{type(exc).__name__}: {exc}"
+        result["reply_error_text"] = safe_error_text(exc)
 
     return result
 
@@ -256,16 +259,15 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
         result = _execute(approval)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-        logger.warning("Approval #%s failed: %s", approval_id, error)
+        report_failure(exc, "approval.execute", approval_id=approval_id, type=approval["type"])
         store.finish_approval(approval_id, "failed", error)
         store.add_failure(f"approval:{approval['type']}", error, message_id=message_id)
         if message_id:
             store.mark_processed(message_id, thread_id, status="needs_attention", summary=f"Approved change failed: {error}")
-        return {"ok": False, "message": f"#{approval_id} failed, nothing was changed: {error}"}
+        return {"ok": False, "message": f"#{approval_id} failed, nothing was changed. {safe_error_text(exc)}", "error": error}
 
     store.finish_approval(approval_id, "approved", "Approved and executed", result)
     complete_followup_task(store, message_id)
-    learn_from_decision(approval, "approved", store)
     store.add_action(approval["type"], approval.get("target"), approval["payload"], "completed", message_id=message_id, result=result)
 
     message = f"#{approval_id} done."
@@ -279,7 +281,7 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
     if result.get("skill"):
         message += " The script can run now."
     if result.get("reply_error"):
-        message += f" The calendar was updated, but the reply failed: {result['reply_error']}"
+        message += f" The calendar was updated, but the reply failed. {result.get('reply_error_text', '')}".rstrip()
 
     if message_id and approval["type"] != "trash_email":
         status = "needs_attention" if result.get("reply_error") else ("replied" if result.get("reply") else "no_action")
@@ -302,8 +304,6 @@ def reject(approval_id: int, store: AgentStateStore | None = None) -> dict[str, 
 
     store.finish_approval(approval_id, "rejected", f"Rejected by owner at {datetime.now().isoformat(timespec='seconds')}")
     complete_followup_task(store, approval.get("message_id"))
-    # A rejection is a correction: remember it (the owner can add why, see telegram_bot).
-    learn_from_decision(approval, "rejected", store)
 
     if approval.get("message_id") and approval["type"] in {"book_meeting", "move_event", "cancel_event"} | REPLY_TYPES:
         store.mark_processed(
@@ -311,7 +311,7 @@ def reject(approval_id: int, store: AgentStateStore | None = None) -> dict[str, 
             summary="Owner rejected the proposed change; handle this email manually.",
         )
 
-    return {"ok": True, "message": f"#{approval_id} rejected. Nothing was changed."}
+    return {"ok": True, "message": f"#{approval_id} rejected. No changes were made."}
 
 
 def to_draft(approval_id: int, store: AgentStateStore | None = None) -> dict[str, Any]:
@@ -346,13 +346,12 @@ def to_draft(approval_id: int, store: AgentStateStore | None = None) -> dict[str
             draft = create_reply_draft(message_id=reply["message_id"], body=reply["body"], attachment_path=attachment)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-        logger.warning("Approval #%s: draft failed: %s", approval_id, error)
+        report_failure(exc, "approval.to_draft", approval_id=approval_id, type=approval["type"])
         store.finish_approval(approval_id, "failed", error)
         store.add_failure("approval:to_draft", error, message_id=approval.get("message_id"))
-        return {"ok": False, "message": f"#{approval_id}: could not create the draft, nothing was sent: {error}"}
+        return {"ok": False, "message": f"#{approval_id}: could not create the draft, nothing was sent. {safe_error_text(exc)}", "error": error}
 
     store.finish_approval(approval_id, "resolved", "Moved to Gmail Drafts by owner", {"draft_id": draft.get("id")})
-    learn_from_decision(approval, "edited", store)
 
     message = f"#{approval_id} saved to Gmail Drafts. Nothing was sent; edit and send it from Gmail."
     if len(attachments) > 1:

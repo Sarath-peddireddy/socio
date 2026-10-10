@@ -246,6 +246,37 @@ class AgentStateStore:
             """
         )
 
+    @classmethod
+    def _migrate_v3_notes_and_workflows(cls, conn: sqlite3.Connection) -> None:
+        """Short-lived owner notes, workflow success counts, and which runs replayed a skill."""
+
+        # Situational notes from the owner ("already talked to him"): expire after a day.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS episodic_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity TEXT NOT NULL,
+                note TEXT NOT NULL,
+                approval_id INTEGER,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        # Successful multi-step runs per tool-graph shape, for the "save as a skill?" hint.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workflow_stats (
+                signature TEXT PRIMARY KEY,
+                successes INTEGER NOT NULL DEFAULT 0,
+                last_run_id INTEGER,
+                suggested_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cls._ensure_column(conn, "supervisor_runs", "skill", "TEXT")
+
     # ----- processed messages -------------------------------------------------
 
     def mark_processed(self, message_id: str, thread_id: str | None = None, status: str = "processed", summary: str | None = None, metadata: dict[str, Any] | None = None) -> None:
@@ -554,13 +585,13 @@ class AgentStateStore:
         with self._connect() as conn:
             return int(conn.execute("INSERT INTO supervisor_runs (request) VALUES (?)", (request[:4000],)).lastrowid)
 
-    def save_supervisor_plan(self, run_id: int, plan: list[dict[str, Any]]) -> None:
-        """Store the task DAG and create one 'pending' checkpoint row per worker task."""
+    def save_supervisor_plan(self, run_id: int, plan: list[dict[str, Any]], skill: str = "") -> None:
+        """Store the task DAG (and the skill it came from, if any) and one 'pending' checkpoint row per worker task."""
 
         with self._connect() as conn:
             conn.execute(
-                "UPDATE supervisor_runs SET plan = ?, status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (json.dumps(plan), run_id),
+                "UPDATE supervisor_runs SET plan = ?, skill = ?, status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (json.dumps(plan), skill or None, run_id),
             )
             conn.executemany(
                 "INSERT OR IGNORE INTO worker_tasks (run_id, task_id, goal, depends_on, tools_allowed) VALUES (?, ?, ?, ?, ?)",
@@ -606,6 +637,43 @@ class AgentStateStore:
         run["plan"] = json.loads(run["plan"]) if run["plan"] else None
         return run
 
+    def last_successful_plan_run(self, min_tasks: int = 2) -> dict[str, Any] | None:
+        """The newest run whose tasks all succeeded, with at least min_tasks tasks, not replayed from a skill."""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, request, plan FROM supervisor_runs WHERE status = 'done' AND skill IS NULL "
+                "AND plan IS NOT NULL ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+        for row in rows:
+            plan = json.loads(row["plan"])
+            if len(plan) >= min_tasks:
+                return {"id": row["id"], "request": row["request"], "plan": plan}
+        return None
+
+    def record_workflow_success(self, signature: str, run_id: int) -> dict[str, Any]:
+        """Count one more success for a tool-graph shape. Returns {successes, suggested}."""
+
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO workflow_stats (signature, successes, last_run_id) VALUES (?, 1, ?) "
+                "ON CONFLICT(signature) DO UPDATE SET successes = successes + 1, last_run_id = excluded.last_run_id, "
+                "updated_at = CURRENT_TIMESTAMP",
+                (signature, run_id),
+            )
+            row = conn.execute("SELECT successes, suggested_at FROM workflow_stats WHERE signature = ?", (signature,)).fetchone()
+        return {"successes": int(row["successes"]), "suggested": row["suggested_at"] is not None}
+
+    def mark_workflow_suggested(self, signature: str) -> bool:
+        """Remember that the owner was offered /save_skill for this shape. False if already offered."""
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE workflow_stats SET suggested_at = CURRENT_TIMESTAMP WHERE signature = ? AND suggested_at IS NULL",
+                (signature,),
+            )
+            return cursor.rowcount > 0
+
     def close_stale_supervisor_runs(self, minutes: int = RUN_LOCK_MINUTES) -> int:
         """Mark runs left 'planning'/'running' by a stopped process as interrupted (not re-run)."""
 
@@ -647,7 +715,28 @@ class AgentStateStore:
                 "SELECT 1 FROM trusted_skill_scripts WHERE name = ? AND sha256 = ?", (name, sha256)
             ).fetchone() is not None
 
-    # ----- Telegram feedback prompts (owner corrections after Reject / Edit in Gmail)
+    # ----- situational notes (expire; see app.memory.episodic) ----------------------
+
+    def add_episodic_note(self, entity: str, note: str, hours: int, approval_id: int | None = None) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO episodic_notes (entity, note, approval_id, expires_at) VALUES (?, ?, ?, datetime('now', ?))",
+                (entity, note, approval_id, f"{int(hours):+d} hours"),
+            )
+            return int(cursor.lastrowid)
+
+    def active_episodic_notes(self, limit: int = 5) -> list[dict[str, Any]]:
+        """Notes that have not expired, newest first."""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, entity, note, approval_id, expires_at, created_at FROM episodic_notes "
+                "WHERE expires_at > CURRENT_TIMESTAMP ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    # ----- Telegram rule prompts (owner taps "+ Add Permanent Rule" after Reject / Edit in Gmail)
 
     def add_feedback_request(self, chat_message_id: int, approval_id: int) -> None:
         with self._connect() as conn:
@@ -671,5 +760,6 @@ class AgentStateStore:
 MIGRATIONS = [
     (1, AgentStateStore._migrate_v1_baseline),
     (2, AgentStateStore._migrate_v2_memory_and_runs),
+    (3, AgentStateStore._migrate_v3_notes_and_workflows),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]

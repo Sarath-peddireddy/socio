@@ -1,25 +1,29 @@
 """
-Memory ingestion: learning from the owner's decisions and corrections.
+Memory ingestion: only what the owner explicitly asks Socio to remember.
 
-Two sources, both controlled by the owner:
+Approving, rejecting, or editing a request teaches Socio nothing by itself (a
+single decision is not a rule). Memories come from the owner's own words:
 
-1. Every decision on an approval request (Approve, Reject, Edit in Gmail) becomes a
-   tuple built only from structured fields (type, counterpart address, time, file or
-   document name). No free text from an email is used, so an email cannot write
-   itself into memory.
-2. The owner's own words: the reply to the "why?" prompt after a Reject / Edit in
-   Gmail, or /remember. Gemini only restructures that text into tuples; if it is
-   unavailable, the note is stored as written.
+1. /remember TEXT (Telegram) or --remember TEXT (CLI): a standing preference.
+2. "+ Add Permanent Rule" under a rejected or edited request: the owner's note is
+   classified first. A STANDING_POLICY ("never book calls before noon") goes to
+   long-term memory; a SITUATIONAL note ("already talked to him", "I'm tired
+   today") is kept for 24 hours only (app.memory.episodic).
 
-Learning never blocks or fails the action that triggered it.
+Gemini only restructures and classifies the owner's text; if it is unavailable,
+the note is stored as written (and classified by keywords). Context about the
+request comes from structured fields only (type, counterpart address, time, file
+or document name), never from email text, so an email cannot write itself into
+memory.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date
 from email.utils import getaddresses
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -29,9 +33,6 @@ from app.memory.semantic import SemanticMemory, memory_enabled
 
 
 logger = logging.getLogger(__name__)
-
-# Approval types that only ask the owner to look at something: nothing to learn.
-NOT_LEARNED_TYPES = {"review_draft", "review_decision"}
 
 DECISION_WORDS = {
     "approved": "approved",
@@ -113,19 +114,6 @@ def decision_tuple(approval: dict[str, Any], decision: str) -> tuple[str, str, s
     return counterpart(approval), preference, context
 
 
-def learn_from_decision(approval: dict[str, Any], decision: str, store: AgentStateStore | None = None) -> int | None:
-    """Record an approve / reject / edit decision as a memory. Returns its id (None if skipped)."""
-
-    if not memory_enabled() or approval.get("type") in NOT_LEARNED_TYPES:
-        return None
-    try:
-        memory_id, _ = SemanticMemory(store).upsert(*decision_tuple(approval, decision), source=f"decision:{decision}")
-        return memory_id
-    except Exception as exc:
-        logger.warning("Could not learn from approval #%s: %s", approval.get("id"), exc)
-        return None
-
-
 class PreferenceTuple(BaseModel):
     entity: str = Field(description="Who or what it applies to: an email address, a domain, a document name, or 'owner' for general habits.")
     preference: str = Field(description="The rule in a short imperative sentence, in the owner's terms.")
@@ -162,9 +150,9 @@ def _extract(note: str, approval: dict[str, Any] | None) -> list[tuple[str, str,
 
 def learn_from_owner_note(note: str, approval: dict[str, Any] | None = None, store: AgentStateStore | None = None) -> list[dict[str, Any]]:
     """
-    Store the owner's correction or instruction as memories.
+    Store a standing preference the owner stated (/remember) as memories.
 
-    approval is the request the note is about (after a Reject / Edit in Gmail), if any.
+    approval is the request the note is about, if any (adds context for the extraction).
     Returns [{"id", "entity", "preference", "created"}]; [] when memory is off.
     """
 
@@ -189,3 +177,113 @@ def learn_from_owner_note(note: str, approval: dict[str, Any] | None = None, sto
         memory_id, created = memory.upsert(entity, preference, context, source=source)
         saved.append({"id": memory_id, "entity": entity, "preference": preference, "created": created})
     return saved
+
+
+# ----- "+ Add Permanent Rule": standing policy or situational note -----------------------
+
+STANDING_POLICY = "STANDING_POLICY"
+SITUATIONAL = "SITUATIONAL"
+
+
+class RuleClassification(BaseModel):
+    kind: Literal["STANDING_POLICY", "SITUATIONAL"] = Field(
+        description="STANDING_POLICY for a lasting rule about the future; SITUATIONAL for this case or today only."
+    )
+    summary: str = Field(description="The note restated in one short sentence, keeping the owner's meaning exactly.")
+    preferences: list[PreferenceTuple] = Field(
+        default_factory=list, description="For STANDING_POLICY: 1 to 3 rules the owner stated. Empty for SITUATIONAL."
+    )
+
+
+CLASSIFY_PROMPT = """The owner turned down a request from their email assistant and then wrote the note below.
+Classify the note:
+- STANDING_POLICY: a lasting rule for the future, for example "never book calls before noon",
+  "always cc my manager", "no meetings after 5pm", "only send my resume as PDF".
+- SITUATIONAL: about this case or today only, for example "I'm tired today", "already talked to him",
+  "not this week".
+Then give a one-sentence summary. For STANDING_POLICY also list 1 to 3 preferences:
+- entity: who or what it applies to (an email address, a domain, a document name, or "owner" for general habits)
+- preference: one short imperative sentence ("No meetings before 12:00 IST")
+- context: when it applies or why, briefly ("" if not stated)
+Only restate what the owner said. Do not add rules they did not state.
+{facts}
+Owner's note:
+\"\"\"{note}\"\"\""""
+
+# Keyword fallback for when Gemini is unavailable.
+_STANDING_WORDS = re.compile(
+    r"\b(never|always|only|every|any ?time|from now on|in (the )?future|don'?t ever|no \w+ (before|after)|(before|after) \d)",
+    re.IGNORECASE,
+)
+_SITUATIONAL_WORDS = re.compile(
+    r"\b(today|tonight|tomorrow|this (time|week|one|morning|afternoon|evening)|right now|at the moment|already|tired|for now)\b",
+    re.IGNORECASE,
+)
+
+
+def guess_rule_kind(note: str) -> str:
+    """Keyword classification; when unsure, a note the owner asked to keep is kept (standing)."""
+
+    if _STANDING_WORDS.search(note):
+        return STANDING_POLICY
+    if _SITUATIONAL_WORDS.search(note):
+        return SITUATIONAL
+    return STANDING_POLICY
+
+
+def _classify(note: str, approval: dict[str, Any] | None) -> RuleClassification:
+    from app.agent.llm import get_llm, invoke_llm
+
+    facts = ""
+    if approval:
+        decision = {"resolved": "edited"}.get(approval.get("status"), approval.get("status") or "decided")
+        entity, preference, _ = decision_tuple(approval, decision)
+        facts = f"The note is about this decision: {preference} (about {entity}).\n"
+
+    llm = get_llm().with_structured_output(RuleClassification)
+    result = invoke_llm(llm, CLASSIFY_PROMPT.format(facts=facts, note=note))
+    if result is None or result.kind not in {STANDING_POLICY, SITUATIONAL}:
+        raise ValueError("No classification returned.")
+    return result
+
+
+def promote_owner_rule(note: str, approval: dict[str, Any] | None = None, store: AgentStateStore | None = None) -> dict[str, Any]:
+    """
+    Classify the owner's note and keep it accordingly.
+
+    Returns {"kind", "summary", "saved": [...]} for a standing policy (long-term
+    memory) or {"kind", "summary", "note_id"} for a situational note (24 hours).
+    """
+
+    from app.memory import episodic
+
+    note = " ".join((note or "").split())[:1000]
+    if not note:
+        raise ValueError("Empty note.")
+
+    entity = counterpart(approval) if approval else "owner"
+    try:
+        classified = _classify(note, approval)
+        kind, summary = classified.kind, " ".join(classified.summary.split()) or note
+        tuples = [(p.entity, p.preference, p.context) for p in classified.preferences[:3] if p.entity and p.preference]
+    except Exception as exc:
+        logger.warning("Rule classification failed, using keywords: %s", exc)
+        kind, summary, tuples = guess_rule_kind(note), note, []
+
+    if kind == SITUATIONAL:
+        note_id = episodic.add_note(note, entity=entity, approval_id=approval.get("id") if approval else None, store=store)
+        return {"kind": SITUATIONAL, "summary": summary, "note_id": note_id}
+
+    if not tuples:
+        context = f"about approval #{approval['id']}" if approval else "told by the owner"
+        tuples = [(entity, note, context)]
+
+    memory = SemanticMemory(store)
+    saved = []
+    for item_entity, preference, context in tuples:
+        memory_id, created = memory.upsert(item_entity, preference, context, source="owner_rule")
+        saved.append({"id": memory_id, "entity": item_entity, "preference": preference, "created": created})
+    summary = "; ".join(
+        item["preference"] + ("" if item["entity"].lower() == "owner" else f" ({item['entity']})") for item in saved
+    )
+    return {"kind": STANDING_POLICY, "summary": summary, "saved": saved}

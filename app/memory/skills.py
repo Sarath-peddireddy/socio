@@ -17,8 +17,10 @@ A skill is a Markdown recipe with YAML front matter and a JSON plan:
       "context_slice": "", "tools_allowed": ["search_gmail"], "depends_on": []}]
     ```
 
-- Socio saves a recipe after a multi-step owner instruction succeeded, and the
-  supervisor reuses its plan next time instead of planning from scratch.
+- Recipes are saved only when the owner asks: /save_skill NAME (or --save-skill)
+  packages the last successful multi-step plan (app.agent.supervisor.save_last_plan).
+  After the same tool graph succeeds 3 times, the run report suggests it once.
+  The supervisor then reuses the plan instead of planning from scratch.
   Recipes contain no code: replaying one runs the same guarded tools and approvals.
 - Socio never writes Python. A script (skills/<name>.py) is written by the owner
   and runs only after the owner approved its exact SHA-256 (enable_skill_script),
@@ -59,7 +61,6 @@ PLAN_BLOCK = re.compile(r"## Plan\s*```json\s*(.*?)```", re.DOTALL)
 FRONT_MATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?(.*)\Z", re.DOTALL)
 
 SKILL_MATCH_SCORE = 0.6       # request -> skill description similarity needed to offer a skill to the planner
-SKILL_DUPLICATE_SCORE = 0.95  # description -> description similarity at which a new recipe repeats an old one
 SCRIPT_TIMEOUT_SECONDS = 60
 MAX_SCRIPT_OUTPUT_CHARS = 20_000
 
@@ -184,21 +185,6 @@ def find_skills(request: str, k: int = 3, min_score: float = SKILL_MATCH_SCORE) 
     return sorted(scored, key=lambda item: -item[1])[:k]
 
 
-def similar_skill(description: str, min_score: float = SKILL_DUPLICATE_SCORE) -> Skill | None:
-    """An existing recipe that describes the same procedure, if any."""
-
-    from app.memory.embeddings import get_embedder
-
-    skills = [skill for skill in list_skills() if skill.plan]
-    if not skills:
-        return None
-    embedder = get_embedder()
-    vector = embedder.embed_documents([description])[0]
-    scored = [(skill, float(_skill_vector(skill, embedder) @ vector)) for skill in skills]
-    best = max(scored, key=lambda item: item[1])
-    return best[0] if best[1] >= min_score else None
-
-
 def expand_skill(skill: Skill, params: dict[str, Any], allowed_tools: set[str]) -> list[dict[str, Any]]:
     """The skill's plan with {{parameters}} filled in, validated like any other plan."""
 
@@ -283,7 +269,7 @@ def save_recipe(
         f"---\n{yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip()}\n---\n"
         f"# {title}\n\n"
         + (f"{notes}\n\n" if notes else "")
-        + "Saved by Socio after this procedure succeeded. Replaying it uses the same tools and\n"
+        + "Saved with /save_skill after this procedure succeeded. Replaying it uses the same tools and\n"
         "approval gates as any instruction. Edit or delete this file freely.\n\n"
         f"## Plan\n```json\n{json.dumps(plan, indent=2, ensure_ascii=False)}\n```\n"
     )

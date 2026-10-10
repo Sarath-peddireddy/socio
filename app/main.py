@@ -15,18 +15,20 @@ Run Socio, the autonomous email and calendar agent.
     python -m app.main --memories            # list what Socio has learned
     python -m app.main --forget 7            # forget memory #7
     python -m app.main --skills              # list saved skills (./skills)
+    python -m app.main --save-skill NAME     # save the last successful multi-step instruction as a skill
 
 Output shows sender, subject, and decisions only, never email bodies.
+Warnings and full error details are also written to logs/agent.log.
 """
 
 import argparse
-import logging
 import sys
 
 from app.agent.approvals import approve, describe, reject, to_draft
 from app.agent.followups import complete_followup_task
 from app.agent.runner import DEFAULT_QUERY, handle_owner_command, process_inbox
 from app.agent.state import AgentStateStore
+from app.errors import setup_logging
 
 
 def _short(text: str, width: int) -> str:
@@ -90,6 +92,18 @@ def _memory_command(args) -> int:
     from app.memory.learning import learn_from_owner_note
     from app.memory.semantic import SemanticMemory, memory_enabled
 
+    if args.save_skill:
+        from app.agent.supervisor import save_last_plan
+
+        try:
+            saved = save_last_plan(args.save_skill)
+        except skills.SkillError as exc:
+            print(exc)
+            return 1
+        print(f"Saved skill '{saved.name}' ({saved.tasks} steps; parameters: {', '.join(saved.parameters) or 'none'})"
+              + ("" if saved.generalized else " exactly as it ran (Gemini could not generalize it)") + ".")
+        return 0
+
     if args.skills:
         found = skills.list_skills()
         print("Saved skills:" if found else f"No skills in {skills.skills_dir()}.")
@@ -113,7 +127,7 @@ def _memory_command(args) -> int:
         return 0 if forgotten else 1
 
     memories = memory.all(limit=100)
-    print(f"Memories: {len(memories)}" + ("" if memories else " (reject or edit a request, or use --remember)"))
+    print(f"Memories: {len(memories)}" + ("" if memories else " (use --remember, or + Add Permanent Rule in Telegram)"))
     for item in memories:
         print(f"  [{item.id}] {item.line()}  <{item.source}, x{item.hits}>")
     return 0
@@ -134,6 +148,7 @@ def main(argv=None) -> int:
     parser.add_argument("--memories", action="store_true", help="List what Socio has learned")
     parser.add_argument("--forget", type=int, metavar="ID", help="Forget memory #ID")
     parser.add_argument("--skills", action="store_true", help="List saved skills")
+    parser.add_argument("--save-skill", metavar="NAME", help="Save the last successful multi-step instruction as skill NAME")
     parser.add_argument("--google-login", "--drive-login", dest="google_login", action="store_true",
                         help="Sign in to Google Drive, Docs, Sheets and Tasks, and list the Socio folder")
     args = parser.parse_args(argv)
@@ -143,7 +158,7 @@ def main(argv=None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
 
-    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    setup_logging()
 
     if args.status:
         print_status()
@@ -181,9 +196,11 @@ def main(argv=None) -> int:
         else:
             outcome = to_draft(args.draft)
         print(outcome["message"])
+        if outcome.get("error"):
+            print(f"  detail (local only): {outcome['error']}")
         return 0 if outcome["ok"] else 1
 
-    if args.remember or args.memories or args.forget is not None or args.skills:
+    if args.remember or args.memories or args.forget is not None or args.skills or args.save_skill:
         return _memory_command(args)
 
     if args.ask:

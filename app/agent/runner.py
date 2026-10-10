@@ -29,7 +29,9 @@ from app.agent.tools import thread_participants
 from app.agent.untrusted import inline_untrusted, wrap_untrusted_email
 from app.gmail.messages import search_messages
 from app.gmail.tools import get_thread_details
+from app.errors import plain_message, report_failure
 from app.google_api import GoogleApiUnavailableError
+from app.memory.episodic import notes_block
 from app.memory.semantic import format_memories, recall
 
 
@@ -92,7 +94,7 @@ def _greeting_instruction(target: dict) -> str:
     )
 
 
-def _task_prompt(target: dict, thread: list[dict], decision, earlier_actions: list[dict] | None = None, memories: list | None = None) -> str:
+def _task_prompt(target: dict, thread: list[dict], decision, earlier_actions: list[dict] | None = None, memories: list | None = None, notes: str = "") -> str:
     reply_to = target.get("reply_to") or target.get("from", "")
 
     recovery = ""
@@ -114,6 +116,7 @@ def _task_prompt(target: dict, thread: list[dict], decision, earlier_actions: li
         f"confidence={decision.confidence}, reason={decision.reason}\n"
         f"{recovery}\n"
         + (f"{format_memories(memories)}\n\n" if memories else "")
+        + (f"{notes}\n\n" if notes else "")
         + "Full thread, oldest first:\n\n"
         f"{_thread_transcript(thread)}"
     )
@@ -215,7 +218,7 @@ def handle_message(message_id: str, thread_id: str, *, dry_run: bool = False, st
             agent = create_agent_graph()
             result = agent.invoke(
                 {
-                    "messages": [HumanMessage(content=_task_prompt(target, thread, decision, earlier_actions, memories))],
+                    "messages": [HumanMessage(content=_task_prompt(target, thread, decision, earlier_actions, memories, notes_block(store)))],
                     "processed_message_ids": [],
                     "actions": [],
                     "pending_approvals": [],
@@ -335,10 +338,10 @@ def _process_inbox(store: AgentStateStore, query: str, max_messages: int, dry_ru
             reconcile_pending_approvals(store)
         listed = search_messages(query=query, max_results=max_messages)
     except GoogleApiUnavailableError as exc:
-        logger.error("Stopping run before processing: %s", exc)
+        report_failure(exc, "process_inbox.list")
         if not dry_run:
             store.add_failure("process_inbox", str(exc))
-        return [MessageOutcome("-", status="failed", reason=str(exc))]
+        return [MessageOutcome("-", status="failed", reason=plain_message(exc))]
 
     for item in listed:  # Gmail lists newest first
         if item["threadId"] not in newest_per_thread:
@@ -359,18 +362,19 @@ def _process_inbox(store: AgentStateStore, query: str, max_messages: int, dry_ru
         except (GoogleApiUnavailableError, LLMUnavailableError) as exc:
             # An outage is not this email's fault: stop the batch and do not
             # count the attempt, so the email is retried normally next run.
-            logger.error("Stopping run: %s", exc)
+            report_failure(exc, "process_inbox.outage", message_id=message_id)
             if not dry_run:
                 store.add_failure("process_inbox", str(exc), message_id=message_id)
                 store.abort_attempt(message_id, reason=str(exc))
-            outcomes.append(MessageOutcome(message_id, thread_id, status="failed", reason=str(exc)))
+            retry = "" if dry_run else " I'll retry this email on the next inbox check."
+            outcomes.append(MessageOutcome(message_id, thread_id, status="failed", reason=plain_message(exc) + retry))
             break
         except Exception as exc:
-            logger.exception("Failed to process message %s", message_id)
+            report_failure(exc, "handle_message", message_id=message_id, thread_id=thread_id)
             if not dry_run:
                 store.add_failure("handle_message", f"{type(exc).__name__}: {exc}", message_id=message_id)
                 store.mark_processed(message_id, thread_id, status="failed", summary=str(exc))
-            outcomes.append(MessageOutcome(message_id, thread_id, status="failed", reason=f"{type(exc).__name__}: {exc}"))
+            outcomes.append(MessageOutcome(message_id, thread_id, status="failed", reason=plain_message(exc)))
             continue
 
         outcomes.append(outcome)

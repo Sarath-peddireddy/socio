@@ -41,6 +41,7 @@ from app.agent.tools import (
 from app.calendar.events import parse_ist
 from app.calendar.holds import overlapping_holds
 from app.calendar.tools import find_calendar_availability
+from app.errors import report_failure, safe_error_text
 from app.google_api import is_retryable_error
 
 
@@ -548,7 +549,9 @@ def execute_tools(state: AgentState):
                 proposal = _reply_proposal(args) if _is_email_mode(state) else _owner_write_proposal(tool_name, args)
             except Exception as exc:
                 failures.append(f"{tool_name}: {exc}")
-                tool_results.append(_tool_message(f"Tool failed: {exc}", tool_call))
+                if not isinstance(exc, ValueError):
+                    report_failure(exc, "graph.proposal", tool=tool_name, message_id=source_message_id)
+                tool_results.append(_tool_message(f"Tool failed: {safe_error_text(exc)}", tool_call))
                 continue
             message = _record_proposal(proposal, state, store, dry_run, actions, pending_approvals, failures)
             tool_results.append(_tool_message(message, tool_call))
@@ -566,11 +569,13 @@ def execute_tools(state: AgentState):
             result = _execute_tool(tool_call)
         except Exception as exc:  # pragma: no cover - exercised in live runs and recorded for follow-up
             failures.append(f"{tool_name}: {exc}")
+            report_failure(exc, "graph.tool", tool=tool_name, message_id=source_message_id)
 
             if not dry_run:
                 store.add_failure(tool_name, str(exc))
 
-            message = f"Tool failed: {exc}"
+            # The model gets our own validation messages, never raw Google/network/internal errors.
+            message = f"Tool failed: {safe_error_text(exc)}"
 
             if tool_name in SIDE_EFFECT_TOOLS:
                 status = "unknown" if is_retryable_error(exc) else "failed"
