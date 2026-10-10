@@ -13,6 +13,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from app.agent.followups import complete_followup_task
 from app.agent.state import AgentStateStore
 from app.calendar.events import cancel_event, move_event, parse_ist
 from app.gmail.messages import send_reply, trash_message
@@ -128,6 +129,7 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
 
     if approval["type"] in REVIEW_TYPES:
         store.resolve_pending_approval(approval_id, "Marked done by owner")
+        complete_followup_task(store, approval.get("message_id"))
         return {"ok": True, "message": f"#{approval_id} marked done."}
 
     if approval["type"] not in EXECUTABLE_TYPES:
@@ -150,6 +152,7 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
         return {"ok": False, "message": f"#{approval_id} failed, nothing was changed: {error}"}
 
     store.finish_approval(approval_id, "approved", "Approved and executed", result)
+    complete_followup_task(store, message_id)
     store.add_action(approval["type"], approval.get("target"), approval["payload"], "completed", message_id=message_id, result=result)
 
     message = f"#{approval_id} done."
@@ -178,6 +181,7 @@ def reject(approval_id: int, store: AgentStateStore | None = None) -> dict[str, 
         return {"ok": False, "message": f"Approval #{approval_id} was already {approval['status']}."}
 
     store.finish_approval(approval_id, "rejected", f"Rejected by owner at {datetime.now().isoformat(timespec='seconds')}")
+    complete_followup_task(store, approval.get("message_id"))
 
     if approval.get("message_id") and approval["type"] in {"move_event", "cancel_event"}:
         store.mark_processed(

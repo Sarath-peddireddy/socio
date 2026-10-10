@@ -18,6 +18,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 
 from app.agent.decision import decide_reply_needed
+from app.agent.followups import complete_followup_task, create_followup_task
 from app.agent.graph import create_agent_graph
 from app.agent.llm import LLMUnavailableError
 from app.agent.state import AgentStateStore
@@ -211,7 +212,10 @@ def handle_message(message_id: str, thread_id: str, *, dry_run: bool = False, st
                 )
         else:
             # Work completed by an interrupted earlier attempt (restart recovery).
-            earlier_actions = [] if dry_run else store.actions_for_message(message_id, status="completed")
+            earlier_actions = [] if dry_run else [
+                action for action in store.actions_for_message(message_id, status="completed")
+                if not action["type"].startswith("auto_task")
+            ]
 
             # 4-5. Let the agent choose and execute tools; tools verify their own results.
             agent = create_agent_graph()
@@ -244,6 +248,12 @@ def handle_message(message_id: str, thread_id: str, *, dry_run: bool = False, st
             metadata={"intent": outcome.intent, "reason": outcome.reason, "attempts": attempts},
         )
 
+        # Put anything waiting on the owner into their Google Tasks.
+        create_followup_task(
+            store, message_id, thread_id, outcome.status, outcome.subject, outcome.sender,
+            outcome.summary or outcome.reason,
+        )
+
     return outcome
 
 
@@ -274,7 +284,9 @@ def reconcile_pending_approvals(store: AgentStateStore) -> int:
             continue
 
         if thread and "SENT" in thread[-1].get("label_ids", []):
-            closed += store.resolve_pending_approval(approval["id"], "Owner replied in the thread")
+            if store.resolve_pending_approval(approval["id"], "Owner replied in the thread"):
+                closed += 1
+                complete_followup_task(store, approval.get("message_id"))
 
     return closed
 

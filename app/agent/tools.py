@@ -418,3 +418,96 @@ def send_new_email(to: str, subject: str, body: str, attachment_paths: list[str]
     sent = send_new_email_message(to=to, subject=subject, body=body, attachment_paths=attachments)
 
     return {**sent, "attachments": [Path(path).name for path in attachments], "verified": bool(sent.get("message_id"))}
+
+
+# ----- Google Docs / Sheets / Tasks (owner mode only) ------------------------
+# Docs and Sheets are limited to the Socio Drive folder; content is only ever
+# appended, never deleted or overwritten. Use find_documents to get a file's
+# "path" (drive:<id>); a Docs/Sheets URL also works.
+
+
+@tool
+def read_document(document: str) -> dict:
+    """Read the text of a Google Doc in the Socio folder. document is a find_documents path or a Docs URL."""
+
+    from app.workspace import docs
+
+    return docs.read_document(document)
+
+
+@tool
+def create_document(title: str, content: str) -> dict:
+    """Create a new Google Doc with the given text in the Socio folder. Returns its link."""
+
+    from app.workspace import docs
+
+    return docs.create_document(title, content)
+
+
+@tool
+def append_to_document(document: str, text: str) -> dict:
+    """Append text to the end of a Google Doc in the Socio folder. Existing content is not changed."""
+
+    from app.workspace import docs
+
+    return docs.append_to_document(document, text)
+
+
+@tool
+def read_sheet(spreadsheet: str, tab: str = "") -> dict:
+    """
+    Read the rows of a Google Sheet in the Socio folder (first tab unless tab is given).
+    spreadsheet is a find_documents path or a Sheets URL. Use it to see the columns before adding a row.
+    """
+
+    from app.workspace import sheets
+
+    return sheets.read_sheet(spreadsheet, tab)
+
+
+@tool
+def append_sheet_row(spreadsheet: str, values: list[str], tab: str = "") -> dict:
+    """
+    Add one row at the bottom of a Google Sheet in the Socio folder. values are the
+    cells in column order (read_sheet first to match the header). Existing rows are not changed.
+    """
+
+    from app.workspace import sheets
+
+    return sheets.append_sheet_row(spreadsheet, values, tab)
+
+
+@tool
+def create_spreadsheet(title: str, headers: list[str] | None = None) -> dict:
+    """Create a new Google Sheet in the Socio folder, optionally with a header row. Returns its link."""
+
+    from app.workspace import sheets
+
+    return sheets.create_spreadsheet(title, headers)
+
+
+@tool
+def list_tasks(include_completed: bool = False) -> list[dict]:
+    """List tasks in the owner's Google Tasks (default list)."""
+
+    from app.tasks import tasks
+
+    return tasks.list_tasks(include_completed=include_completed)
+
+
+@tool
+def create_task(title: str, notes: str = "", due_date: str = "") -> dict:
+    """Add a task to the owner's Google Tasks. due_date is optional, YYYY-MM-DD."""
+
+    from app.tasks import tasks
+
+    return tasks.create_task(title, notes, due_date)
+
+
+@tool
+def complete_task(task_id: str) -> dict:
+    """Mark a Google Task as completed (task_id from list_tasks). This can be undone in the Tasks app."""
+
+    from app.tasks import tasks
+
+    return tasks.complete_task(task_id)

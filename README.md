@@ -27,6 +27,12 @@ And from Telegram, you can just ask:
 - *"what's on my calendar this week?"*
 - *"move my 3pm with Raj to Friday 11am"*
 - *"trash the Swiggy email"*
+- *"add Acme, PM, applied today to my applications sheet"*
+- *"write a cover letter for Acme in a doc"*
+- *"remind me to send the invoice on Friday"*
+
+When something needs you (a draft to review, a change to approve), Socio
+also adds it to **Google Tasks**, and completes it once you've acted.
 
 ## Safety model
 
@@ -39,8 +45,12 @@ And from Telegram, you can just ask:
   restricted toolset: it can only reply inside that conversation, only to
   people already in it, and can never delete, search your other mail, or
   email new people.
-- **Least-privilege documents.** Only one Google Drive folder you choose is
-  visible to Socio, read-only.
+- **One folder, append-only.** Socio only sees one Google Drive folder you
+  choose. It can read Docs and Sheets there and *add* to them (append text,
+  add rows) but never deletes or overwrites anything. Sheet values are
+  written as plain text, so content from an email can never become a formula.
+  Docs, Sheets, and Tasks are only available on your instructions, never
+  while handling an incoming email.
 - **No duplicates.** Sends, bookings, and drafts are never retried
   blindly; every outcome is recorded so a restart never repeats work.
 - **Owner-only bot.** The Telegram bot only responds to your chat id.
@@ -48,7 +58,7 @@ And from Telegram, you can just ask:
 ## Quick start
 
 Requirements: Python 3.11+, a Google Cloud project with the Gmail, Google
-Calendar, and Google Drive APIs enabled, an OAuth client (`credentials.json`,
+Calendar, Google Drive, Google Docs, Google Sheets, and Google Tasks APIs enabled, an OAuth client (`credentials.json`,
 type "Desktop app"), a Gemini API key, and a Telegram bot token.
 
 ```bash
@@ -60,7 +70,7 @@ cp .env.example .env              # then fill in the values
 # put credentials.json in the project root
 
 python -m app.main --dry-run      # first run opens Google sign-in; shows what Socio would do
-python -m app.main --drive-login  # one-time Google Drive sign-in (read-only)
+python -m app.main --google-login # one-time sign-in for Drive, Docs, Sheets, Tasks
 python -m app.telegram_bot        # start the assistant
 ```
 
@@ -83,7 +93,8 @@ See [`.env.example`](.env.example).
 |---|---|
 | `GEMINI_API_KEY` | LLM used for decisions and writing |
 | `AGENT_OWNER_NAME` | Name used to sign emails |
-| `AGENT_DRIVE_FOLDER` | Google Drive folder Socio may send documents from |
+| `AGENT_DRIVE_FOLDER` | The one Google Drive folder Socio may use (documents, Docs, Sheets) |
+| `AGENT_AUTO_TASKS` | Add a Google Task when something needs you (default on; `0` = off) |
 | `AGENT_FILES_DIR` | Optional local documents folder (default `./documents`) |
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
 | `TELEGRAM_OWNER_CHAT_ID` | The only chat allowed to use the bot |
@@ -131,7 +142,9 @@ app/
   agent/            Runner, LangGraph agent, decisions, prompts, approvals, state
   gmail/            Gmail auth, messages, threads, drafts, parsing
   calendar/         Availability, booking, find/move/cancel events
-  drive/            Google Drive client (read-only)
+  drive/            Google Drive client
+  workspace/        Shared Workspace sign-in, Google Docs, Google Sheets
+  tasks/            Google Tasks
   files/            Document search: Drive folder + local folder
 docs/
   ARCHITECTURE.md
@@ -139,6 +152,5 @@ docs/
 
 ## Roadmap
 
-- Google Docs, Sheets, and Tasks integration
 - Always-on hosting (service / cloud)
 - Configurable working hours and time zones

@@ -24,8 +24,9 @@ documents/
 # Local test files
 test_*.py
 
-# Google Drive token (read-only Drive access)
+# Google Workspace tokens (Drive, Docs, Sheets, Tasks)
 drive_token.json
+workspace_token.json
 
 # Local AI-assistant notes (never published)
 CLAUDE.md

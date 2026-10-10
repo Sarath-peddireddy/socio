@@ -7,6 +7,7 @@ Run Socio, the autonomous email and calendar agent.
     python -m app.main --status              # show stored outcomes, approvals, failures
     python -m app.main --resolve 3           # close pending approval #3
     python -m app.main --ask "trash the Swiggy email"   # direct instruction (owner mode)
+    python -m app.main --google-login        # one-time sign-in for Drive, Docs, Sheets, Tasks
     python -m app.main --approve 4           # approve and execute request #4
     python -m app.main --reject 4            # reject request #4 (nothing changes)
 
@@ -18,6 +19,7 @@ import logging
 import sys
 
 from app.agent.approvals import approve, describe, reject
+from app.agent.followups import complete_followup_task
 from app.agent.runner import DEFAULT_QUERY, handle_owner_command, process_inbox
 from app.agent.state import AgentStateStore
 
@@ -84,7 +86,8 @@ def main(argv=None) -> int:
     parser.add_argument("--approve", type=int, metavar="ID", help="Approve and execute pending approval #ID")
     parser.add_argument("--reject", type=int, metavar="ID", help="Reject pending approval #ID (nothing changes)")
     parser.add_argument("--ask", metavar="TEXT", help="Give the agent a direct instruction (owner mode)")
-    parser.add_argument("--drive-login", action="store_true", help="Log in to Google Drive (read-only) and list the documents folder")
+    parser.add_argument("--google-login", "--drive-login", dest="google_login", action="store_true",
+                        help="Sign in to Google Drive, Docs, Sheets and Tasks, and list the Socio folder")
     args = parser.parse_args(argv)
 
     # Windows consoles default to cp1252, which cannot print emoji in subjects.
@@ -99,17 +102,21 @@ def main(argv=None) -> int:
         return 0
 
     if args.resolve is not None:
-        closed = AgentStateStore().resolve_pending_approval(args.resolve, "Resolved by owner")
+        store = AgentStateStore()
+        approval = store.get_approval(args.resolve)
+        closed = store.resolve_pending_approval(args.resolve, "Resolved by owner")
+        if closed and approval:
+            complete_followup_task(store, approval.get("message_id"))
         print(f"Approval #{args.resolve} {'closed' if closed else 'not found or already closed'}.")
         return 0 if closed else 1
 
-    if args.drive_login:
+    if args.google_login:
         from app.drive.client import get_drive_service
         from app.files.drive import drive_configured, list_drive_documents
         from app.files.local import ALLOWED_EXTENSIONS
 
         get_drive_service(allow_browser_login=True)
-        print("Google Drive connected (read-only).")
+        print("Google Drive, Docs, Sheets and Tasks connected.")
         if not drive_configured():
             print("Set AGENT_DRIVE_FOLDER=<folder name> in .env to choose the documents folder.")
             return 1

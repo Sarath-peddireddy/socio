@@ -29,7 +29,10 @@ app/agent/state.py       SQLite: message outcomes, attempts, actions, approvals,
         │
 app/gmail/               read, search, reply, send, draft, trash (never permanent delete)
 app/calendar/            availability, create, find, move, cancel
-app/drive/, app/files/   documents from one Drive folder (read-only) or a local folder
+app/drive/, app/files/   documents from one Drive folder or a local folder
+app/workspace/           shared Workspace sign-in; Google Docs and Sheets (append-only)
+app/tasks/               Google Tasks; app/agent/followups.py adds tasks when the owner is needed
+app/google_auth.py       shared OAuth credential loading
 app/google_api.py        shared timeouts, bounded retries, token refresh
 ```
 
@@ -51,8 +54,22 @@ Guards in the tools node:
 
 ## Owner mode (Telegram / `--ask`)
 
-Full toolset (search mail, send new email, calendar, documents) plus
-`propose_trash_email`. Destructive changes still go through approvals.
+Full toolset (search mail, send new email, calendar, documents, Google Docs,
+Sheets, and Tasks) plus `propose_trash_email`. Destructive changes still go
+through approvals.
+
+## Google Workspace
+
+Drive, Docs, Sheets, and Tasks share one OAuth token (`workspace_token.json`,
+`python -m app.main --google-login`); Gmail and Calendar keep their own.
+Scopes: `drive.readonly`, `drive.file`, `documents`, `spreadsheets`, `tasks`.
+Because the Docs/Sheets scopes cover the whole Drive, the code restricts every
+read and edit to the configured Socio folder (`files/drive.resolve_folder_file`).
+Edits are append-only; Sheets values are written with `valueInputOption=RAW`.
+
+Follow-up tasks: when an email ends as `needs_review`, `needs_attention`, or
+`awaiting_approval`, a Google Task is created (once per email) and completed
+when the owner approves, rejects, or resolves it. Failures never affect email handling.
 
 ## Approvals
 

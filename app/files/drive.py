@@ -151,3 +151,64 @@ def download_drive_document(path: str, allowed_extensions: set[str], max_bytes: 
     target.write_bytes(data)
 
     return target
+
+
+def socio_folder_id() -> str:
+    """Id of the configured Socio Drive folder."""
+
+    if not drive_configured():
+        raise RuntimeError("No Socio Drive folder configured. Set AGENT_DRIVE_FOLDER in .env.")
+    return _root_folder_id(get_drive_service())
+
+
+def _file_id_from_reference(reference: str) -> str:
+    """Accept "drive:<id>", a Google Docs/Sheets URL, or a bare file id."""
+
+    reference = reference.strip()
+    if reference.startswith(DRIVE_PREFIX):
+        return reference[len(DRIVE_PREFIX):]
+
+    marker = "/d/"
+    if marker in reference:
+        return reference.split(marker, 1)[1].split("/", 1)[0].split("?", 1)[0]
+
+    return reference
+
+
+def resolve_folder_file(reference: str, mime_type: str) -> dict:
+    """
+    Resolve a reference to a file of mime_type inside the Socio folder.
+
+    Socio's Docs/Sheets permissions cover the whole Drive, so this check is
+    what keeps reads and edits inside the folder the owner chose.
+    """
+
+    from app.files.local import ALLOWED_EXTENSIONS
+
+    file_id = _file_id_from_reference(reference)
+    for document in list_drive_documents(ALLOWED_EXTENSIONS):
+        if document["path"] == f"{DRIVE_PREFIX}{file_id}":
+            if document["mime_type"] != mime_type:
+                raise ValueError(f"'{document['name']}' is not a {mime_type.rsplit('.', 1)[-1]}.")
+            return {"id": file_id, "name": document["name"], "folder": document["folder"]}
+
+    raise ValueError("That file is not in the Socio Drive folder. Use find_documents to locate it first.")
+
+
+def move_into_socio_folder(file_id: str) -> None:
+    """Move a file Socio just created (in My Drive) into the Socio folder."""
+
+    service = get_drive_service()
+    current = execute_with_retry(
+        service.files().get(fileId=file_id, fields="parents"),
+        operation_name="drive_get_parents",
+    )
+    execute_with_retry(
+        service.files().update(
+            fileId=file_id,
+            addParents=socio_folder_id(),
+            removeParents=",".join(current.get("parents", [])),
+            fields="id, parents",
+        ),
+        operation_name="drive_move_to_folder",
+    )

@@ -10,7 +10,16 @@ from app.agent.prompts import build_system_prompt
 from app.agent.state import AgentStateStore
 from app.agent.approvals import describe
 from app.agent.tools import (
+    append_sheet_row,
+    append_to_document,
     check_reply_needed,
+    complete_task,
+    create_document,
+    create_spreadsheet,
+    create_task,
+    list_tasks,
+    read_document,
+    read_sheet,
     create_reply_draft,
     find_calendar_events,
     find_documents,
@@ -45,11 +54,31 @@ AGENT_TOOLS = [
     propose_move_calendar_event,
     propose_cancel_calendar_event,
     propose_trash_email,
+    read_document,
+    create_document,
+    append_to_document,
+    read_sheet,
+    append_sheet_row,
+    create_spreadsheet,
+    list_tasks,
+    create_task,
+    complete_task,
 ]
 TOOLS_BY_NAME = {agent_tool.name: agent_tool for agent_tool in AGENT_TOOLS}
 
 # Tools with external side effects. Only these are recorded as actions.
-SIDE_EFFECT_TOOLS = {"send_gmail_reply", "send_new_email", "create_calendar_event", "create_reply_draft"}
+SIDE_EFFECT_TOOLS = {
+    "send_gmail_reply",
+    "send_new_email",
+    "create_calendar_event",
+    "create_reply_draft",
+    "create_document",
+    "append_to_document",
+    "create_spreadsheet",
+    "append_sheet_row",
+    "create_task",
+    "complete_task",
+}
 
 # Tools that only create an approval request for the owner (see app.agent.approvals).
 PROPOSAL_TOOLS = {"propose_move_calendar_event", "propose_cancel_calendar_event", "propose_trash_email"}
@@ -136,6 +165,14 @@ def _action_target(tool_name: str, args: dict[str, Any]) -> str:
         return args.get("message_id", "")
     if tool_name == "send_new_email":
         return args.get("to", "")
+    if tool_name in {"create_document", "create_spreadsheet", "create_task"}:
+        return args.get("title", "")
+    if tool_name == "append_to_document":
+        return args.get("document", "")
+    if tool_name == "append_sheet_row":
+        return args.get("spreadsheet", "")
+    if tool_name == "complete_task":
+        return args.get("task_id", "")
     if tool_name == "create_calendar_event":
         return f"{args.get('title', '')} @ {args.get('start_time', '')}"
     return ""

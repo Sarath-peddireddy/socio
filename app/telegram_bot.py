@@ -48,6 +48,9 @@ Or just type an instruction, e.g.
 - what's on my calendar this week?
 - move my 3pm call with Raj to Friday 11am
 - trash the Swiggy email
+- add Acme, PM, applied today to my applications sheet
+- write a cover letter for Acme in a doc
+- remind me to send the invoice on Friday
 Deleting email and moving/cancelling events always ask for your approval first."""
 
 INTERESTING_STATUSES = {
