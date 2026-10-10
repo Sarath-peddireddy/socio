@@ -1,0 +1,32 @@
+# Google OAuth and Calendar credentials
+credentials.json
+token.json
+calendar_token.json
+.env
+
+# Python environment and generated files
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor settings
+.vscode/
+
+# Local agent state (contains email addresses and reply bodies)
+*.sqlite3
+
+# Downloaded email attachments, shareable documents, and local logs
+downloads/
+documents/
+*.log
+
+# Local test files
+test_*.py
+
+# Google Drive token (read-only Drive access)
+drive_token.json
+
+# Local AI-assistant notes (never published)
+CLAUDE.md
+.claude/
