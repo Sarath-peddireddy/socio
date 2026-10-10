@@ -7,10 +7,14 @@
    judgement: classifying intent, choosing tools, writing emails.
 2. **Two trust levels.** Instructions from the owner (Telegram / CLI) are
    trusted. Email content is untrusted data and gets a restricted toolset.
-3. **Human-in-the-loop by blast radius.** Plain in-thread replies are sent
-   autonomously. Booking, moving, or cancelling events, trashing email, and
-   sending attachments are proposals; only the owner's approval executes them.
-   The agent has no direct booking tool at all (`propose_book_meeting` only).
+   Every prompt carries email content only inside `<untrusted_email_body>`
+   tags (`app/agent/untrusted.py`).
+3. **Nothing reaches other people without the owner.** In email mode every
+   reply (with or without files) is held as an approval; booking, moving, or
+   cancelling events and trashing email are proposals too. Only the owner's
+   approval executes them. The agent has no direct booking tool at all
+   (`propose_book_meeting` only). In owner mode, emails the owner asks for are
+   sent directly.
 4. **Never claim what didn't happen.** An action counts as done only when the
    API result confirms it; sends are re-checked in the thread.
 
@@ -26,10 +30,11 @@ app/agent/decision.py    metadata rules → keyword pre-check → Gemini structu
 app/agent/graph.py       LangGraph: agent node ⇄ tools node; mode-specific toolsets and guards
 app/agent/prompts.py     system prompts and per-intent playbooks
 app/agent/approvals.py   execute / reject approval requests (re-validated at execution time)
-app/agent/state.py       SQLite: message outcomes, attempts, actions, approvals, failures
+app/agent/state.py       SQLite: message outcomes, attempts, actions, approvals, slot holds, failures
+app/agent/untrusted.py   sanitize + wrap email content in <untrusted_email_body> tags
         │
 app/gmail/               read, search, reply, send, draft, trash (never permanent delete)
-app/calendar/            availability, create, find, move, cancel
+app/calendar/            availability, create, find, move, cancel; holds.py: local soft holds
 app/drive/, app/files/   document search: owner's Drive (owned files) + local shareable folder
 app/workspace/           shared Workspace sign-in; Google Docs and Sheets (append-only)
 app/tasks/               Google Tasks; app/agent/followups.py adds tasks when the owner is needed
@@ -47,13 +52,24 @@ fetch thread ─► decide ─► no action / low confidence ─► record
 
 Guards in the tools node:
 
+- every `send_gmail_reply` becomes a `send_reply` / `send_reply_with_attachment`
+  approval; the recipient, thread, and message come from the runner, not the model
 - only the conversation being handled can be replied to, only to its participants
 - calendar invites only to conversation participants
 - an event can only be moved/cancelled on request of one of its attendees
 - one reply / draft per email, even across restarts
-- once a reply is held in an approval (booking, attachment), no other reply can
-  be sent for that email
+- once a reply is held in an approval (reply, booking, move), no other reply or
+  draft can be made for that email, including by a restarted run
+- a booking/move whose time overlaps another email's held slot is refused
 - no Trash, no new emails, no mailbox search
+
+Untrusted content: `untrusted.py` strips HTML (scripts, styles, comments,
+tags), invisible and control characters, then escapes `<`/`>` so an email
+cannot close the `<untrusted_email_body>` tag early; headers become escaped
+attributes. Used by the runner's task prompt, the triage prompt, and the
+Gmail read tools (`get_thread`, `get_email`, `search_gmail`,
+`get_recent_emails`). This lowers injection risk; the hard limits are the
+toolset and the approvals above.
 
 ## Owner mode (Telegram / `--ask`)
 
@@ -74,10 +90,9 @@ folder it creates and tags (`appProperties`), so it never writes into one of
 the owner's folders. Edits are append-only; Sheets values are written with
 `valueInputOption=RAW`.
 
-Sharing files by email: when the agent (email mode) replies with any
-attachment (Drive or local) the owner has not marked *Always allow*, the reply
-becomes a `send_reply_with_attachment` approval (Telegram: Send / Reject /
-Send & always allow).
+Sharing files by email: in email mode a reply with any attachment (Drive or
+local) becomes a `send_reply_with_attachment` approval (Telegram: Approve &
+Send / Edit in Gmail / Reject).
 
 Follow-up tasks: when an email ends as `needs_review`, `needs_attention`, or
 `awaiting_approval`, a Google Task is created (once per email) and completed
@@ -85,21 +100,35 @@ when the owner approves, rejects, or resolves it. Failures never affect email ha
 
 ## Approvals
 
-`propose_*` tools validate the request and the graph records an approval
-(`pending_approvals` table). The Telegram bot pushes each new request with
-Approve / Reject buttons. `approvals.approve()` claims the request atomically
-(so a double tap cannot run it twice), re-validates (event exists, new slot
-still free), executes, then sends the follow-up reply if one was attached.
+`propose_*` tools (and, in email mode, `send_gmail_reply`) validate the request
+and the graph records an approval (`pending_approvals` table). The Telegram bot
+pushes each new request with Approve / Reject buttons (replies also get Edit in
+Gmail). `approvals.approve()` claims the request atomically (so a double tap
+cannot run it twice), re-validates (event exists, new slot still free),
+executes, then sends the follow-up reply if one was attached.
 
 | Type | Executes |
 |---|---|
+| `send_reply` | the reply in the thread |
+| `send_reply_with_attachment` | the reply with its files |
 | `book_meeting` | create the event (conflict re-checked, attendee invited), then the reply |
 | `move_event` / `cancel_event` | patch / delete the event (attendees notified), then the reply |
-| `send_reply_with_attachment` | the reply with its files |
 | `trash_email` | move the message or thread to Trash |
 
-A failed execution changes nothing further and marks the email
-`needs_attention`; a rejection marks it `needs_review` for the owner.
+`approvals.to_draft()` (Edit in Gmail, `--draft ID`) saves a held reply as a
+Gmail draft instead (one attachment carried over; with several, the owner
+attaches them) and marks the email `needs_review`. A failed execution changes
+nothing further and marks the email `needs_attention`; a rejection marks it
+`needs_review` for the owner.
+
+Soft holds: when a `book_meeting` or `move_event` approval is recorded, its new
+time goes into `slot_holds` for 24 hours (`SLOT_HOLD_HOURS`).
+`find_calendar_availability` treats active holds as busy, and the graph refuses
+another email's booking/move that overlaps one (an email's own hold never
+blocks it, so a retried run still works). A hold is released as soon as its
+approval is approved, rejected, failed, or resolved. After it
+expires the approval may still be open; approving then still re-checks the
+real calendar.
 
 ## Reliability
 

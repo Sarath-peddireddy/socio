@@ -17,7 +17,8 @@ one tap from you. You talk to it from Telegram.
 | Incoming email | What Socio does |
 |---|---|
 | "Can we schedule a 30-min interview?" | Finds a free slot and asks you on Telegram; once you approve, it books it with the sender invited and replies with the exact time |
-| "Could you send your resume?" | Finds it in your Google Drive and asks you on Telegram before sending it (tap *Always allow* once and it won't ask again) |
+| "Could you send your resume?" | Finds it in your Google Drive and asks you on Telegram before sending it |
+| "Just to confirm, you join on 1 Nov?" | Writes the reply and asks you on Telegram: *Approve & Send*, *Edit in Gmail*, or *Reject* |
 | "What's your notice period?" (Socio doesn't know) | Saves a ready-to-send Gmail draft with the gaps marked for you |
 | "Can we move our call to Friday?" | Finds the meeting and asks you on Telegram; once you approve, it moves the event and replies |
 | Newsletters, promotions, receipts, "thanks!", FYIs | Nothing. No reply is sent |
@@ -37,15 +38,15 @@ also adds it to **Google Tasks**, and completes it once you've acted.
 
 ## Safety model
 
-- **Autonomous for routine work, your call for high-impact actions.**
+- **Socio does the work; nothing reaches anyone else without your tap.**
 
   | Action | What Socio does |
   |---|---|
-  | Plain reply in the sender's own thread | Sends it |
-  | Reply with a file attached | Asks you (Send / Reject / *Send & always allow this file*) |
+  | Reply to an incoming email (with or without a file) | Asks you (*Approve & Send* / *Edit in Gmail* / *Reject*); *Edit in Gmail* saves it as a draft for you to change and send |
   | Booking a new meeting | Asks you; the booking and its confirmation reply go out together |
   | Moving or cancelling a meeting | Asks you; then updates the event and replies |
   | Moving email to Trash | Asks you (only when you asked for it) |
+  | Emails you ask for in Telegram ("send my resume to …") | Sends it (you asked) |
   | Docs/Sheets appends, Tasks | Does it (your own files, append-only) |
 
   Approved actions are re-validated at the moment you tap (for example, the
@@ -54,10 +55,15 @@ also adds it to **Google Tasks**, and completes it once you've acted.
 - **Emails are untrusted.** When handling an incoming email, Socio gets a
   restricted toolset: it can only reply inside that conversation, only to
   people already in it, and can never delete, search your other mail, or
-  email new people.
+  email new people. Email content reaches the model only inside
+  `<untrusted_email_body>` tags (sanitized, with tags in the email escaped),
+  and the model is told never to follow instructions found there.
+- **No double-booked slots.** A time proposed for a booking or a move is held
+  locally for 24 hours (or until you decide), so Socio won't propose the same
+  slot to two people while you haven't approved either yet.
 - **Your Drive, your call.** Socio searches your whole Drive (only files you
   own, never ones others shared with you). It never emails a file to anyone
-  without your approval, unless you've marked that file *Always allow*.
+  without your approval.
 - **Append-only edits.** Socio can read Docs and Sheets and *add* to them
   (append text, add rows) but never deletes or overwrites anything. Sheet
   values are written as plain text, so content from an email can never
@@ -123,6 +129,7 @@ python -m app.main --status                # outcomes, open approvals, recent fa
 python -m app.main --ask "trash the Swiggy email"   # same as typing in Telegram
 python -m app.main --approve 3             # approve request #3
 python -m app.main --reject 3              # reject request #3 (nothing changes)
+python -m app.main --draft 3               # move held reply #3 to Gmail Drafts (not sent)
 ```
 
 ## How it works

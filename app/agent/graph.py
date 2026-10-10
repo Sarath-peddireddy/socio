@@ -1,3 +1,5 @@
+import json
+from email.utils import getaddresses
 from typing import Annotated, Any
 
 from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage, ToolMessage
@@ -34,6 +36,8 @@ from app.agent.tools import (
     send_gmail_reply,
     send_new_email,
 )
+from app.calendar.events import parse_ist
+from app.calendar.holds import overlapping_holds
 from app.calendar.tools import find_calendar_availability
 from app.google_api import is_retryable_error
 
@@ -82,13 +86,16 @@ SIDE_EFFECT_TOOLS = {
 
 # Tools that only create an approval request for the owner (see app.agent.approvals).
 # High-blast-radius actions always go through one: booking, moving, or cancelling
-# meetings, trashing email (and sending attachments, see _needs_share_approval).
+# meetings, trashing email (and, in email mode, every reply, see _reply_proposal).
 PROPOSAL_TOOLS = {
     "propose_book_meeting",
     "propose_move_calendar_event",
     "propose_cancel_calendar_event",
     "propose_trash_email",
 }
+
+# Proposals whose new time is held locally until the owner decides (see app.calendar.holds).
+SLOT_HOLD_TYPES = {"book_meeting", "move_event"}
 
 # Tools that must stay inside the thread being handled.
 THREAD_SCOPED_TOOLS = {"send_gmail_reply", "create_reply_draft"}
@@ -206,6 +213,16 @@ def _scope_violation(tool_name: str, args: dict[str, Any], state: AgentState) ->
             "so they cannot be invited."
         )
 
+    # The held reply always goes to the runner's recipient; still refuse (and log)
+    # an attempt to address someone outside the conversation.
+    if tool_name == "send_gmail_reply" and target_thread_id and participants:
+        outsiders = {address.lower() for _, address in getaddresses([args.get("to") or ""]) if address} - participants
+        if outsiders:
+            return (
+                f"Refused: {', '.join(sorted(outsiders))} is not part of this conversation. "
+                "Replies only go to people already in it."
+            )
+
     return None
 
 
@@ -226,24 +243,32 @@ def _tool_message(content: Any, tool_call: dict[str, Any]) -> ToolMessage:
     return ToolMessage(content=str(content), tool_call_id=tool_call.get("id"))
 
 
-def _needs_share_approval(args: dict[str, Any], store: AgentStateStore) -> bool:
+def _stored_held_reply(store: AgentStateStore, message_id: str) -> dict[str, Any] | None:
+    """An open approval for this email that already carries its reply, if any."""
+
+    for approval in store.pending_approvals():
+        if approval.get("message_id") == message_id and json.loads(approval.get("payload") or "{}").get("reply"):
+            return {"id": approval["id"]}
+    return None
+
+
+def _reply_proposal(args: dict[str, Any]) -> dict[str, Any]:
     """
-    True if a reply attaches any file the owner has not marked as always shareable.
+    Validate a reply to an incoming email and describe it for the owner's approval.
 
-    A sent file cannot be unsent, so every attachment asks the owner first,
-    unless they chose "Send & always allow this file" for it before.
+    A sent email cannot be unsent, and an email may try to steer what the agent
+    writes, so in email mode every reply waits for the owner (Approve & Send,
+    Edit in Gmail, or Reject).
     """
-
-    return any(not store.is_file_shareable(path) for path in args.get("attachment_paths") or [])
-
-
-def _attachment_share_proposal(args: dict[str, Any]) -> dict[str, Any]:
-    """Validate the attachments and describe the reply for the owner's approval."""
 
     from pathlib import Path
 
     from app.files.drive import get_drive_document
     from app.files.local import ALLOWED_EXTENSIONS, resolve_shareable_file
+
+    body = (args.get("body") or "").strip()
+    if not body:
+        raise ValueError("The reply body is empty.")
 
     attachments = []
     for path in args.get("attachment_paths") or []:
@@ -253,11 +278,14 @@ def _attachment_share_proposal(args: dict[str, Any]) -> dict[str, Any]:
             name = Path(resolve_shareable_file(path)).name
         attachments.append({"path": path, "name": name})
 
+    if not attachments:
+        return {"type": "send_reply", "reply_body": body}
+
     return {
         "type": "send_reply_with_attachment",
         "attachments": attachments,
         "reason": "The reply includes a file.",
-        "reply_body": args.get("body", ""),
+        "reply_body": body,
     }
 
 
@@ -295,6 +323,21 @@ def _record_proposal(
                 "body": reply_body,
             }
 
+    # A slot already proposed for another email is held until that approval is decided.
+    if kind in SLOT_HOLD_TYPES:
+        held = overlapping_holds(
+            parse_ist(proposal["new_start"]), parse_ist(proposal["new_end"]),
+            ignore_message_id=state.get("target_message_id"), store=store,
+        )
+        if held:
+            refusal = (
+                f"Refused: that time is held for '{held[0]['label']}' (approval request "
+                f"#{held[0]['approval_id']}, waiting for the owner). Pick another free slot "
+                "from find_calendar_availability."
+            )
+            failures.append(f"{kind}: {refusal}")
+            return refusal
+
     summary = describe({"type": kind, "payload": proposal})
 
     if dry_run:
@@ -308,6 +351,12 @@ def _record_proposal(
         message_id=state.get("target_message_id"),
         thread_id=state.get("target_thread_id"),
     )
+    if kind in SLOT_HOLD_TYPES:
+        store.add_slot_hold(
+            approval_id, proposal["new_start"], proposal["new_end"],
+            label=proposal.get("title", ""), message_id=state.get("target_message_id"),
+        )
+
     actions.append({"type": kind, "status": "proposed", "approval_id": approval_id, "args": proposal})
     pending_approvals.append({"id": approval_id, "type": kind, "holds_reply": bool(proposal.get("reply"))})
 
@@ -360,9 +409,14 @@ def execute_tools(state: AgentState):
                     f"(result: {earlier[-1]['result']}). Do not repeat it; use that result."
                 )
 
-        # A reply that waits for approval (booking, file) is the reply for this email.
-        held = next((p for p in pending_approvals if p.get("holds_reply")), None)
-        if refusal is None and held and tool_name in {"send_gmail_reply", "create_reply_draft"}:
+        # A reply that waits for approval (reply, booking, move) is the reply for this
+        # email, including one recorded by an earlier, interrupted run.
+        held = None
+        if refusal is None and tool_name in {"send_gmail_reply", "create_reply_draft"}:
+            held = next((p for p in pending_approvals if p.get("holds_reply")), None)
+            if held is None and source_message_id and not dry_run:
+                held = _stored_held_reply(store, source_message_id)
+        if refusal is None and held:
             refusal = (
                 f"Not sent: the reply for this email is waiting for the owner's approval "
                 f"(request #{held['id']}). Do not send another one."
@@ -373,10 +427,10 @@ def execute_tools(state: AgentState):
             tool_results.append(_tool_message(refusal, tool_call))
             continue
 
-        # In email mode, sending a Drive file the owner has not allowed needs approval.
-        if _is_email_mode(state) and tool_name == "send_gmail_reply" and _needs_share_approval(args, store):
+        # In email mode, every reply waits for the owner's approval.
+        if _is_email_mode(state) and tool_name == "send_gmail_reply":
             try:
-                proposal = _attachment_share_proposal(args)
+                proposal = _reply_proposal(args)
             except Exception as exc:
                 failures.append(f"{tool_name}: {exc}")
                 tool_results.append(_tool_message(f"Tool failed: {exc}", tool_call))

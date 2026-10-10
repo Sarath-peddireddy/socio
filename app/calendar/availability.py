@@ -33,9 +33,13 @@ def find_free_slots(
     start_time: datetime,
     end_time: datetime,
     duration_minutes: int = 30,
+    extra_busy: list[tuple[datetime, datetime]] | None = None,
 ) -> list[dict]:
     """
     Find available time slots between start_time and end_time.
+
+    extra_busy adds (start, end) periods that are not in the calendar but
+    must not be offered (local soft holds, see app.calendar.holds).
 
     This function only reads the calendar.
     It does not create or modify events.
@@ -65,6 +69,8 @@ def find_free_slots(
                 ),
             )
         )
+
+    busy_periods.extend(extra_busy or [])
 
     busy_periods.sort(
         key=lambda period: period[0]

@@ -5,6 +5,7 @@ from langchain_core.tools import tool
 
 from app.calendar.availability import find_free_slots
 from app.calendar.client import get_calendar_service
+from app.calendar.holds import held_periods
 from app.google_api import execute_with_retry
 
 
@@ -23,11 +24,13 @@ def find_calendar_availability(
 
     Checks the next days_ahead days (default 7, max 21) and only returns
     weekday slots between 11:00 AM and 4:00 PM India time (UTC+05:30).
-    Each free gap yields its earliest slot.
+    Each free gap yields its earliest slot. Slots already proposed to
+    someone and waiting for the owner's approval count as busy.
     """
 
     now = datetime.now(INDIA_TZ)
     days_ahead = max(1, min(int(days_ahead), 21))
+    held = [(hold["start"], hold["end"]) for hold in held_periods()]
 
     suitable_slots = []
 
@@ -78,6 +81,7 @@ def find_calendar_availability(
             start_time=search_start,
             end_time=window_end,
             duration_minutes=duration_minutes,
+            extra_busy=held,
         )
 
         for slot in raw_slots:

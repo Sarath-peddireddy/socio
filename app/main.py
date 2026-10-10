@@ -10,6 +10,7 @@ Run Socio, the autonomous email and calendar agent.
     python -m app.main --google-login        # one-time sign-in for Drive, Docs, Sheets, Tasks
     python -m app.main --approve 4           # approve and execute request #4
     python -m app.main --reject 4            # reject request #4 (nothing changes)
+    python -m app.main --draft 4             # move held reply #4 to Gmail Drafts (not sent)
 
 Output shows sender, subject, and decisions only, never email bodies.
 """
@@ -18,7 +19,7 @@ import argparse
 import logging
 import sys
 
-from app.agent.approvals import approve, describe, reject
+from app.agent.approvals import approve, describe, reject, to_draft
 from app.agent.followups import complete_followup_task
 from app.agent.runner import DEFAULT_QUERY, handle_owner_command, process_inbox
 from app.agent.state import AgentStateStore
@@ -68,7 +69,7 @@ def print_status() -> None:
         for line in describe(store.get_approval(approval["id"])).splitlines():
             print(f"     {line}")
     if approvals:
-        print("\n  Approve with --approve ID, reject with --reject ID.")
+        print("\n  Approve with --approve ID, reject with --reject ID, or move a reply to Drafts with --draft ID.")
 
     failures = store.failures()[:5]
     print(f"\nRecent failures: {len(failures)} shown")
@@ -85,7 +86,7 @@ def main(argv=None) -> int:
     parser.add_argument("--resolve", type=int, metavar="ID", help="Close pending approval #ID and exit")
     parser.add_argument("--approve", type=int, metavar="ID", help="Approve and execute pending approval #ID")
     parser.add_argument("--reject", type=int, metavar="ID", help="Reject pending approval #ID (nothing changes)")
-    parser.add_argument("--always-allow", action="store_true", help="With --approve on a file share: always allow sending that file")
+    parser.add_argument("--draft", type=int, metavar="ID", help="Move held reply #ID to Gmail Drafts instead of sending it")
     parser.add_argument("--ask", metavar="TEXT", help="Give the agent a direct instruction (owner mode)")
     parser.add_argument("--google-login", "--drive-login", dest="google_login", action="store_true",
                         help="Sign in to Google Drive, Docs, Sheets and Tasks, and list the Socio folder")
@@ -126,8 +127,13 @@ def main(argv=None) -> int:
             print("Socio can search your whole Drive. Files Socio creates go into a 'Socio' folder.")
         return 0
 
-    if args.approve is not None or args.reject is not None:
-        outcome = approve(args.approve, always_allow=args.always_allow) if args.approve is not None else reject(args.reject)
+    if args.approve is not None or args.reject is not None or args.draft is not None:
+        if args.approve is not None:
+            outcome = approve(args.approve)
+        elif args.reject is not None:
+            outcome = reject(args.reject)
+        else:
+            outcome = to_draft(args.draft)
         print(outcome["message"])
         return 0 if outcome["ok"] else 1
 

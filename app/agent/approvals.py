@@ -1,11 +1,13 @@
 """
 Human-in-the-loop approvals.
 
-High-blast-radius actions are never done by the agent directly: booking,
-moving, or cancelling meetings, trashing email, and sending attachments. The
-agent records an approval request; only approve() below executes it, after the
-owner says yes (Telegram button or `python -m app.main --approve ID`).
-Everything is re-validated at execution time.
+Actions that reach other people or cannot be undone are never done by the
+agent directly: replying to an incoming email (with or without a file),
+booking, moving, or cancelling meetings, and trashing email. The agent records
+an approval request; only approve() below executes it, after the owner says
+yes (Telegram button or `python -m app.main --approve ID`). A held reply can
+instead be moved to Gmail Drafts for editing (to_draft). Everything is
+re-validated at execution time.
 """
 
 from __future__ import annotations
@@ -19,13 +21,16 @@ from app.agent.state import AgentStateStore
 from app.calendar.events import cancel_event, move_event, parse_ist
 from app.calendar.tools import create_calendar_event
 from app.files.local import resolve_shareable_file
+from app.gmail.drafts import create_reply_draft
 from app.gmail.messages import send_reply, trash_message
 
 
 logger = logging.getLogger(__name__)
 
 # Approvals that perform an action when approved.
-EXECUTABLE_TYPES = {"trash_email", "book_meeting", "move_event", "cancel_event", "send_reply_with_attachment"}
+EXECUTABLE_TYPES = {"trash_email", "book_meeting", "move_event", "cancel_event", "send_reply", "send_reply_with_attachment"}
+# Approvals that send an email reply; these can also be moved to Gmail Drafts.
+REPLY_TYPES = {"send_reply", "send_reply_with_attachment"}
 # Approvals that only ask the owner to look at something; approving closes them.
 REVIEW_TYPES = {"review_draft", "review_decision"}
 
@@ -70,6 +75,9 @@ def describe(approval: dict[str, Any]) -> str:
             f"Cancel calendar event '{payload.get('title')}' at {format_time(payload.get('old_start'))}\n"
             f"Attendees are notified by Google: {', '.join(payload.get('other_attendees', [])) or 'none'}"
         )
+    elif kind == "send_reply":
+        reply = payload.get("reply") or {}
+        text = f"Reply to {reply.get('to', 'the sender')}:\n\"{reply.get('body', '')}\""
     elif kind == "send_reply_with_attachment":
         names = ", ".join(a["name"] for a in payload.get("attachments", []))
         to = (payload.get("reply") or {}).get("to", "the sender")
@@ -85,7 +93,7 @@ def describe(approval: dict[str, Any]) -> str:
         text += f"\nWhy: {payload['reason']}"
 
     reply = payload.get("reply")
-    if reply and kind != "send_reply_with_attachment":
+    if reply and kind not in REPLY_TYPES:
         text += f"\nThen reply to {reply.get('to')}:\n\"{reply.get('body')}\""
 
     return text
@@ -112,14 +120,14 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
     if kind == "trash_email":
         return {"trash": trash_message(payload["message_id"], whole_thread=bool(payload.get("whole_thread")))}
 
-    if kind == "send_reply_with_attachment":
+    if kind in REPLY_TYPES:
         reply = payload["reply"]
-        attachments = [str(resolve_shareable_file(a["path"])) for a in payload["attachments"]]
+        attachments = [str(resolve_shareable_file(a["path"])) for a in payload.get("attachments", [])]
         sent = send_reply(
             thread_id=reply["thread_id"], message_id=reply["message_id"], to=reply["to"],
             subject="", body=reply["body"], attachment_paths=attachments,
         )
-        return {"reply": sent, "attachments": [a["name"] for a in payload["attachments"]]}
+        return {"reply": sent, "attachments": [a["name"] for a in payload.get("attachments", [])]}
 
     if kind == "book_meeting":
         # create_calendar_event re-checks that the slot is still free.
@@ -152,13 +160,8 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def approve(approval_id: int, store: AgentStateStore | None = None, always_allow: bool = False) -> dict[str, Any]:
-    """
-    Execute an approval. Safe to call twice: only the first call acts.
-
-    always_allow (file shares only): also remember the attached files as
-    shareable, so future email requests for them are sent without asking.
-    """
+def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str, Any]:
+    """Execute an approval. Safe to call twice: only the first call acts."""
 
     store = store or AgentStateStore()
     approval = store.get_approval(approval_id)
@@ -181,10 +184,6 @@ def approve(approval_id: int, store: AgentStateStore | None = None, always_allow
         return {"ok": False, "message": f"Approval #{approval_id} is already being handled."}
 
     message_id, thread_id = approval.get("message_id"), approval.get("thread_id")
-
-    if always_allow and approval["type"] == "send_reply_with_attachment":
-        for attachment in approval["payload"].get("attachments", []):
-            store.allow_shared_file(attachment["path"], attachment["name"])
 
     try:
         result = _execute(approval)
@@ -229,10 +228,55 @@ def reject(approval_id: int, store: AgentStateStore | None = None) -> dict[str, 
     store.finish_approval(approval_id, "rejected", f"Rejected by owner at {datetime.now().isoformat(timespec='seconds')}")
     complete_followup_task(store, approval.get("message_id"))
 
-    if approval.get("message_id") and approval["type"] in {"book_meeting", "move_event", "cancel_event", "send_reply_with_attachment"}:
+    if approval.get("message_id") and approval["type"] in {"book_meeting", "move_event", "cancel_event"} | REPLY_TYPES:
         store.mark_processed(
             approval["message_id"], approval.get("thread_id"), status="needs_review",
             summary="Owner rejected the proposed change; handle this email manually.",
         )
 
     return {"ok": True, "message": f"#{approval_id} rejected. Nothing was changed."}
+
+
+def to_draft(approval_id: int, store: AgentStateStore | None = None) -> dict[str, Any]:
+    """
+    Move a held reply to Gmail Drafts so the owner can edit and send it themselves.
+
+    Nothing is sent. The email is left as needs_review (its follow-up task stays open).
+    """
+
+    store = store or AgentStateStore()
+    approval = store.get_approval(approval_id)
+
+    if approval is None:
+        return {"ok": False, "message": f"Approval #{approval_id} not found."}
+
+    if approval["type"] not in REPLY_TYPES:
+        return {"ok": False, "message": f"Approval #{approval_id} is not a reply, so it cannot be moved to Drafts."}
+
+    if not store.claim_approval(approval_id):
+        return {"ok": False, "message": f"Approval #{approval_id} was already {approval['status']}."}
+
+    reply = approval["payload"]["reply"]
+    attachments = approval["payload"].get("attachments", [])
+
+    try:
+        # A Gmail reply draft carries at most one file; with several, the owner attaches them.
+        attachment = str(resolve_shareable_file(attachments[0]["path"])) if len(attachments) == 1 else None
+        draft = create_reply_draft(message_id=reply["message_id"], body=reply["body"], attachment_path=attachment)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        logger.warning("Approval #%s: draft failed: %s", approval_id, error)
+        store.finish_approval(approval_id, "failed", error)
+        store.add_failure("approval:to_draft", error, message_id=approval.get("message_id"))
+        return {"ok": False, "message": f"#{approval_id}: could not create the draft, nothing was sent: {error}"}
+
+    store.finish_approval(approval_id, "resolved", "Moved to Gmail Drafts by owner", {"draft_id": draft.get("id")})
+
+    message = f"#{approval_id} saved to Gmail Drafts. Nothing was sent; edit and send it from Gmail."
+    if len(attachments) > 1:
+        message += " Attach the files there yourself."
+
+    if approval.get("message_id"):
+        store.mark_processed(approval["message_id"], approval.get("thread_id"), status="needs_review", summary=message)
+
+    return {"ok": True, "message": message, "draft_id": draft.get("id")}

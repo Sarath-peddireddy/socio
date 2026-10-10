@@ -95,9 +95,6 @@ def search_documents(query: str, max_results: int = 5) -> list[dict]:
 
     if drive_available():
         try:
-            from app.agent.state import AgentStateStore
-
-            store = AgentStateStore()
             query_tokens = _query_tokens(query)
 
             for document in search_drive(query_tokens, ALLOWED_EXTENSIONS):
@@ -115,7 +112,6 @@ def search_documents(query: str, max_results: int = 5) -> list[dict]:
                         # 0.5 = Drive matched the words inside the file, not in its name.
                         "match_score": name_score or 0.5,
                         "too_large_to_attach": document["size_bytes"] > MAX_ATTACHMENT_BYTES,
-                        "email_share_needs_approval": not store.is_file_shareable(document["path"]),
                     }
                 )
         except Exception as exc:

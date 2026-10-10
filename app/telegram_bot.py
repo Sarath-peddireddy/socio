@@ -6,7 +6,8 @@ Telegram front end for Socio.
 - Only the owner's chat (TELEGRAM_OWNER_CHAT_ID) can use the bot. Until it is
   set, the bot only replies with the sender's chat id so it can be configured.
 - Plain messages are instructions for the agent (owner mode).
-- Approval requests arrive with Approve / Reject buttons.
+- Approval requests arrive with Approve / Reject buttons (replies also get
+  Edit in Gmail, which saves them as a Gmail draft instead).
 - The inbox is processed every AGENT_POLL_MINUTES (default 10, 0 = off).
 
 Uses the Telegram Bot API over HTTPS long polling (no webhook, nothing exposed).
@@ -23,7 +24,7 @@ import requests
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.agent.approvals import EXECUTABLE_TYPES, approve, describe, reject
+from app.agent.approvals import EXECUTABLE_TYPES, REPLY_TYPES, approve, describe, reject, to_draft
 from app.agent.llm import LLMUnavailableError
 from app.agent.runner import DEFAULT_QUERY, handle_owner_command, process_inbox
 from app.agent.state import AgentStateStore
@@ -51,8 +52,9 @@ Or just type an instruction, e.g.
 - add Acme, PM, applied today to my applications sheet
 - write a cover letter for Acme in a doc
 - remind me to send the invoice on Friday
-Booking, moving or cancelling meetings, deleting email, and sending files
-always ask for your approval first. Plain replies are sent on their own."""
+Replies to incoming emails, booking, moving or cancelling meetings, and
+deleting email always ask for your approval first. A reply can also be moved
+to Gmail Drafts (Edit in Gmail) so you can change it before sending."""
 
 INTERESTING_STATUSES = {
     "replied": "✅ Replied",
@@ -116,12 +118,16 @@ class Bot:
 
         for approval in approvals:
             approval_id = approval["id"]
-            if approval["type"] == "send_reply_with_attachment":
-                title = f"📎 Share a file? #{approval_id}"
+            if approval["type"] in REPLY_TYPES:
+                title = (
+                    f"📎 Send this reply with a file? #{approval_id}"
+                    if approval["type"] == "send_reply_with_attachment"
+                    else f"✉️ Send this reply? #{approval_id}"
+                )
                 buttons = [
-                    [{"text": "✅ Send", "callback_data": f"approve:{approval_id}"},
-                     {"text": "❌ Reject", "callback_data": f"reject:{approval_id}"}],
-                    [{"text": "✅ Send & always allow this file", "callback_data": f"always:{approval_id}"}],
+                    [{"text": "✅ Approve & Send", "callback_data": f"approve:{approval_id}"},
+                     {"text": "✏️ Edit in Gmail", "callback_data": f"draft:{approval_id}"}],
+                    [{"text": "❌ Reject", "callback_data": f"reject:{approval_id}"}],
                 ]
             elif approval["type"] in EXECUTABLE_TYPES:
                 title = f"🔐 Approval needed #{approval_id}"
@@ -183,20 +189,20 @@ class Bot:
             return
 
         action, _, raw_id = (query.get("data") or "").partition(":")
-        if action not in {"approve", "always", "reject"} or not raw_id.isdigit():
+        if action not in {"approve", "draft", "reject"} or not raw_id.isdigit():
             self.api.call("answerCallbackQuery", callback_query_id=query["id"], text="Unknown button.")
             return
 
         if action == "reject":
             outcome = reject(int(raw_id), self.store)
+        elif action == "draft":
+            outcome = to_draft(int(raw_id), self.store)
         else:
-            outcome = approve(int(raw_id), self.store, always_allow=(action == "always"))
-            if action == "always" and outcome["ok"]:
-                outcome["message"] += " This file will be sent without asking next time."
+            outcome = approve(int(raw_id), self.store)
         self.api.call("answerCallbackQuery", callback_query_id=query["id"], text=outcome["message"][:190])
 
         original = query.get("message", {}).get("text", "")
-        mark = "❌" if action == "reject" else ("✅" if outcome["ok"] else "⚠️")
+        mark = {"reject": "❌", "draft": "✏️"}.get(action, "✅") if outcome["ok"] else "⚠️"
         self.api.call(
             "editMessageText",
             chat_id=chat_id,

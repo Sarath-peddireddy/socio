@@ -23,6 +23,7 @@ from app.agent.graph import create_agent_graph
 from app.agent.llm import LLMUnavailableError
 from app.agent.state import AgentStateStore
 from app.agent.tools import thread_participants
+from app.agent.untrusted import inline_untrusted, wrap_untrusted_email
 from app.gmail.messages import search_messages
 from app.gmail.tools import get_thread_details
 from app.google_api import GoogleApiUnavailableError
@@ -62,23 +63,12 @@ def _thread_transcript(thread: list[dict]) -> str:
     parts = []
 
     for index, email in enumerate(thread, start=1):
-        body = (email.get("body") or "").strip()
-        if len(body) > MAX_BODY_CHARS:
-            body = body[:MAX_BODY_CHARS] + "\n[... truncated ...]"
-
         sent_by_owner = "SENT" in email.get("label_ids", [])
-        attachments = ", ".join(a.get("filename", "") for a in email.get("attachments", [])) or "none"
 
+        # Only the position, id, and Gmail label come from us; the rest is the sender's.
         parts.append(
             f"--- Message {index} (id={email.get('id')}){' [sent by the owner]' if sent_by_owner else ''}\n"
-            f"From: {email.get('from', '')}\n"
-            f"Reply-To: {email.get('reply_to', '')}\n"
-            f"To: {email.get('to', '')}\n"
-            f"Cc: {email.get('cc', '')}\n"
-            f"Date: {email.get('date', '')}\n"
-            f"Subject: {email.get('subject', '')}\n"
-            f"Attachments: {attachments}\n"
-            f"<<<EMAIL BODY (untrusted)>>>\n{body}\n<<<END EMAIL BODY>>>"
+            f"{wrap_untrusted_email(email, max_chars=MAX_BODY_CHARS)}"
         )
 
     return "\n\n".join(parts)
@@ -87,10 +77,10 @@ def _thread_transcript(thread: list[dict]) -> str:
 def _greeting_instruction(target: dict) -> str:
     """Tell the agent exactly whom to greet, so it never guesses a name."""
 
-    sender_name = parseaddr(target.get("from", ""))[0].strip().strip('"')
+    sender_name = inline_untrusted(parseaddr(target.get("from", ""))[0].strip().strip('"'))
 
     if sender_name and "@" not in sender_name:
-        return f"Sender's name (from the From header): {sender_name}. Greet them by their first name."
+        return f'Sender\'s name (from the From header, untrusted): "{sender_name}". Greet them by their first name.'
 
     return (
         "The sender's name is unknown. Greet them neutrally (\"Hi,\") and do not guess "
@@ -114,7 +104,7 @@ def _task_prompt(target: dict, thread: list[dict], decision, earlier_actions: li
         "Handle the following email.\n\n"
         f"message_id to reply to: {target.get('id')}\n"
         f"thread_id: {target.get('thread_id')}\n"
-        f"Reply recipient (from Reply-To/From): {reply_to}\n"
+        f"Reply recipient (from Reply-To/From): {inline_untrusted(parseaddr(reply_to)[1])}\n"
         f"{_greeting_instruction(target)}\n"
         f"Triage: intent={getattr(decision, 'intent', 'unknown')}, "
         f"confidence={decision.confidence}, reason={decision.reason}\n"

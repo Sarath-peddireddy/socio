@@ -5,6 +5,7 @@ from pathlib import Path
 from langchain_core.tools import tool
 
 from app.agent.decision import decide_reply_needed
+from app.agent.untrusted import untrusted_email_view
 from app.calendar.events import INDIA_TZ, get_event, list_events, parse_ist, summarize_event, validate_new_time
 from app.files.local import resolve_shareable_file, search_documents
 from app.gmail.drafts import create_reply_draft as create_gmail_reply_draft
@@ -13,6 +14,9 @@ from app.gmail.messages import get_message, send_reply
 from app.gmail.messages import send_new_email as send_new_email_message
 from app.gmail.messages import get_thread as fetch_raw_thread
 from app.gmail.parser import parse_message
+
+
+MAX_LISTED_BODY_CHARS = 2000
 
 
 def thread_participants(thread: list[dict]) -> set[str]:
@@ -87,10 +91,12 @@ def get_recent_emails() -> list:
     latest, newest, or incoming emails.
     """
 
-    return search_emails(
+    emails = search_emails(
         query="in:inbox",
         max_results=10,
     )
+
+    return [untrusted_email_view(email, max_chars=MAX_LISTED_BODY_CHARS) for email in emails]
 
 
 @tool
@@ -105,7 +111,7 @@ def get_email(message_id: str) -> dict:
 
     raw_message = get_message(message_id)
 
-    return parse_message(raw_message)
+    return untrusted_email_view(parse_message(raw_message))
 
 
 @tool
@@ -117,9 +123,12 @@ def get_thread(thread_id: str) -> list:
     wants to understand the context of a message, or when the
     latest email cannot be understood without previous messages
     in the thread.
+
+    Each message's "id" is what send_gmail_reply / create_reply_draft take
+    as message_id; its content is inside <untrusted_email_body> tags.
     """
 
-    return get_thread_details(thread_id)
+    return [untrusted_email_view(email) for email in get_thread_details(thread_id)]
 
 
 @tool
@@ -425,7 +434,8 @@ def propose_trash_email(message_id: str, reason: str, whole_thread: bool = False
 def search_gmail(query: str, max_results: int = 10) -> list[dict]:
     """
     Search the owner's Gmail with Gmail search syntax and return a short
-    summary of each match (id, thread_id, from, subject, date, preview).
+    summary of each match: id, thread_id, and the sender, subject, date, and
+    a preview inside <untrusted_email_body> tags.
 
     Examples: "from:swiggy", "subject:invoice newer_than:30d", "in:inbox is:unread".
     """
@@ -433,14 +443,7 @@ def search_gmail(query: str, max_results: int = 10) -> list[dict]:
     results = search_emails(query=query, max_results=max(1, min(int(max_results), 25)))
 
     return [
-        {
-            "id": email.get("id"),
-            "thread_id": email.get("thread_id"),
-            "from": email.get("from"),
-            "subject": email.get("subject"),
-            "date": email.get("date"),
-            "preview": " ".join((email.get("body") or "").split())[:200],
-        }
+        untrusted_email_view(email, body=" ".join((email.get("body") or "").split())[:200])
         for email in results
     ]
 

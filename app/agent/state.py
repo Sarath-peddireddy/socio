@@ -17,13 +17,16 @@ HANDLED_STATUSES = (
     "no_action",           # decided that nothing needed to be done
     "needs_review",        # left for the owner (draft created or decision too uncertain)
     "needs_attention",     # partial or uncertain side effect; owner must check
-    "awaiting_approval",   # a change (move/cancel event) waits for the owner's approval
+    "awaiting_approval",   # a reply or calendar change waits for the owner's approval
     "superseded",          # a newer message in the same thread was handled instead
     "failed_permanently",  # failed too many times; will not be retried
 )
 
 # Non-final: picked up again on the next run.
 RETRYABLE_STATUSES = ("in_progress", "failed")
+
+# How long a slot proposed for a booking/move stays held while the owner decides.
+SLOT_HOLD_HOURS = 24
 
 
 class AgentStateStore:
@@ -97,9 +100,15 @@ class AgentStateStore:
 
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS shared_files (
-                    path TEXT PRIMARY KEY,
-                    name TEXT,
+                CREATE TABLE IF NOT EXISTS slot_holds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    approval_id INTEGER NOT NULL,
+                    message_id TEXT,
+                    label TEXT,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    expires_at TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -313,6 +322,7 @@ class AgentStateStore:
                 "UPDATE pending_approvals SET status = ?, resolution = ?, result = ?, decided_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (status, resolution[:2000], json.dumps(result, default=str), approval_id),
             )
+        self.release_slot_holds(approval_id)
 
     def resolve_pending_approval(self, approval_id: int, resolution: str = "resolved") -> bool:
         with self._connect() as conn:
@@ -321,7 +331,10 @@ class AgentStateStore:
                 "WHERE id = ? AND status = 'open'",
                 (resolution, approval_id),
             )
-            return cursor.rowcount > 0
+            resolved = cursor.rowcount > 0
+        if resolved:
+            self.release_slot_holds(approval_id)
+        return resolved
 
     def pending_approvals(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -344,19 +357,37 @@ class AgentStateStore:
         with self._connect() as conn:
             conn.execute("UPDATE pending_approvals SET notified = 1 WHERE id = ?", (approval_id,))
 
-    # ----- files the owner allowed Socio to send without asking -------------------
+    # ----- soft holds on calendar slots (see app.calendar.holds) -----------------
 
-    def is_file_shareable(self, path: str) -> bool:
-        with self._connect() as conn:
-            return conn.execute("SELECT 1 FROM shared_files WHERE path = ?", (path,)).fetchone() is not None
+    def add_slot_hold(self, approval_id: int, start_time: str, end_time: str, label: str = "", message_id: str | None = None, hours: int = SLOT_HOLD_HOURS) -> None:
+        """Hold a proposed slot for an approval (one hold per approval; a repeat is ignored)."""
 
-    def allow_shared_file(self, path: str, name: str = "") -> None:
         with self._connect() as conn:
-            conn.execute("INSERT OR IGNORE INTO shared_files (path, name) VALUES (?, ?)", (path, name))
+            if conn.execute(
+                "SELECT 1 FROM slot_holds WHERE approval_id = ? AND status = 'active'", (approval_id,)
+            ).fetchone():
+                return
+            conn.execute(
+                "INSERT INTO slot_holds (approval_id, message_id, label, start_time, end_time, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, datetime('now', ?))",
+                (approval_id, message_id, label, start_time, end_time, f"+{int(hours)} hours"),
+            )
 
-    def shared_files(self) -> list[dict[str, Any]]:
+    def active_slot_holds(self) -> list[dict[str, Any]]:
+        """Holds that are neither released nor expired."""
+
         with self._connect() as conn:
-            return [dict(row) for row in conn.execute("SELECT path, name, created_at FROM shared_files ORDER BY name")]
+            rows = conn.execute(
+                "SELECT approval_id, message_id, label, start_time, end_time, expires_at FROM slot_holds "
+                "WHERE status = 'active' AND expires_at > CURRENT_TIMESTAMP ORDER BY start_time"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def release_slot_holds(self, approval_id: int) -> None:
+        """Free an approval's slot once it is decided (approved, rejected, failed, or resolved)."""
+
+        with self._connect() as conn:
+            conn.execute("UPDATE slot_holds SET status = 'released' WHERE approval_id = ? AND status = 'active'", (approval_id,))
 
     # ----- failures -------------------------------------------------------------
 
