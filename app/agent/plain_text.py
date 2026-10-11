@@ -83,6 +83,39 @@ def _clean_words(part: str) -> str:
     return _PERSON_POSSESSIVE.sub(lambda m: "Your" if m.group(1) == "T" else "your", part)
 
 
+# "The email has been sent successfully." Socio never sends inside a chat run (every email
+# goes out only when the owner taps Approve & Send), so this in an answer is always a repeat
+# of what the card already shows (developer request 2026-10-11).
+# Within one sentence: a '.' inside a word (gmail.com, 15.55) does not end it.
+_IN_SENTENCE = r"(?:[^.!?\n]|[.!?](?=\S))*"
+_SENT_SENTENCE = re.compile(
+    _IN_SENTENCE
+    + r"(?:\b(?:has|have)\s+been\s+(?:successfully\s+)?sent\b|\b(?:was|were|got)\s+(?:successfully\s+)?sent\b"
+    r"|\bsent\s+successfully\b|\bwent\s+out\b|\b(?:has|have)\s+been\s+delivered\b)"
+    + _IN_SENTENCE + r"[.!]?",
+    re.IGNORECASE,
+)
+# Unless the owner asked exactly that ("Did the email go out?", "Have you sent it?").
+_ASKED_IF_SENT = re.compile(
+    r"\b(did|has|have|was|were|is)\b.*\b(sent|send|e-?mail(ed)?|mail(ed)?|go(ne)?\s+out|went|deliver\w*)\b",
+    re.IGNORECASE,
+)
+# Only sentences about an email ("Power went out across Spain" in a news briefing stays).
+_ABOUT_EMAIL = re.compile(r"\b(e-?mails?|mail|message|reply)\b", re.IGNORECASE)
+NOTHING_MORE = "Nothing else is needed from you. Any reply will show up in your inbox."
+
+
+def without_sent_repeat(reply: str, owner_text: str) -> str:
+    """Drop "the email has been sent" sentences unless the owner asked whether it was sent."""
+
+    if _ASKED_IF_SENT.search(owner_text or "") or not _SENT_SENTENCE.search(reply or ""):
+        return reply
+    drop = lambda match: "" if _ABOUT_EMAIL.search(match.group(0)) else match.group(0)
+    lines = [_MULTI_SPACE.sub(" ", _SENT_SENTENCE.sub(drop, line)).strip() for line in reply.splitlines()]
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return cleaned or NOTHING_MORE
+
+
 def plain_reply(text: str) -> str:
     """The agent's text, safe and plain for the owner's chat."""
 

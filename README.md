@@ -64,6 +64,23 @@ eye on your open tasks and offers to close them, so you don't have to:
 (Automatic follow-up tasks for emails that need you are off;
 `AGENT_AUTO_TASKS=1` turns them back on.)
 
+**Routines.** Ask for anything on a schedule and Socio does it for you then:
+
+- *"send me the top AI news every day at 9 AM"* → "✅ Scheduled! I will prepare
+  and send your **Top AI updates** daily at 09:00 AM IST." Every morning at 9 a
+  "⏰ **Scheduled Briefing:** Top AI updates" message arrives with the headlines
+  and links.
+- Daily, every weekday, weekly on one day, or once; times are IST unless you
+  name another timezone.
+- `/schedules` lists your routines with a **Cancel** button each (or just ask
+  "stop the AI news routine").
+- News comes from a few public tech news sites (Hacker News, TechCrunch, The
+  Verge, Ars Technica, MIT Technology Review); Socio only reports headlines
+  it actually read, with their links. Anything a routine wants to change (an
+  email, an event) still waits for your tap.
+- If the PC was off at a routine's time, it runs when Socio is back (within 6
+  hours); after that it is skipped once and you're told.
+
 ## It learns from you
 
 - **Only when you say so.** Approving, rejecting, or editing a request
@@ -171,7 +188,7 @@ everything runs offline on your CPU.
 
 Bot commands: `/run` (check inbox now), `/dryrun`, `/status`, `/approvals`,
 `/new` (or `/reset`, `/clear`: forget the conversation so far), `/remember TEXT`, `/memories`, `/forget ID`, `/save_skill NAME`,
-`/skills`, `/forget_skill NAME`, `/help`. `/start`, `/help`, or asking "what
+`/skills`, `/forget_skill NAME`, `/schedules` (your routines, with Cancel buttons), `/help`. `/start`, `/help`, or asking "what
 can you do?" shows an overview of what Socio does. The inbox is also checked
 every `AGENT_POLL_MINUTES`.
 
@@ -211,6 +228,8 @@ See [`.env.example`](.env.example).
 | `AGENT_SKILLS_DIR` | Where skills live (default `./skills`) |
 | `AGENT_MODEL_CACHE` | Where the embedding model is stored (default `./.cache/fastembed`) |
 | `AGENT_LOG_DIR` | Where `agent.log` goes (default `./logs`, gitignored) |
+| `AGENT_SCHEDULE_GRACE_HOURS` | A routine missed while the bot was off still runs if it is at most this late (default 6) |
+| `AGENT_NEWS_FEEDS` | Optional: your own news feeds instead of the default five (comma-separated RSS/Atom URLs, each optionally `Name\|URL`) |
 
 ## Command line
 
@@ -281,6 +300,8 @@ app/
   drive/            Google Drive client
   workspace/        Shared Workspace sign-in, Google Docs, Google Sheets
   tasks/            Google Tasks
+  scheduler/        Routines: when they run (jobs.py) and the once-a-minute runner (service.py)
+  news/             Tech news headlines from public RSS/Atom feeds
   files/            Document search: Drive folder + local folder
 skills/             Saved procedures (recipes) and your own scripts; personal, gitignored
 logs/               agent.log (full error details); gitignored

@@ -37,6 +37,10 @@ from app.agent.tools import (
     propose_trash_email,
     remember_rule,
     run_skill_script,
+    get_news,
+    schedule_task,
+    list_scheduled_tasks,
+    cancel_scheduled_task,
     search_gmail,
     send_gmail_reply,
     send_new_email,
@@ -79,6 +83,10 @@ AGENT_TOOLS = [
     propose_complete_task,
     remember_rule,
     run_skill_script,
+    get_news,
+    schedule_task,
+    list_scheduled_tasks,
+    cancel_scheduled_task,
 ]
 TOOLS_BY_NAME = {agent_tool.name: agent_tool for agent_tool in AGENT_TOOLS}
 
@@ -94,6 +102,8 @@ SIDE_EFFECT_TOOLS = {
     "create_and_share_file",
     "share_drive_file",
     "remember_rule",
+    "schedule_task",
+    "cancel_scheduled_task",
 }
 
 # Tools that only create an approval request for the owner (see app.agent.approvals).
@@ -234,6 +244,10 @@ def _action_target(tool_name: str, args: dict[str, Any]) -> str:
         return args.get("spreadsheet", "")
     if tool_name == "remember_rule":
         return "owner rule"
+    if tool_name == "schedule_task":
+        return args.get("title", "")
+    if tool_name == "cancel_scheduled_task":
+        return args.get("job_id", "")
     return ""
 
 

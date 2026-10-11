@@ -25,6 +25,8 @@ Telegram front end for Socio.
   (app.memory.context_anchor), so both survive a restart. /new, /clear, /reset
   start over.
 - /save_skill NAME saves the last successful multi-step instruction as a skill.
+- Routines ("send me the top AI news every day at 9 AM", app.scheduler) are checked once a
+  minute; each result arrives as "⏰ Scheduled Briefing". /schedules lists them with Cancel buttons.
 - The inbox is processed every AGENT_POLL_MINUTES (default 10, 0 = off).
 - Every handler runs behind the error gateway (app.errors): details go to
   logs/agent.log, the chat only ever gets a short predefined status card.
@@ -63,6 +65,8 @@ from app.memory.context_anchor import (
 from app.memory.context_assembler import archive_history, load_history, note_on_last_turn, save_turn
 from app.memory.learning import learn_from_owner_note
 from app.memory.semantic import SemanticMemory, memory_enabled
+from app.scheduler.jobs import describe_schedule, next_run_text
+from app.scheduler.service import TICK_SECONDS, RoutineRun, run_due_jobs
 from app.tasks.tracker import check_tasks
 from app.telegram_format import (
     MAX_MESSAGE_CHARS,
@@ -74,6 +78,8 @@ from app.telegram_format import (
     is_capability_question,
     md_to_html,
     reply_messages,
+    routine_header,
+    schedules_html,
     strip_html,
 )
 
@@ -133,6 +139,7 @@ class Bot:
         self.offset: int | None = None
         self.next_inbox_run = time.monotonic()
         self.next_task_check = time.monotonic()
+        self.next_routine_check = time.monotonic()
         # Decisions taken on cards since the last instruction, for the follow-up context.
         self.decisions: list[str] = []
 
@@ -244,6 +251,14 @@ class Bot:
             return
 
         action, _, raw_id = (query.get("data") or "").partition(":")
+        if action == "unsched":
+            try:
+                self._cancel_routine(raw_id, query)
+            except Exception as exc:
+                text = report_failure(exc, "telegram.cancel_routine", html=True, job_id=raw_id)
+                self._answer(query, strip_html(text))
+                self._report_error(text)
+            return
         if action not in {"approve", "draft", "reject", "rule"} or not raw_id.isdigit():
             self._answer(query, "Unknown button.")
             return
@@ -364,6 +379,8 @@ class Bot:
             self.send(f"Forgot memory {esc(argument)}." if ok else "Usage: <code>/forget ID</code> (see /memories).")
         elif command == "/skills":
             self.send(self._skills_text())
+        elif command in {"/schedules", "/routines"}:
+            self.send(*self._schedules())
         elif command == "/save_skill":
             self._save_skill(argument)
         elif command == "/forget_skill":
@@ -410,11 +427,74 @@ class Bot:
                 entities.update(entities_from_approval(card))
         update_context_anchor(self.owner_chat_id, entities, self.store)
 
+    # ----- scheduled routines --------------------------------------------------------
+
+    def _schedules(self) -> tuple[str, list]:
+        return schedules_html(self.store.scheduled_jobs(), describe_schedule, next_run_text)
+
+    def _cancel_routine(self, job_id: str, query: dict) -> None:
+        job = self.store.get_scheduled_job(job_id)
+        stopped = bool(job) and self.store.cancel_scheduled_job(job_id)
+        self._answer(query, f"Stopped: {job['title']}" if stopped else "That routine was already stopped.")
+        text, buttons = self._schedules()
+        params = {
+            "chat_id": query["message"]["chat"]["id"],
+            "message_id": query["message"]["message_id"],
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if buttons:
+            params["reply_markup"] = {"inline_keyboard": buttons}
+        self._call_html("editMessageText", params)
+
+    def run_routines(self) -> None:
+        run_due_jobs(self._run_routine, self._deliver_routine, store=self.store)
+
+    def _run_routine(self, job: dict):
+        # No chat history or anchor: a routine stands on its own and must not act on
+        # whatever the chat was last about.
+        try:
+            self.api.call("sendChatAction", chat_id=self.owner_chat_id, action="typing")
+        except Exception as exc:  # only the "typing…" hint; the routine still runs
+            logger.warning("Could not show typing for a routine: %s", exc)
+        return handle_owner_command(job["prompt_query"])
+
+    def _deliver_routine(self, outcome: RoutineRun) -> None:
+        job, header = outcome.job, routine_header(outcome.job["title"])
+        if outcome.status == "missed":
+            later = f" Next time: {esc(next_run_text(job))}." if job.get("is_active") else ""
+            self.send(f"⏰ I missed your <b>{esc(job['title'])}</b> routine because I wasn't running at its time.{later}")
+            return
+        if outcome.status == "failed":
+            self.send(f"{header}\n\n{outcome.error_html}")
+            return
+
+        result = outcome.result
+        if result.parts:
+            before, after = reply_messages(result.parts)
+        else:
+            before, after = ([md_to_html(result.reply)] if result.reply.strip() else []), []
+        messages = [f"{header}\n\n{before[0]}" if before else header] + before[1:]
+        for message in messages:
+            self.send(message)
+        if result.approval_ids:
+            self.notify_approvals()
+        for message in after:
+            self.send(message)
+        # Kept in the conversation so "tell me more about the second story" works.
+        save_turn(self.owner_chat_id, f"(Scheduled routine: {job['title']})", result.reply, self.store)
+
     def _note_decisions(self) -> None:
         """Add the owner's taps since the last instruction to the last reply in the context."""
 
         if self.decisions:
-            note_on_last_turn(self.owner_chat_id, "\n(Afterwards: " + " / ".join(self.decisions) + ")", self.store)
+            # The owner saw each result on its card ("✅ Email sent"): context for "it" / "that",
+            # not news to report again.
+            note_on_last_turn(
+                self.owner_chat_id,
+                "\n(Afterwards: " + " / ".join(self.decisions) + ". The owner already sees the result on the card.)",
+                self.store,
+            )
         self.decisions = []
 
     def _learn(self, text: str, approval: dict | None) -> None:
@@ -477,6 +557,7 @@ class Bot:
         lines.append(f"<b>Open approval requests:</b> {len(self.store.pending_approvals())} (/approvals to show)")
         lines.append(f"<b>Active calendar holds:</b> {len(self.store.active_slot_holds())}")
         lines.append(f"<b>Open tasks I'm keeping an eye on:</b> {len(self.store.tracked_tasks('open'))}")
+        lines.append(f"<b>Scheduled routines:</b> {len(self.store.scheduled_jobs())} (/schedules)")
         interrupted = self.store.interrupted_supervisor_runs()
         if interrupted:
             lines.append(f"<b>Instructions stopped by a restart</b> (not re-run): {len(interrupted)}")
@@ -507,6 +588,16 @@ class Bot:
                 self._report_error(report_failure(exc, "telegram.update", html=True, update_id=update.get("update_id"), kind=kind))
 
         if self.owner_chat_id is not None:
+            # Routines first, so a 9:00 briefing is not held up by an inbox check. Runs even
+            # when inbox checks are off (AGENT_POLL_MINUTES=0).
+            if time.monotonic() >= self.next_routine_check:
+                self.next_routine_check = time.monotonic() + TICK_SECONDS
+                try:
+                    self.run_routines()
+                except Exception as exc:
+                    # Each routine reports its own failure; this is the due-check itself.
+                    report_failure(exc, "telegram.routines")
+
             if self.poll_seconds and time.monotonic() >= self.next_inbox_run:
                 self.next_inbox_run = time.monotonic() + self.poll_seconds
                 try:

@@ -47,7 +47,7 @@ from app.calendar.tools import INDIA_TZ
 from app.agent.llm import get_llm, invoke_llm
 from app.agent.prompts import CARDS_ONLY
 from app.agent.state import AgentStateStore
-from app.agent.plain_text import plain_reply, without_internal_ids  # noqa: F401  (re-exported for callers and tests)
+from app.agent.plain_text import plain_reply, without_internal_ids, without_sent_repeat  # noqa: F401  (re-exported for callers and tests)
 from app.agent.taskgraph import DOMAIN_TOOLS, MAX_TASKS, PlanError, covered_domains, normalize_plan, topological_order
 from app.agent.workers import NEEDS_INPUT, run_worker
 from app.errors import plain_message, report_failure
@@ -80,7 +80,21 @@ REQUEST_DOMAINS = {
                            r"appointments?|invites?)\b", re.IGNORECASE),
     "workspace": re.compile(r"\b(docs?|documents?|sheets?|spreadsheets?|drive)\b", re.IGNORECASE),
     "tasks": re.compile(r"\b(tasks?|remind\w*|to-?dos?)\b", re.IGNORECASE),
+    "news": re.compile(r"\b(news|headlines?)\b", re.IGNORECASE),
 }
+
+# "every day at 9", "each Monday", "daily at 7", "at 9 am on weekdays": a request to set up a
+# routine. It is one schedule_task call for the single agent, never a plan: the words inside
+# it ("send me ... news every day") would otherwise read as several domains. "daily" / "weekly"
+# alone are not enough ("the weekly prep", "my daily standup" are names): they need a time.
+_TIME_WORD = r"\d{1,2}(?::\d\d)?\s*(?:am|pm|a\.m\.|p\.m\.)?"
+RECURRING_REQUEST = re.compile(
+    r"\b(?:every|each)\s+(?:other\s+)?(?:day|morning|evening|night|week|weekday|weekend|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)s?\b"
+    rf"|\b(?:daily|weekly|on weekdays)\s+at\s+{_TIME_WORD}"
+    rf"|\bat\s+{_TIME_WORD}\s+(?:daily|weekly|on weekdays)\b",
+    re.IGNORECASE,
+)
 
 
 def request_domains(text: str) -> set[str]:
@@ -176,7 +190,7 @@ class SubTask(BaseModel):
         description="A few everyday words naming this part for the person, e.g. 'the email to Priya', "
         "'the rent reminder'. Used only if it fails.",
     )
-    target_domain: Literal["email", "calendar", "workspace", "tasks", "memory", "script"] = Field(
+    target_domain: Literal["email", "calendar", "workspace", "tasks", "memory", "script", "news", "routines"] = Field(
         description="The one domain this task works in. The worker only gets that domain's tools."
     )
     goal_contract: str = Field(description="What the worker must achieve and what counts as done. Self-contained.")
@@ -711,6 +725,7 @@ def run_single_agent(
         approval_ids = merge_same_emails(approval_ids, AgentStateStore())
     actions = result.get("actions", [])
     reply = owner_reply(messages[-1].text if messages else "", approval_ids, dry_run=dry_run, actions=actions)
+    reply = without_sent_repeat(reply, text)
     tool_calls = [
         {"name": call.get("name", ""), "args": call.get("args") or {}}
         for message in messages[len(history or []):]
@@ -774,6 +789,8 @@ ACTION_WORDS = {
     "append_sheet_row": "Adding the row",
     "create_and_share_file": "Creating and sharing the file",
     "share_drive_file": "Sharing the file",
+    "schedule_task": "Setting up the routine",
+    "cancel_scheduled_task": "Stopping the routine",
 }
 
 
@@ -790,6 +807,10 @@ def _direct_outcomes(actions: list[dict[str, Any]]) -> list[str]:
             lines.append(f"✅ Rule saved: {(action.get('result') or {}).get('summary') or args.get('rule', '')}")
         elif status == "completed" and kind == "create_reply_draft":
             lines.append("✅ Saved a reply draft in Gmail Drafts.")
+        elif status == "completed" and kind == "schedule_task":
+            lines.append((action.get("result") or {}).get("confirmation") or "✅ Routine scheduled.")
+        elif status == "completed" and kind == "cancel_scheduled_task":
+            lines.append(f"✅ Stopped the routine {(action.get('result') or {}).get('title', '')}.".replace("  ", " "))
         elif status == "completed":
             lines.append(f"✅ Done: {ACTION_WORDS.get(kind, kind.replace('_', ' ')).lower()}.")
     return lines
@@ -808,6 +829,16 @@ def owner_reply(text: str, approval_ids: list[int], dry_run: bool = False, actio
     reply = _CARDS_ONLY.sub(" ", text).strip() if said_cards_only else text
     if not reply and said_cards_only:
         reply = "\n".join(_direct_outcomes(actions or []))
+    # A new routine is confirmed in Socio's own words ("✅ Scheduled! I will prepare and send
+    # your **X** daily at 09:00 AM IST."), not the model's paraphrase.
+    confirmations = [
+        (action.get("result") or {}).get("confirmation", "")
+        for action in actions or []
+        if action.get("type") == "schedule_task" and action.get("status") == "completed"
+    ]
+    confirmations = [line for line in confirmations if line and line not in reply]
+    if confirmations:
+        return "\n".join(confirmations + ([reply] if reply else []))
     if reply or approval_ids:
         return reply
     if said_cards_only:
@@ -826,7 +857,7 @@ def should_plan(text: str, skills: list[tuple[Skill, float]]) -> bool:
     anyway (one model call saved, same result).
     """
 
-    if not is_action_request(text):
+    if not is_action_request(text) or RECURRING_REQUEST.search(text or ""):
         return False
     return bool(skills) or bool(MULTI_PART.search(text or "")) or len(request_domains(text)) >= 2
 

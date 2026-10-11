@@ -327,6 +327,33 @@ class AgentStateStore:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conversation_turns_chat ON conversation_turns (chat_id, archived, id)")
 
+    @classmethod
+    def _migrate_v6_scheduled_jobs(cls, conn: sqlite3.Connection) -> None:
+        """Routines the owner asked for ("tech news every day at 9"), run by app.scheduler."""
+
+        # Times are UTC text in one fixed format (app.scheduler.jobs.UTC_FORMAT), so they
+        # compare correctly as strings. cron_expr ("0 9 * * 1-5") is in the job's own timezone.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                prompt_query TEXT NOT NULL,
+                cron_expr TEXT,
+                rrule TEXT,
+                timezone TEXT DEFAULT 'Asia/Kolkata',
+                next_run_at TEXT NOT NULL,
+                frequency TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now')),
+                last_run_at TEXT,
+                last_status TEXT
+            )
+            """
+        )
+        # Equality column first: "is_active = 1 AND next_run_at <= ?" is one index range scan.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_next_run ON scheduled_jobs (is_active, next_run_at)")
+
     # ----- processed messages -------------------------------------------------
 
     def mark_processed(self, message_id: str, thread_id: str | None = None, status: str = "processed", summary: str | None = None, metadata: dict[str, Any] | None = None) -> None:
@@ -941,6 +968,79 @@ class AgentStateStore:
             cursor = conn.execute("UPDATE conversation_turns SET archived = 1 WHERE chat_id = ? AND archived = 0", (chat_id,))
             return cursor.rowcount
 
+    # ----- scheduled routines (app.scheduler) ---------------------------------------
+
+    _JOB_COLUMNS = (
+        "id, title, prompt_query, cron_expr, rrule, timezone, next_run_at, frequency, is_active, "
+        "created_at, last_run_at, last_status"
+    )
+
+    def add_scheduled_job(self, job: dict[str, Any]) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO scheduled_jobs (id, title, prompt_query, cron_expr, rrule, timezone, next_run_at, frequency) "
+                "VALUES (:id, :title, :prompt_query, :cron_expr, :rrule, :timezone, :next_run_at, :frequency)",
+                job,
+            )
+
+    def due_scheduled_jobs(self, now_utc: str) -> list[dict[str, Any]]:
+        """
+        Active jobs whose next run is at or before now_utc. Runs every minute, so it is one
+        indexed read (idx_scheduled_jobs_next_run) on a connection closed right away: under
+        WAL a reader never waits for, or blocks, a writer.
+        """
+
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"SELECT {self._JOB_COLUMNS} FROM scheduled_jobs WHERE is_active = 1 AND next_run_at <= ? ORDER BY next_run_at",
+                (now_utc,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [dict(row) for row in rows]
+
+    def claim_scheduled_job(self, job_id: str, expected_next_run: str, ran_at: str, next_run_at: str | None, status: str) -> bool:
+        """
+        Move a due job on before it runs (next_run_at, or inactive when next_run_at is None).
+        Only succeeds if nobody moved it since it was read, so a job runs at most once per slot.
+        """
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE scheduled_jobs SET last_run_at = ?, last_status = ?, next_run_at = COALESCE(?, next_run_at), "
+                "is_active = CASE WHEN ? IS NULL THEN 0 ELSE 1 END "
+                "WHERE id = ? AND next_run_at = ? AND is_active = 1",
+                (ran_at, status, next_run_at, next_run_at, job_id, expected_next_run),
+            )
+            return cursor.rowcount > 0
+
+    def set_scheduled_job_status(self, job_id: str, status: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE scheduled_jobs SET last_status = ? WHERE id = ?", (status, job_id))
+
+    def scheduled_jobs(self, active_only: bool = True) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {self._JOB_COLUMNS} FROM scheduled_jobs" + (" WHERE is_active = 1" if active_only else "")
+                + " ORDER BY next_run_at",
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_scheduled_job(self, job_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(f"SELECT {self._JOB_COLUMNS} FROM scheduled_jobs WHERE id = ?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def cancel_scheduled_job(self, job_id: str) -> bool:
+        """Stop an active job (the row is kept). False if it does not exist or was already stopped."""
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE scheduled_jobs SET is_active = 0, last_status = 'cancelled' WHERE id = ? AND is_active = 1", (job_id,)
+            )
+            return cursor.rowcount > 0
+
 
 # Ordered schema migrations; PRAGMA user_version records the last one applied.
 # Append new ones at the end; never edit or reorder a released migration.
@@ -950,5 +1050,6 @@ MIGRATIONS = [
     (3, AgentStateStore._migrate_v3_notes_and_workflows),
     (4, AgentStateStore._migrate_v4_tracked_tasks),
     (5, AgentStateStore._migrate_v5_conversation_context),
+    (6, AgentStateStore._migrate_v6_scheduled_jobs),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]

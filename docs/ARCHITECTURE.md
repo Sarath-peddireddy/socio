@@ -304,6 +304,57 @@ Google Task (once per email), completed when the owner approves, rejects, or
 resolves it. With it off, Socio neither creates nor completes them. Failures never
 affect email handling.
 
+## Routines and news (`app/scheduler/`, `app/news/`)
+
+The owner can ask for something on a schedule ("send me the top AI news every day
+at 9 AM"). Owner-mode tools: `schedule_task(title, query, time_of_day, frequency,
+timezone="Asia/Kolkata", day_of_week, date)`, `list_scheduled_tasks`,
+`cancel_scheduled_task(job_id)`. Creating or cancelling a routine is a local write
+(like `remember_rule`), not an approval; anything the routine later proposes
+(emails, events, writes) still becomes an approval card. Not available in email mode.
+
+- **Storage:** `scheduled_jobs` (migration v6): `id`, `title`, `prompt_query`,
+  `cron_expr` ("0 9 * * 1-5", in the job's own timezone), `rrule` (for reference),
+  `timezone`, `next_run_at`, `frequency` (`daily` / `weekdays` / `weekly` /
+  `one_off`), `is_active`, `last_run_at`, `last_status`. `next_run_at` is UTC text in
+  one fixed format (`2026-10-12T03:30:00Z`) and "now" is passed in from Python:
+  SQLite's `datetime('now')` uses a space instead of the `T`, so comparing the two
+  as text would be wrong. Index `idx_scheduled_jobs_next_run (is_active,
+  next_run_at)`: the due query is one index range search (~0.005 ms at 5,000 jobs).
+- **Times:** `zoneinfo` + `tzdata` (already installed), so any IANA zone works,
+  daylight saving included; IST is the default. Only the four frequencies above are
+  supported, so `jobs.py` computes the next run itself (no cron library).
+- **Runner:** the bot's loop calls `service.run_due_jobs` every 60 s (before the
+  inbox check, and even with `AGENT_POLL_MINUTES=0`). For each due job it first
+  *claims* the slot (conditional UPDATE: next slot, or inactive for a one-off), then
+  runs `prompt_query` through `handle_owner_command` with no chat history, then the
+  bot sends "⏰ **Scheduled Briefing:** title" + the answer (approval cards after it)
+  and saves the turn so follow-up questions work. At most once per slot: a crash or a
+  second process cannot repeat it, and a failed run is not retried (the owner gets the
+  error gateway's status card; the next slot runs normally). A slot missed while the
+  bot was off runs once if it is at most `AGENT_SCHEDULE_GRACE_HOURS` (6) late,
+  otherwise it is skipped with a one-line notice; missed days never pile up.
+- **No loops:** while a routine runs, `schedule_task` / `cancel_scheduled_task`
+  refuse (a process-wide flag, since workers run in other threads). Requests with a
+  recurrence ("every day", "each Monday", "daily at 7") skip the planner
+  (`supervisor.RECURRING_REQUEST`); "daily" / "weekly" alone ("the weekly prep") do not
+  count.
+- **Confirmation:** the reply to a new routine is the tool's own text ("✅ Scheduled! I
+  will prepare and send your **X** daily at 09:00 AM IST."), added by
+  `supervisor.owner_reply`; the model answers `CARDS_ONLY` when that was all.
+- **Telegram:** `/schedules` (alias `/routines`) lists active routines with one
+  Cancel button each (`unsched:<job_id>`, owner only); the message is redrawn after a
+  tap. No ids in the visible text.
+- **News:** `get_news(topic, max_items)` reads public RSS / Atom feeds (Hacker
+  News, TechCrunch, The Verge, Ars Technica, MIT Technology Review; override with
+  `AGENT_NEWS_FEEDS`) with `requests` and the standard library XML parser: 10 s
+  timeout, 3 MB cap, documents declaring entities refused, only http(s) links kept,
+  items older than 4 days dropped, duplicates merged, newest first; a topic matches
+  whole words ("AI" also matches LLM / OpenAI / ..., but not "said"). Headlines and
+  summaries are sanitized and wrapped in `<untrusted_news_item>` tags (`<` / `>`
+  escaped), covered by the same untrusted-data rule as emails. Planner domains
+  `news` and `routines` hold these tools.
+
 ## Approvals
 
 `propose_*` tools (and, in email mode, `send_gmail_reply`) validate the request

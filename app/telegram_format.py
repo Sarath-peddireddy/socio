@@ -51,6 +51,10 @@ I triage your inbox, coordinate your calendar, and manage your documents with st
 • Creates notes and appends structured rows to Google Docs and Sheets.
 • Adds Google Tasks for action items needing your personal follow-up.
 
+⏰ <b>Routines &amp; News</b>
+• Sends you reports on a schedule, e.g. "Send me the top AI news every day at 9 AM".
+• Reads the latest headlines from public tech news sites.
+
 🛡️ <b>Security &amp; Memory</b>
 • Inbound content is strictly quarantined inside untrusted XML boundaries.
 • Zero-touch sends and file deletions are disabled—nothing mutates without approval.
@@ -62,6 +66,7 @@ I triage your inbox, coordinate your calendar, and manage your documents with st
 • <code>/status</code> — Inspect active holds, pending approvals &amp; system health
 • <code>/approvals</code> — Review pending decision cards
 • <code>/memories</code> — View your saved rules and standing preferences
+• <code>/schedules</code> — See or cancel your scheduled routines
 • <code>/dryrun</code> · <code>/new</code> · <code>/reset</code> · <code>/forget ID</code> · <code>/save_skill NAME</code> · <code>/skills</code> · <code>/forget_skill NAME</code>
 
 <i>You can also message me naturally (e.g., "What's on my calendar tomorrow?" or "Draft an email to Alex").</i>"""
@@ -234,6 +239,33 @@ def reply_messages(parts: list) -> tuple[list[str], list[str]]:
         body = md_to_html(items[0]) if len(items) == 1 else "\n".join(f"• {md_to_html(item)}" for item in items)
         (after if kind == "question" else before).append(f"{REPLY_HEADERS[kind]}\n{body}")
     return before, after
+
+
+# ----- scheduled routines -------------------------------------------------------------------
+
+ROUTINE_HEADER = "⏰ <b>Scheduled Briefing:</b> {title}"
+NO_ROUTINES_HTML = (
+    "⏰ You have no scheduled routines.\n"
+    "<i>Just ask, e.g. \"Send me the top AI news every day at 9 AM\".</i>"
+)
+
+
+def routine_header(title: str) -> str:
+    return ROUTINE_HEADER.format(title=esc(title))
+
+
+def schedules_html(jobs: list[dict], describe, next_run) -> tuple[str, list]:
+    """The /schedules message: one line per active routine and one Cancel button each (no ids shown)."""
+
+    if not jobs:
+        return NO_ROUTINES_HTML, []
+    lines = ["⏰ <b>Active Scheduled Routines:</b>", ""]
+    buttons = []
+    for number, job in enumerate(jobs, 1):
+        lines.append(f"{number}. <b>{esc(job['title'])}</b> ({esc(describe(job))})")
+        lines.append(f"   <i>Next: {esc(next_run(job))}</i>")
+        buttons.append([{"text": f"Cancel {number}. {job['title'][:40]}", "callback_data": f"unsched:{job['id']}"}])
+    return "\n".join(lines), buttons
 
 
 # ----- approval cards -----------------------------------------------------------------------

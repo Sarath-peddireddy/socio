@@ -41,6 +41,8 @@ DOMAIN_TOOLS: dict[str, frozenset[str]] = {
     "tasks": frozenset({"list_tasks", "propose_create_task", "propose_complete_task"}),
     "memory": frozenset({"remember_rule"}),
     "script": frozenset({"run_skill_script"}),
+    "news": frozenset({"get_news"}),
+    "routines": frozenset({"schedule_task", "list_scheduled_tasks", "cancel_scheduled_task"}),
 }
 DOMAIN_ALIASES = {"drive": "workspace", "docs": "workspace", "sheets": "workspace", "gmail": "email", "google_tasks": "tasks"}
 # Compound tools that also do another domain's job inside one approval: "create a sheet
