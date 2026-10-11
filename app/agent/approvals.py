@@ -11,6 +11,12 @@ says yes (Telegram button or `python -m app.main --approve ID`). A held email
 can instead be moved to Gmail Drafts for editing (to_draft). Everything is
 re-validated at execution time.
 
+A tap claims the request atomically (open -> executing), so a double tap or a
+repeated Telegram update runs it once. Hours can pass between the card and the
+tap: before acting, check_still_current() re-reads the world. If the email
+thread got a new message, or the proposed slot is no longer free, nothing is
+done and the request becomes 'stale' (the owner can re-check the email).
+
 A decision teaches Socio nothing by itself; the owner can turn a rejection or an
 edit into a rule explicitly (by asking Socio to remember it, see app.memory.learning).
 Failures are logged in full (app.errors) and reported with a short fixed message.
@@ -19,16 +25,19 @@ Failures are logged in full (app.errors) and reported with a short fixed message
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
+from email.utils import parseaddr
 from typing import Any
 
 from app.agent.followups import complete_followup_task
 from app.agent.state import AgentStateStore
-from app.calendar.events import cancel_event, move_event, parse_ist
-from app.calendar.tools import create_calendar_event
+from app.calendar.events import cancel_event, find_conflicts, move_event, parse_ist
+from app.calendar.tools import INDIA_TZ, create_calendar_event
 from app.files.local import resolve_shareable_file
 from app.gmail.drafts import create_draft, create_reply_draft
 from app.gmail.messages import send_new_email, send_reply, trash_message
+from app.gmail.tools import get_thread_details
 from app.errors import report_failure, safe_error_text
 
 
@@ -60,7 +69,57 @@ REVIEW_TYPES = {"review_draft", "review_decision"}
 STATUS_WORDS = {
     "approved": "approved", "rejected": "rejected", "resolved": "handled",
     "failed": "tried and it failed", "executing": "being handled",
+    "stale": "stopped because things changed", "rechecked": "re-checked",
 }
+# Approvals that change a calendar slot; the slot must still be free when the owner taps.
+SLOT_TYPES = {"book_meeting", "move_event"}
+# Something only the owner knows, left in a reply by the agent: "[OWNER: your notice period]".
+GAP_MARKER = re.compile(r"\[OWNER:[^\]]*\]", re.IGNORECASE)
+GAP_REFUSAL = "This reply still has a gap only you can fill. Reply to the card with the answer, or use Edit in Gmail."
+
+
+def reply_gaps(approval: dict[str, Any]) -> list[str]:
+    """The [OWNER: ...] gaps still in an email approval's text (it can't be sent while any remain)."""
+
+    if approval.get("type") not in EMAIL_TYPES:
+        return []
+    payload = approval.get("payload") or {}
+    body = payload.get("body") if approval.get("type") == "send_email" else (payload.get("reply") or {}).get("body")
+    return GAP_MARKER.findall(body or "")
+
+
+def _for_gmail(body: str) -> str:
+    """A draft the owner finishes in Gmail: each gap reads "[fill in: ...]", not Socio's marker."""
+
+    return GAP_MARKER.sub(lambda match: f"[fill in: {match.group(0)[7:-1].strip()}]", body)
+
+
+def fill_reply(approval_id: int, body: str, question: str = "", store: AgentStateStore | None = None) -> int | None:
+    """
+    Replace a gap reply with the version the owner completed in chat: the old request is closed
+    and a new one (same recipient, thread, files, snapshot) carries the new text. Returns the new
+    request's id, or None if the old one was decided meanwhile. question: what is still missing.
+    """
+
+    store = store or AgentStateStore()
+    approval = store.get_approval(approval_id)
+    body = (body or "").strip()
+    if not approval or approval["type"] not in EMAIL_TYPES or not body:
+        return None
+    if not store.resolve_pending_approval(approval_id, "Filled in by the owner in chat"):
+        return None
+
+    payload = {key: value for key, value in approval["payload"].items() if key != "question"}
+    if approval["type"] == "send_email":
+        payload["body"] = body
+    else:
+        payload["reply"] = {**payload["reply"], "body": body}
+    if question and GAP_MARKER.search(body):
+        payload["question"] = question
+    new = {"type": approval["type"], "payload": payload}
+    return store.add_pending_approval(
+        approval["type"], describe(new), payload, message_id=approval.get("message_id"), thread_id=approval.get("thread_id"),
+    )
 
 # What the owner is told after approving (no internal numbers; the CLI adds them).
 DONE_TEXT = {
@@ -85,15 +144,69 @@ def _already(approval: dict[str, Any]) -> str:
     return f"This request was already {STATUS_WORDS.get(approval['status'], approval['status'])}."
 
 
+def _who(email: dict[str, Any]) -> str:
+    name, address = parseaddr(email.get("from", ""))
+    return name or address or "Someone"
+
+
+def check_still_current(approval: dict[str, Any]) -> str | None:
+    """
+    Why this approved change no longer fits the world, in plain words; None if it still does.
+
+    - An email reply (also the reply after a booking): the thread must not have a message
+      newer than the one it was written against (whoever wrote it, the owner included).
+      Gmail's historyId is not used: reading or labelling a message changes it too.
+    - A booking or a move: the slot must still be in the future and free in Calendar.
+    Requests made before this check existed carry no snapshot and skip the thread part.
+    Google errors propagate (the caller reports them; nothing is done).
+    """
+
+    payload, kind = approval["payload"], approval["type"]
+    reply = payload.get("reply") or {}
+
+    if reply.get("thread_id") and reply.get("last_seen_message_id"):
+        thread = get_thread_details(reply["thread_id"])
+        ids = [email.get("id") for email in thread]
+        if reply.get("message_id") and reply["message_id"] not in ids:
+            return "The email this answers is no longer in the conversation."
+        seen = reply["last_seen_message_id"]
+        if seen not in ids:  # the newest message then was deleted
+            return "The conversation changed after I prepared this."
+        newer = thread[ids.index(seen) + 1:]
+        if newer:
+            latest = newer[-1]
+            if "SENT" in latest.get("label_ids", []):
+                return "You wrote in this conversation yourself after I prepared this."
+            return f"{_who(latest)} wrote again in this conversation after I prepared this."
+
+    if kind in SLOT_TYPES:
+        start, end = parse_ist(payload["new_start"]), parse_ist(payload["new_end"])
+        if start <= datetime.now(INDIA_TZ):
+            return "That time has already passed."
+        conflicts = find_conflicts(start, end, ignore_event_id=payload.get("event_id") if kind == "move_event" else None)
+        if conflicts:
+            first = conflicts[0]
+            return f"That time is no longer free: it overlaps with '{first['title']}' ({format_time(first.get('start'))})."
+
+    return None
+
+
+def clock_12(moment: datetime) -> str:
+    """12-hour clock for people: 15:00 -> '3:00 PM' (no leading zero, works on Windows too)."""
+
+    return f"{moment.hour % 12 or 12}:{moment:%M} {'AM' if moment.hour < 12 else 'PM'}"
+
+
 def format_time(value: str | None) -> str:
-    """'2026-10-16T11:00:00+05:30' -> 'Fri 16 Oct, 11:00 IST'."""
+    """'2026-10-16T15:00:00+05:30' -> 'Fri 16 Oct, 3:00 PM IST'."""
 
     if not value:
         return "?"
     try:
-        return parse_ist(value).strftime("%a %d %b, %H:%M IST")
+        moment = parse_ist(value)
     except ValueError:
         return value
+    return f"{moment:%a %d %b}, {clock_12(moment)} IST"
 
 
 def invitees(payload: dict[str, Any]) -> list[str]:
@@ -189,6 +302,8 @@ def describe(approval: dict[str, Any]) -> str:
         )
     elif kind == "review_draft":
         text = f"A reply draft is waiting in Gmail Drafts.\nWhat to check: {payload.get('target') or approval.get('target', '')}"
+        if payload.get("body"):
+            text += f"\nDraft:\n\"{payload['body']}\""
     elif kind == "review_decision":
         text = f"Unsure whether to reply to '{payload.get('subject', '')}'.\n{payload.get('reason', '')}"
     else:
@@ -305,10 +420,22 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
         return create_and_share(payload)
 
     if kind == "share_file":
-        from app.workspace.sharing import share_file, shareable_file
+        from app.workspace.sharing import LINK_PLACEHOLDER, share_file, shareable_file
 
         file = shareable_file(payload["file_id"])  # still Socio's and not trashed
-        return {"share": share_file(file["id"], payload["recipient"], payload.get("role") or "editor", notify=True)}
+        # Asked in an email: our reply in the thread tells them (no separate Google email).
+        result = {"share": share_file(file["id"], payload["recipient"], payload.get("role") or "editor",
+                                      notify=payload.get("notify", True))}
+        if payload.get("reply"):
+            reply = dict(payload["reply"])
+            reply["body"] = LINK_PLACEHOLDER.sub(lambda _: file["url"] or payload.get("url", ""), reply["body"])
+            try:
+                result["reply"] = _send_follow_up_reply({"reply": reply})
+            except Exception as exc:  # access was given; a failed reply must not hide that
+                report_failure(exc, "approval.follow_up_reply", approval_id=approval.get("id"), type=kind)
+                result["reply_error"] = f"{type(exc).__name__}: {exc}"
+                result["reply_error_text"] = safe_error_text(exc)
+        return result
 
     if kind == "create_task":
         from app.tasks import tasks
@@ -445,7 +572,8 @@ def share_outcome(kind: str, payload: dict[str, Any], result: dict[str, Any]) ->
     title, recipient = payload.get("title", ""), payload.get("recipient", "")
     verb = ROLE_VERB.get(payload.get("role") or "editor", "edit")
     if kind == "share_file":
-        return f"Shared \"{title}\" with {recipient} (they can {verb} it). Google emailed them the link."
+        told = " Google emailed them the link." if payload.get("notify", True) else ""
+        return f"Shared \"{title}\" with {recipient} (they can {verb} it).{told}"
 
     url = (result.get("file") or {}).get("url", "")
     if result.get("share_error"):
@@ -486,23 +614,35 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
     if approval is None:
         return {"ok": False, "message": "That request no longer exists."}
 
+    # duplicate: a second tap on a card that is already decided or running; the card
+    # already shows the first tap's result, so the bot must not overwrite it.
     if approval["status"] != "open":
-        return {"ok": False, "message": _already(approval)}
+        return {"ok": False, "duplicate": True, "message": _already(approval)}
 
     if approval["type"] in REVIEW_TYPES:
-        store.resolve_pending_approval(approval_id, "Marked done by owner")
+        if not store.resolve_pending_approval(approval_id, "Marked done by owner"):
+            return {"ok": False, "duplicate": True, "message": "This request was already handled."}
         complete_followup_task(store, approval.get("message_id"))
         return {"ok": True, "message": "Marked as done."}
 
     if approval["type"] not in EXECUTABLE_TYPES:
         return {"ok": False, "message": "Socio doesn't know how to carry out this request."}
 
+    if reply_gaps(approval):  # never send "[OWNER: ...]" to anyone; the request stays open
+        return {"ok": False, "message": GAP_REFUSAL}
+
     if not store.claim_approval(approval_id):
-        return {"ok": False, "message": "This request is already being handled."}
+        return {"ok": False, "duplicate": True, "message": "This request is already being handled."}
 
     message_id, thread_id = approval.get("message_id"), approval.get("thread_id")
 
     try:
+        stale = check_still_current(approval)
+        if stale:
+            store.finish_approval(approval_id, "stale", stale)
+            if message_id:
+                store.mark_processed(message_id, thread_id, status="needs_review", summary=f"Not carried out: {stale}")
+            return {"ok": False, "stale": True, "message": f"{stale} Nothing was sent or changed."}
         result = _execute(approval)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
@@ -539,7 +679,8 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
         if (result.get(key) or {}).get("url"):
             message += f" {result[key]['url']}"
     if result.get("reply_error"):
-        message += f" The calendar was updated, but the reply failed. {result.get('reply_error_text', '')}".rstrip()
+        done = "Access was given" if approval["type"] == "share_file" else "The calendar was updated"
+        message += f" {done}, but the reply failed. {result.get('reply_error_text', '')}".rstrip()
 
     if message_id and approval["type"] != "trash_email":
         status = "needs_attention" if result.get("reply_error") else ("replied" if result.get("reply") else "no_action")
@@ -563,7 +704,7 @@ def reject(approval_id: int, store: AgentStateStore | None = None) -> dict[str, 
         return {"ok": False, "message": "That request no longer exists."}
 
     if not store.claim_approval(approval_id):
-        return {"ok": False, "message": _already(approval)}
+        return {"ok": False, "duplicate": True, "message": _already(store.get_approval(approval_id) or approval)}
 
     store.finish_approval(approval_id, "rejected", f"Rejected by owner at {datetime.now().isoformat(timespec='seconds')}")
     complete_followup_task(store, approval.get("message_id"))
@@ -594,7 +735,7 @@ def to_draft(approval_id: int, store: AgentStateStore | None = None) -> dict[str
         return {"ok": False, "message": "This is not an email, so it cannot be moved to Gmail Drafts."}
 
     if not store.claim_approval(approval_id):
-        return {"ok": False, "message": _already(approval)}
+        return {"ok": False, "duplicate": True, "message": _already(store.get_approval(approval_id) or approval)}
 
     from app.workspace.sharing import with_links
 
@@ -607,12 +748,12 @@ def to_draft(approval_id: int, store: AgentStateStore | None = None) -> dict[str
         attachment = str(resolve_shareable_file(attachments[0]["path"])) if len(attachments) == 1 else None
         if approval["type"] == "send_email":
             draft = create_draft(
-                to=payload["to"], subject=payload.get("subject", ""), body=with_links(payload["body"], links),
+                to=payload["to"], subject=payload.get("subject", ""), body=_for_gmail(with_links(payload["body"], links)),
                 attachment_path=attachment,
             )
         else:
             reply = payload["reply"]
-            draft = create_reply_draft(message_id=reply["message_id"], body=with_links(reply["body"], links), attachment_path=attachment)
+            draft = create_reply_draft(message_id=reply["message_id"], body=_for_gmail(with_links(reply["body"], links)), attachment_path=attachment)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         report_failure(exc, "approval.to_draft", approval_id=approval_id, type=approval["type"])

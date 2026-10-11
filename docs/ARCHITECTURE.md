@@ -361,8 +361,9 @@ timezone="Asia/Kolkata", day_of_week, date)`, `list_scheduled_tasks`,
 and the graph records an approval (`pending_approvals` table). The Telegram bot
 pushes each new request as one HTML card (`telegram_format.approval_card`):
 🗑️ Trash, ✉️ Outgoing Email Proposal (To, Subject, the full draft in a
-blockquote), 📅 Meeting Proposal (title, attendee, slot in IST, "Local 24h
-soft-hold active" only while a hold exists, the reply to send afterwards),
+blockquote), 📅 Meeting Proposal (title, attendee, slot in IST on the 12-hour clock, the
+reply to send afterwards; no hold status and no reason line on any card, developer decision
+2026-10-11: the hold still works in the background),
 🔁 Move / 🚫 Cancel Meeting, 📝 Workspace Update (target, action, `+` diff),
 📊 / 📄 Create & Share (Approve & Send / Cancel), 🔗 Share File, 🔐 Trust Skill Script. Buttons: Approve & Trash / Book / Move / Cancel, or
 Approve; emails get Approve & Send / Edit in Gmail / Reject. Every dynamic
@@ -370,6 +371,59 @@ value is HTML-escaped. After a tap the card is rendered again from the stored
 request with the result line. `approvals.approve()` claims the request atomically (so a double tap
 cannot run it twice), re-validates (event exists, new slot still free),
 executes, then sends the follow-up reply if one was attached.
+
+A tap is answered the moment it arrives (toast "Working on it…") and the card is edited to
+"⏳ Working on it…" without buttons before any Google call; the result line replaces it (Google
+calls take ~0.6 s each, so answering after the work felt like 3-5 s). An unexpected error puts
+the buttons back (`Bot._restore_card`). A tap on a card that is no longer open gets a short
+toast ("This was already approved."), never a pop-up and never a card edit.
+
+Inbox summary: an email that has a card is shown by its card alone; the others get one line in
+fixed wording (`telegram_bot.INBOX_NOTES`, or the error gateway's own sentence for an outage),
+never the agent's internal summary. With nothing to say, no summary is sent. The "Reply Drafted
+in Gmail" card shows To / Subject / what you need to do / the draft text itself.
+
+Replies Socio can't finish (something only the owner knows): there are no Gmail drafts in email
+mode. `create_reply_draft` is gated like `send_gmail_reply` and becomes the same reply card; with
+`[OWNER: ...]` gaps the card is "✉️ Reply Needs Your Input" with the question (the tool's `reason`)
+and only Edit in Gmail / Reject, and `approve()` refuses while a gap remains. The owner answers in
+chat, as a Telegram reply to the card (`pending_approvals.card_message_id`, migration v8) or as the
+next message after it: `gap_fill.fill_gaps` (one model call; it also decides whether the message is
+an answer at all, otherwise it runs as an instruction) -> `approvals.fill_reply` (old request
+resolved, a new one with the same recipient, thread, files and snapshot) -> a fresh card with
+Approve & Send / Edit in Gmail / Reject. In owner mode `create_reply_draft` still saves a draft.
+
+Access requests from an email (`propose_file_access`, email mode only, conditional proposal):
+someone in the conversation asks for access to a Google Doc / Sheet whose link is in the
+conversation (`runner._thread_file_ids` -> `state.thread_file_ids`; anyone else or any other
+file is refused in `graph._scope_violation`). The tool reads the file's permissions first
+(`sharing.current_access`; drive.file can read them for Socio's files): already enough access ->
+no card, the agent replies telling them to open it signed in as that address; otherwise one 🔗
+Share File card (`share_file` + `notify: False` + the reply) -> approve grants access, then sends
+the reply in the thread (`[link]` replaced by the file's link).
+
+Taps are idempotent: the claim is one `UPDATE pending_approvals SET status = 'executing',
+locked_at = now WHERE id = ? AND status = 'open'`. Only the tap that changes the row runs; any
+other (double tap, repeated Telegram update, CLI at the same moment) gets `duplicate`, and the
+bot answers it with a pop-up only, so the card keeps the first tap's result. A request still
+`executing` 15 minutes after its `locked_at` was cut off by a crash: `/status` and `--status`
+list it ("may or may not have happened"); it is never retried automatically.
+
+Hours can pass between card and tap, so `check_still_current()` runs right after the claim:
+- an email reply (also the reply after a booking): the thread must have no message newer than
+  `reply.last_seen_message_id`, the newest message when the card was made (whoever wrote it:
+  the owner answering in Gmail counts). Gmail's `historyId` is not used: reading or labelling
+  a message changes it too, which would make nearly every card stale.
+- a booking or move: the slot must still be in the future and free in Calendar.
+
+If not, nothing is done, the request becomes `stale` (its slot hold is released, the email
+`needs_review`), and the card is edited to "⚠️ Things changed since this was proposed" with the
+reason ("Priya wrote again in this conversation after I prepared this."). Cards from an
+incoming email get **🔄 Re-check**: `runner.recheck_stale_approval` (under the inbox lock;
+`stale` -> `rechecked` once) handles the thread's newest incoming email again, unless an inbox
+check already handled that newer email, and the fresh card follows. Owner-mode cards say
+"Ask me again if you still want it." Cards made before this check (no snapshot) skip the
+thread part.
 
 | Type | Executes |
 |---|---|
@@ -428,7 +482,7 @@ Three tiers:
    busy timeout, versioned migrations (`MIGRATIONS`, `PRAGMA user_version`,
    applied inside `BEGIN IMMEDIATE` so two processes cannot both migrate; v1 is
    the old schema, idempotent; v3 adds the notes, workflow counts, and
-   `supervisor_runs.skill`).
+   `supervisor_runs.skill`; v7 adds `pending_approvals.locked_at`).
 2. **Long-term semantic (`memory/semantic.py`)**: `memories` table in the same
    file: (entity, preference, context) + a float32 embedding from fastembed
    (`snowflake/snowflake-arctic-embed-s`, local ONNX, 384-d). Recall is a dot
@@ -503,6 +557,25 @@ Three tiers:
   end or on a crash's expiry). A second live run returns `skipped_busy`; dry
   runs need no lock. Approvals are claimed atomically, so a double tap from
   Telegram and the CLI cannot execute twice.
+- Connections are short-lived: `state._connect()` commits (or rolls back) and closes at the end
+  of each block, so no reader holds a snapshot that would stop SQLite from emptying the WAL
+  file; `synchronous=NORMAL` on each connection (safe with WAL). The bot runs
+  `PRAGMA wal_checkpoint(TRUNCATE)` at startup and once a day (`maintain_database`). The busy
+  timeout stays 30 s (a shorter one brings back "database is locked" between bot and CLI).
+- Time limits: every model call has a 60 s socket timeout (a timeout fails over to the next
+  provider) and every Google call 30 s, so no step hangs forever. On top, each supervisor
+  worker has a wall-clock budget (`AGENT_WORKER_TIMEOUT`, 180 s) checked after every graph
+  step; past it the worker stops before its next model call or tool round and reports
+  FAILED ("It took too long, so I stopped it."). Threads cannot be killed, so a running step
+  finishes first. Its slot frees for the next task, dependents are not started, independent
+  siblings finish (developer decision 2026-10-11: not 25 s, and siblings are not cancelled).
+- One "today" per request (`app/agent/clock.py`): the Telegram message's own timestamp (CLI /
+  routine / email: the start of the run) is frozen in a contextvar, copied into each worker
+  thread (`contextvars.copy_context()` in `run_plan`). The owner, email, worker, and planner
+  prompts carry `<temporal_anchor>Today is 2026-10-11 (Sunday) ... Tomorrow is 2026-10-12
+  (Monday) ... Asia/Kolkata</temporal_anchor>`, so a request sent at 23:59 and run after
+  midnight, or on a UTC server, still means the same dates. Tool checks that need the real
+  time (is a slot in the past or free now?) use the real clock.
 
 ## Error gateway (`app/errors.py`)
 

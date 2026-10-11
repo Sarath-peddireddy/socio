@@ -220,6 +220,10 @@ def find_documents(query: str) -> list[dict]:
     Returns up to 5 candidates with their "path", name, source, and
     match_score. Only files from this result may be attached. An empty
     list means no suitable file exists: do not attach anything else.
+    match_score = how many specific words of the request are in the file's name;
+    0.5 = only words inside the file matched, which is never a clear match.
+    Generic words (sheet, doc, file, the...) don't count: a request that only says
+    "the sheet" returns a note instead, and you must ask the sender which file.
     """
 
     return search_documents(query)
@@ -236,16 +240,19 @@ def create_reply_draft(
     """
     Save a reply as a Gmail draft for the owner to review instead of sending it.
 
-    Use this when a reply is needed but you cannot complete it safely:
-    information only the owner knows, an ambiguous or unusual request,
-    no matching file for a document request, or an action no tool supports
-    (for example rescheduling or cancelling an event).
+    Use this only when the reply must state a fact or decision only the owner
+    knows (a date, a number, a yes/no). If the sender was unclear, do not use
+    this: reply asking them with send_gmail_reply.
 
     Write the draft in the owner's own voice, exactly as the owner would
     send it (first person, never mention tools, assistants, or "checking
-    with" the owner). Put anything the owner must fill in or decide inside
-    [OWNER: ...] markers, e.g. [OWNER: confirm salary expectation].
-    reason explains what the owner must check. Nothing is sent.
+    with" the owner). Put each missing fact where it belongs in the sentence
+    as [OWNER: what goes here], e.g. "My expected salary is [OWNER: salary]."
+    A marker is never a note or instruction to the owner.
+    reason is the question for the owner, short and spoken to them as "you"
+    ("What is your notice period?"). Nothing is sent. While handling an incoming
+    email this does not save a Gmail draft: it becomes the owner's reply card, and
+    they answer the question in their chat.
     """
 
     thread = get_thread_details(thread_id)
@@ -611,6 +618,50 @@ def share_drive_file(file: str, email: str, role: str = "") -> dict:
     from app.workspace.sharing import share_file, shareable_file
 
     return share_file(shareable_file(file)["id"], email, role, notify=True)
+
+
+@tool
+def propose_file_access(file: str, email: str, role: str = "", reply_body: str = "") -> dict:
+    """
+    For an incoming email where someone in this conversation asks for access to a Google
+    Doc / Sheet whose link is already in this conversation ("I can't edit the sheet you
+    sent", "please give me access"). file = that link (or find_documents path); email = the
+    person asking; role = editor unless they asked for view/comment only.
+
+    First checks the access they already have:
+    - {"already_has_access": true, ...}: nothing to grant. Reply with send_gmail_reply telling
+      them they already have that access and to open the link while signed in to Google as
+      their address (they are probably signed in with another account).
+    - {"proposal": ...}: the owner approves granting access; reply_body is then sent in this
+      thread (say access is granted, include the link). Do not send another reply yourself.
+    Only files Socio created can be checked or shared; anything else raises an error: then
+    use create_reply_draft.
+    """
+
+    from app.workspace.sharing import has_access, normalize_role, shareable_file, validate_recipient
+
+    recipient, wanted = validate_recipient(email), normalize_role(role) or "editor"
+    target = shareable_file(file)
+    have = has_access(target["id"], recipient, wanted)
+    if have:
+        return {
+            "already_has_access": True, "access": have, "email": recipient,
+            "file": target["name"], "url": target["url"],
+            "note": f"{recipient} can already {'edit' if have in {'editor', 'owner'} else ('comment on' if have == 'commenter' else 'view')} it.",
+        }
+    return {
+        "proposal": {
+            "type": "share_file",
+            "file_id": target["id"],
+            "title": target["name"],
+            "url": target["url"],
+            "recipient": recipient,
+            "role": wanted,
+            # The reply in the thread tells them; no separate Google notification email.
+            "notify": not reply_body.strip(),
+            "reply_body": reply_body,
+        }
+    }
 
 
 @tool

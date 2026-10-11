@@ -133,6 +133,13 @@ to `logs/agent.log` on your computer.
   Approved actions are re-validated at the moment you tap (for example, the
   slot must still be free). Trash is never a permanent delete (Gmail keeps it
   30 days, and Socio's Gmail permission cannot permanently delete).
+
+  A double tap (or a flaky connection resending the tap) runs the action once;
+  the extra tap only shows a pop-up. If the conversation got a new email, or
+  the slot was taken, between the card and your tap, nothing is sent: the card
+  says "⚠️ Things changed since this was proposed" and why, and cards about an
+  incoming email get **🔄 Re-check**, which reads the conversation again and
+  proposes afresh.
 - **Emails are untrusted.** When handling an incoming email, Socio gets a
   restricted toolset: it can only reply inside that conversation, only to
   people already in it, and can never delete, search your other mail, or
@@ -232,6 +239,7 @@ See [`.env.example`](.env.example).
 | `AGENT_INBOX_QUERY` | Which emails to process (default: inbox, last 7 days, not from you) |
 | `AGENT_MEMORY` | Remember the rules you add and recall them (default on; `0` = off) |
 | `AGENT_MAX_WORKERS` | Tasks of one instruction run in parallel (default 3) |
+| `AGENT_WORKER_TIMEOUT` | Seconds one of those tasks may take before Socio stops it (default 180) |
 | `AGENT_LLM_RPM` | Gemini requests per minute per key, shared by all tasks (default 14; free tier is 15) |
 | `AGENT_MISTRAL_RPM` | Mistral requests per minute, shared by all tasks (default 28; ministral-14b free tier is 30) |
 | `AGENT_GROQ_RPM` | Groq requests per minute, shared by all tasks (default 28; free tier is 30) |

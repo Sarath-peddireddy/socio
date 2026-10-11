@@ -41,16 +41,26 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
-from app.agent.approvals import approve, describe, reject, to_draft
+from app.agent.approvals import STATUS_WORDS, approve, describe, fill_reply, reject, reply_gaps, to_draft
+from app.agent.gap_fill import fill_gaps
 from app.agent.llm import LLMUnavailableError
-from app.agent.runner import BUSY_STATUS, DEFAULT_QUERY, handle_owner_command, process_inbox
+from app.agent.runner import (
+    BUSY_STATUS,
+    DEFAULT_QUERY,
+    RECHECKED_ALREADY,
+    handle_owner_command,
+    process_inbox,
+    recheck_stale_approval,
+)
 from app.agent.state import AgentStateStore
 from app.agent.supervisor import save_last_plan
-from app.errors import report_failure, scrub, setup_logging
+from app.calendar.tools import INDIA_TZ
+from app.errors import MESSAGES as ERROR_MESSAGES, report_failure, scrub, setup_logging
 from app.google_api import GoogleApiUnavailableError
 from app.memory import skills as skill_store
 from app.memory.embeddings import get_embedder
@@ -81,8 +91,10 @@ from app.telegram_format import (
     md_to_html,
     menu_commands,
     reply_messages,
+    gap_question,
     routine_header,
     schedules_html,
+    stale_notice,
     strip_html,
 )
 
@@ -99,6 +111,42 @@ DRAFTED_TEXT = "✏️ Saved to Gmail Drafts. Nothing was sent."
 RESET_TEXT = "🧹 <b>Context Reset</b>\nActive conversational memory cleared. Ready for a new task."
 OLD_RULE_BUTTON_TEXT = "That button is no longer used. To add a rule, just tell me, e.g. \"remember: never book calls before noon\"."
 DECISION_WORDS = {"approve": "approved", "reject": "rejected", "draft": "moved to Gmail Drafts (not sent)"}
+# What a Re-check found, by the email's new outcome (any new card arrives right below).
+RECHECK_OUTCOMES = {
+    "awaiting_approval": "🔄 Re-checked. Anything that needs you is below.",
+    "no_action": "🔄 Re-checked: nothing needs doing in this conversation now.",
+    "needs_review": "🔄 Re-checked: this one needs you. Anything I prepared is below or in Gmail Drafts.",
+    "needs_attention": "🔄 Re-checked, but something didn't go through. Please look at it in Gmail.",
+    "failed": "🔄 Re-checked, but I couldn't finish. I'll try again on the next inbox check.",
+}
+# Shown the instant a card's button is tapped (toast, and on the card until the result).
+WORKING_TOAST = {"approve": "Working on it…", "draft": "Saving it to Gmail Drafts…", "reject": "Rejected."}
+# Inbox summary lines for emails that got no card (fixed wording; never the agent's own notes).
+INBOX_NOTES = {
+    "failed": "I couldn't finish this one. I'll try again on the next check.",
+    "failed_permanently": "I tried 3 times and couldn't finish it. Please handle it in Gmail.",
+    "needs_attention": "Something didn't go through. Please check it in Gmail.",
+    "needs_review": "This one needs you. Please look at it in Gmail.",
+    "replied_unverified": "The reply went out, but I couldn't confirm it in the conversation.",
+}
+
+
+def _gateway_text(reason: str) -> bool:
+    """True when an outcome's reason is one of the error gateway's fixed sentences (app.errors)."""
+
+    return any((reason or "").startswith(text.removeprefix("⚠️").strip()) for text in ERROR_MESSAGES.values())
+
+
+def already_text(approval: dict) -> str:
+    """What a tap on a card that is no longer open says (plain words, no numbers)."""
+
+    return f"This was already {STATUS_WORDS.get(approval['status'], 'handled')}."
+
+
+# A card update lost to a network drop is retried on this many polls before giving up.
+MAX_EDIT_TRIES = 5
+# Database maintenance (WAL checkpoint): at startup, then once a day.
+MAINTENANCE_SECONDS = 24 * 60 * 60
 
 INTERESTING_STATUSES = {
     "replied": "✅ Replied",
@@ -133,6 +181,15 @@ def _clip(text: str) -> str:
     return text if len(text) <= MAX_MESSAGE_CHARS else text[: MAX_MESSAGE_CHARS - 20] + "\n… (truncated)"
 
 
+def sent_at(message: dict) -> datetime | None:
+    """When the owner sent a Telegram message (its own Unix timestamp), in IST."""
+
+    try:
+        return datetime.fromtimestamp(int(message["date"]), tz=timezone.utc).astimezone(INDIA_TZ)
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
 class Bot:
     def __init__(self, api, owner_chat_id: int | None, poll_minutes: float = 10, store: AgentStateStore | None = None):
         self.api = api
@@ -143,8 +200,15 @@ class Bot:
         self.next_inbox_run = time.monotonic()
         self.next_task_check = time.monotonic()
         self.next_routine_check = time.monotonic()
+        self.next_maintenance = time.monotonic()
         # Decisions taken on cards since the last instruction, for the follow-up context.
         self.decisions: list[str] = []
+        # Card updates Telegram didn't receive (network drop): retried each poll, newest wins.
+        self.pending_edits: dict[tuple, dict] = {}
+        # The last card sent, if it is a reply waiting for the owner's answer in chat.
+        self.last_gap_card: int | None = None
+        # Question messages opened by 💬 Answer -> the card they belong to.
+        self.answer_prompts: dict[int, int] = {}
 
     @property
     def history(self) -> list:
@@ -183,9 +247,6 @@ class Bot:
             params["reply_markup"] = {"inline_keyboard": buttons}
         return self._call_html("sendMessage", params)
 
-    def _held_approvals(self) -> set[int]:
-        return {hold["approval_id"] for hold in self.store.active_slot_holds()}
-
     def notify_approvals(self, resend_open: bool = False) -> int:
         """Send approval requests the owner has not seen yet (or all open ones), one card each."""
 
@@ -194,12 +255,13 @@ class Bot:
             if resend_open
             else self.store.unnotified_approvals()
         )
-        held = self._held_approvals() if approvals else set()
-
         for approval in approvals:
-            text, buttons = approval_card(approval, hold_active=approval["id"] in held)
-            self.send(text, buttons)
-            self.store.mark_approval_notified(approval["id"])
+            text, buttons = approval_card(approval)
+            sent = self.send(text, buttons)
+            card_message = sent.get("message_id") if isinstance(sent, dict) else None
+            self.store.mark_approval_notified(approval["id"], card_message)
+            # The newest card decides what a plain next message may answer (see _gap_card_for).
+            self.last_gap_card = approval["id"] if reply_gaps(approval) else None
 
         return len(approvals)
 
@@ -215,25 +277,31 @@ class Bot:
                 self.send(f"⏳ {esc(outcomes[0].reason)}")
             return
 
+        # An email with a card is shown by its card alone (developer: never the same thing
+        # twice). The rest get one line each, in fixed wording, never the agent's own notes.
+        carded = {a.get("message_id") for a in self.store.pending_approvals() if a.get("message_id")}
         lines = []
-        quiet = 0
         for outcome in outcomes:
             label = INTERESTING_STATUSES.get(outcome.status)
-            if not label:
-                quiet += 1
+            if not label or (outcome.message_id in carded and not dry_run):
                 continue
             line = f"{label}: <b>{esc(outcome.subject or '(no subject)')}</b>"
             if outcome.sender:
                 line += f"\n   from {esc(outcome.sender)}"
-            if outcome.status in {"failed", "needs_attention", "needs_review"} and (outcome.reason or outcome.summary):
-                line += f"\n   <i>{esc((outcome.summary or outcome.reason)[:300])}</i>"
+            if outcome.status == "failed" and outcome.message_id == "-":
+                line = f"⚠️ {esc(outcome.reason)}"  # the check itself failed (e.g. Google unreachable)
+            elif outcome.status == "failed" and _gateway_text(outcome.reason):
+                line += f"\n   <i>{esc(outcome.reason)}</i>"  # a predefined outage sentence, safe to show
+            elif outcome.status in INBOX_NOTES:
+                line += f"\n   <i>{esc(INBOX_NOTES[outcome.status])}</i>"
             lines.append(line)
 
-        if lines or announce:
-            header = f"{'🧪 Dry run - ' if dry_run else ''}📬 <b>Inbox check:</b> {len(lines)} handled"
-            if quiet:
-                header += f", {quiet} needed nothing"
-            self.send(header + ("\n\n" + "\n\n".join(lines) if lines else ""))
+        prefix = "🧪 Dry run - " if dry_run else ""
+        if lines:
+            self.send(f"{prefix}📬 <b>Inbox check</b>\n\n" + "\n\n".join(lines))
+        elif announce:
+            waiting = any(o.message_id in carded for o in outcomes)
+            self.send(f"{prefix}📬 Inbox checked. " + ("What needs you is in the cards." if waiting else "Nothing needs you right now."))
 
     # ----- incoming updates ------------------------------------------------------
 
@@ -262,13 +330,17 @@ class Bot:
                 self._answer(query, strip_html(text))
                 self._report_error(text)
             return
-        if action not in {"approve", "draft", "reject", "rule"} or not raw_id.isdigit():
+        if action not in {"approve", "draft", "reject", "rule", "recheck", "answer"} or not raw_id.isdigit():
             self._answer(query, "Unknown button.")
             return
 
         try:
             if action == "rule":  # cards sent before the button was removed
                 self._answer(query, OLD_RULE_BUTTON_TEXT)
+            elif action == "answer":
+                self._ask_for_answer(int(raw_id), query)
+            elif action == "recheck":
+                self._recheck(int(raw_id), query)
             else:
                 self._decide(action, int(raw_id), query)
         except Exception as exc:
@@ -276,24 +348,105 @@ class Bot:
             self._answer(query, strip_html(text))
             self._report_error(text)
 
-    def _answer(self, query: dict, text: str) -> None:
-        """Close the button's loading spinner (best effort: an old query cannot be answered). Plain text."""
+    def _answer(self, query: dict, text: str, alert: bool = False) -> None:
+        """
+        Close the button's loading spinner (best effort: an old query cannot be answered). Plain
+        text; alert=True shows it as a pop-up the owner has to dismiss.
+        """
 
+        params = {"callback_query_id": query["id"], "text": scrub(text)[:190]}
+        if alert:
+            params["show_alert"] = True
         try:
-            self.api.call("answerCallbackQuery", callback_query_id=query["id"], text=scrub(text)[:190])
+            self.api.call("answerCallbackQuery", **params)
         except Exception as exc:
             logger.warning("Could not answer a button press: %s", exc)
 
-    def _decide(self, action: str, approval_id: int, query: dict) -> None:
-        if action == "reject":
-            outcome = reject(approval_id, self.store)
-        elif action == "draft":
-            outcome = to_draft(approval_id, self.store)
-        else:
-            outcome = approve(approval_id, self.store)
-        self._answer(query, outcome["message"])
+    def _edit_card(self, query: dict, text: str, buttons: list | None = None) -> None:
+        self._edit_message(query["message"]["chat"]["id"], query["message"]["message_id"], text, buttons)
 
-        decided = self.store.get_approval(approval_id)
+    def _edit_message(self, chat_id, message_id, text: str, buttons: list | None = None) -> None:
+        params = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if buttons:
+            params["reply_markup"] = {"inline_keyboard": buttons}
+        key = (params["chat_id"], params["message_id"])
+        self.pending_edits.pop(key, None)  # this edit supersedes any queued older one
+        try:
+            self._call_html("editMessageText", params)
+        except requests.RequestException as exc:
+            # Updating the card is only the display: whatever the tap did has happened (or not)
+            # already. A dropped connection must not turn into an error card; retry it instead.
+            logger.warning("Could not update a card (%s); retrying on the next poll.", type(exc).__name__)
+            self.pending_edits[key] = {"params": params, "tries": 1}
+        except TelegramError as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+
+    def _retry_card_edits(self) -> None:
+        """Send card updates that failed earlier (a few tries, then give up quietly)."""
+
+        for key, item in list(self.pending_edits.items()):
+            try:
+                self._call_html("editMessageText", item["params"])
+            except (requests.RequestException, TelegramError) as exc:
+                unchanged = "message is not modified" in str(exc).lower()
+                if not unchanged and item["tries"] < MAX_EDIT_TRIES:
+                    item["tries"] += 1
+                    continue
+                if not unchanged:
+                    logger.warning("Gave up updating a card after %d tries: %s", item["tries"], type(exc).__name__)
+            self.pending_edits.pop(key, None)
+
+    def _decide(self, action: str, approval_id: int, query: dict) -> None:
+        current = self.store.get_approval(approval_id)
+        if current and current["status"] != "open":
+            # A double tap or a repeated update: the card already shows (or is about to show)
+            # the first tap's result. A short toast only; never overwrite the card.
+            self._answer(query, already_text(current))
+            return
+
+        # Stop the button's spinner at once (Google calls take seconds), and replace the
+        # buttons with a working line so there is nothing to tap twice. The result follows.
+        self._answer(query, WORKING_TOAST[action])
+        if current and action != "reject":  # rejecting is instant: no in-between state
+            self._edit_card(query, f"{card_text(current)}\n\n⏳ <i>{WORKING_TOAST[action]}</i>")
+
+        try:
+            if action == "reject":
+                outcome = reject(approval_id, self.store)
+            elif action == "draft":
+                outcome = to_draft(approval_id, self.store)
+            else:
+                outcome = approve(approval_id, self.store)
+        except Exception:
+            self._restore_card(query, approval_id)
+            raise
+
+        approval = self.store.get_approval(approval_id)
+        if outcome.get("duplicate"):
+            # Lost the race to another process (the CLI): show what the request is now.
+            line = f"ℹ️ {esc(already_text(approval))}" if approval else ""
+            self._edit_card(query, f"{card_text(approval)}\n\n{line}" if approval else esc(outcome["message"]))
+            return
+
+        if approval and approval["status"] == "open":
+            # Nothing happened and the request is still waiting (e.g. a gap left in a reply):
+            # the card keeps its buttons, with the reason under it.
+            text, buttons = approval_card(approval)
+            self._edit_card(query, f"{text}\n\n⚠️ {esc(outcome['message'])}", buttons)
+            return
+
+        if outcome.get("stale") and approval:
+            # Nothing was done: say why, and for an incoming email offer to look again.
+            self._edit_card(query, *self._stale_card(approval, outcome["message"]))
+            return
+
+        decided = approval
         if action == "reject" and outcome["ok"] and decided and decided["type"] == "complete_task":
             status_line = KEPT_OPEN_TEXT
         elif action == "reject" and outcome["ok"] and decided and decided["type"] == "close_old_reminders":
@@ -309,18 +462,63 @@ class Bot:
 
         # The card is rendered again from the stored request (it is decided now, so no hold
         # line and no buttons). Nothing else is sent.
-        approval = self.store.get_approval(approval_id)
         original = card_text(approval) if approval else esc(query.get("message", {}).get("text", ""))
-        self._call_html("editMessageText", {
-            "chat_id": query["message"]["chat"]["id"],
-            "message_id": query["message"]["message_id"],
-            "text": f"{original}\n\n{status_line}",
-            "disable_web_page_preview": True,
-        })
+        self._edit_card(query, f"{original}\n\n{status_line}")
         if outcome["ok"] and approval:
             self.decisions.append(f"The owner {DECISION_WORDS[action]}: {describe(approval)}")
             if action != "reject":
                 update_context_anchor(self.owner_chat_id, entities_from_approval(approval), self.store)
+
+    @staticmethod
+    def _stale_card(approval: dict, message: str | None = None) -> tuple[str, list | None]:
+        """The "things changed" card; cards about an incoming email get the Re-check button."""
+
+        recheck = bool(approval.get("message_id") and approval.get("thread_id"))
+        reason = message or f"{approval.get('resolution') or ''} Nothing was sent or changed.".strip()
+        text = f"{card_text(approval)}\n\n{stale_notice(reason, recheck)}"
+        return text, ([[{"text": "🔄 Re-check", "callback_data": f"recheck:{approval['id']}"}]] if recheck else None)
+
+    def _restore_card(self, query: dict, approval_id: int) -> None:
+        """After an unexpected error: show the card as it really is (buttons back if still open)."""
+
+        approval = self.store.get_approval(approval_id)
+        if not approval:
+            return
+        try:
+            if approval["status"] == "open":
+                text, buttons = approval_card(approval)
+                self._edit_card(query, text, buttons)
+            else:
+                self._edit_card(query, f"{card_text(approval)}\n\nℹ️ {esc(already_text(approval))}")
+        except Exception as exc:
+            logger.warning("Could not restore a card: %s", exc)
+
+    def _recheck(self, approval_id: int, query: dict) -> None:
+        """Re-check on a stale card: read the conversation again and propose afresh."""
+
+        approval = self.store.get_approval(approval_id)
+        if not approval or approval["status"] != "stale":
+            self._answer(query, "This was already re-checked.")
+            return
+
+        self._answer(query, "⏳ Reading the conversation again…")
+        self._edit_card(query, f"{card_text(approval)}\n\n⏳ <i>Reading the conversation again…</i>")
+        try:
+            outcome = recheck_stale_approval(approval_id, self.store)
+        except Exception:
+            self._edit_card(query, *self._stale_card(approval))  # still stale: button back
+            raise
+        if outcome.status == BUSY_STATUS:
+            self._edit_card(query, *self._stale_card(approval))
+            self.send(f"⏳ {esc(outcome.reason)}")
+            return
+
+        line = RECHECK_OUTCOMES.get(outcome.status, RECHECK_OUTCOMES["awaiting_approval"])
+        if outcome.status == RECHECKED_ALREADY:
+            line = f"🔄 {esc(outcome.reason)}"
+        decided = self.store.get_approval(approval_id) or approval
+        self._edit_card(query, f"{card_text(decided)}\n\n⚠️ {esc(approval.get('resolution') or '')}\n{line}")
+        self.notify_approvals()
 
     def _handle_message(self, message: dict) -> None:
         chat_id = message.get("chat", {}).get("id")
@@ -392,10 +590,80 @@ class Bot:
             except skill_store.SkillError:
                 ok = False
             self.send(f"Archived skill <b>{esc(argument)}</b> (skills/.archive)." if ok else "Usage: <code>/forget_skill NAME</code> (see /skills).")
+        elif not text.startswith("/") and self._answer_gap(message, text):
+            pass  # it answered a reply card's question: the filled-in card was sent
         elif is_acknowledgement(text, self._last_reply()):
             self._react(message)
         else:
-            self._run_instruction(text)
+            self._run_instruction(text, sent_at(message))
+
+    def _ask_for_answer(self, approval_id: int, query: dict) -> None:
+        """💬 Answer on a reply card: open Telegram's reply box with the question."""
+
+        approval = self.store.get_approval(approval_id)
+        if not approval or approval["status"] != "open" or not reply_gaps(approval):
+            self._answer(query, "This reply doesn't need an answer any more.")
+            return
+        self._answer(query, "Type your answer below.")
+        prompt = self._call_html("sendMessage", {
+            "chat_id": self.owner_chat_id,
+            "text": f"❓ <b>{esc(gap_question(approval))}</b>\nType your answer below.",
+            # Opens the reply box on the phone, already pointing at this question.
+            "reply_markup": {"force_reply": True, "input_field_placeholder": "Your answer"},
+        })
+        if isinstance(prompt, dict) and prompt.get("message_id"):
+            self.answer_prompts[prompt["message_id"]] = approval_id
+        self.last_gap_card = approval_id
+
+    def _gap_card_for(self, message: dict) -> dict | None:
+        """
+        The open reply card with a gap that this message may answer: the card it replies to
+        (Telegram "reply"), else the last card sent if that one is waiting for an answer.
+        """
+
+        replied_to = (message.get("reply_to_message") or {}).get("message_id")
+        candidates = []
+        if replied_to in self.answer_prompts:  # typed into the box opened by 💬 Answer
+            candidates.append(self.store.get_approval(self.answer_prompts[replied_to]))
+        elif replied_to:
+            candidates.append(self.store.approval_for_card(replied_to))
+        if not replied_to and self.last_gap_card:
+            candidates.append(self.store.get_approval(self.last_gap_card))
+        for approval in candidates:
+            if approval and approval["status"] == "open" and reply_gaps(approval):
+                return approval
+        return None
+
+    def _answer_gap(self, message: dict, text: str) -> bool:
+        """Fill a reply card's gap from the owner's answer. False if the message wasn't an answer."""
+
+        approval = self._gap_card_for(message)
+        if not approval:
+            return False
+        try:
+            self.api.call("sendChatAction", chat_id=self.owner_chat_id, action="typing")
+        except Exception as exc:
+            logger.info("Could not show typing: %s", exc)
+
+        payload = approval["payload"]
+        draft = payload.get("body") if approval["type"] == "send_email" else (payload.get("reply") or {}).get("body", "")
+        filled = fill_gaps(draft, payload.get("question", ""), text)
+        if not filled.is_answer:
+            return False  # an instruction sent after the card: handled as usual
+
+        new_id = fill_reply(approval["id"], filled.body, filled.still_missing, self.store)
+        if new_id is None:
+            self.send("That reply was already handled, so I left it as it was.")
+            return True
+        self.last_gap_card = None
+        if approval.get("card_message_id"):
+            old = self.store.get_approval(approval["id"]) or approval
+            self._edit_message(
+                self.owner_chat_id, approval["card_message_id"],
+                f"{card_text(old)}\n\n✏️ <i>Filled in with your answer. The updated reply is below.</i>",
+            )
+        self.notify_approvals()
+        return True
 
     def _last_reply(self) -> str:
         replies = [m.content for m in self.history if isinstance(m, AIMessage)]
@@ -423,11 +691,12 @@ class Bot:
         except Exception as exc:
             logger.warning("Could not set the command menu: %s", exc)
 
-    def _run_instruction(self, text: str) -> None:
+    def _run_instruction(self, text: str, received_at: datetime | None = None) -> None:
         self.api.call("sendChatAction", chat_id=self.owner_chat_id, action="typing")
         self._note_decisions()
         context = format_anchor(get_context_anchor(self.owner_chat_id, self.store))
-        result = handle_owner_command(text, history=self.history, context=context)
+        kwargs = {"received_at": received_at} if received_at else {}
+        result = handle_owner_command(text, history=self.history, context=context, **kwargs)
 
         # One message per intent (answer / done / problem), then the approval cards, then any
         # question. Nothing at all when the cards say it all (no "I have sent an approval request").
@@ -586,12 +855,18 @@ class Bot:
         lines = ["📊 <b>Socio status</b>", ""]
         lines.append("<b>Email outcomes:</b> " + (esc(", ".join(f"{k} {v}" for k, v in sorted(counts.items()))) or "none yet"))
         lines.append(f"<b>Open approval requests:</b> {len(self.store.pending_approvals())} (/approvals to show)")
-        lines.append(f"<b>Active calendar holds:</b> {len(self.store.active_slot_holds())}")
         lines.append(f"<b>Open tasks I'm keeping an eye on:</b> {len(self.store.tracked_tasks('open'))}")
         lines.append(f"<b>Scheduled routines:</b> {len(self.store.scheduled_jobs())} (/schedules)")
         interrupted = self.store.interrupted_supervisor_runs()
         if interrupted:
             lines.append(f"<b>Instructions stopped by a restart</b> (not re-run): {len(interrupted)}")
+        stuck = self.store.stuck_approvals()
+        if stuck:
+            # Never retried: it may have gone through (an email may already be sent).
+            lines.append(
+                f"<b>Approved actions cut off by a restart:</b> {len(stuck)} "
+                "(check Gmail / Calendar: they may or may not have happened)"
+            )
         if memory_enabled():
             lines.append(f"<b>Memories:</b> {SemanticMemory(self.store).count()} (/memories); <b>skills:</b> {len(skill_store.list_skills())} (/skills)")
         # Raw failure messages hold internal details: only a count goes to the chat.
@@ -609,6 +884,8 @@ class Bot:
             timeout=long_poll_seconds,
             allowed_updates=["message", "callback_query"],
         )
+        if self.pending_edits:  # Telegram is reachable again: catch up on card updates
+            self._retry_card_edits()
 
         for update in updates:
             self.offset = update["update_id"] + 1
@@ -651,6 +928,19 @@ class Bot:
                 self.notify_approvals()
             except Exception as exc:
                 self._report_error(report_failure(exc, "telegram.notify_approvals", html=True))
+
+        if time.monotonic() >= self.next_maintenance:
+            self.next_maintenance = time.monotonic() + MAINTENANCE_SECONDS
+            self.maintain_database()
+
+    def maintain_database(self) -> None:
+        """Fold the SQLite WAL file back into the database (quiet; failures only logged)."""
+
+        try:
+            result = self.store.checkpoint()
+            logger.info("Database checkpoint: %s", result)
+        except Exception as exc:
+            report_failure(exc, "telegram.db_checkpoint")
 
     def _report_error(self, text: str) -> None:
         """Send a predefined gateway status card (never raw exception text)."""

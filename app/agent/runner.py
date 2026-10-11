@@ -13,12 +13,14 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from email.utils import parseaddr
 from typing import Any
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
 
+from app.agent import clock
 from app.agent.decision import decide_reply_needed
 from app.agent.followups import complete_followup_task, create_followup_task
 from app.agent.graph import create_agent_graph
@@ -63,6 +65,15 @@ def _latest_inbound(thread: list[dict]) -> dict | None:
         if "SENT" not in email.get("label_ids", []):
             return email
     return None
+
+
+def _thread_file_ids(thread: list[dict]) -> list[str]:
+    """Drive ids of the Google Docs / Sheets / Slides linked anywhere in the thread."""
+
+    from app.files.drive import _file_id_from_reference
+    from app.workspace.sharing import links_in_text
+
+    return sorted({_file_id_from_reference(url) for email in thread for url in links_in_text(email.get("body", ""))})
 
 
 def _thread_transcript(thread: list[dict]) -> str:
@@ -158,8 +169,13 @@ def _outcome_status(actions: list[dict], failures: list[str]) -> str:
 
 
 def handle_message(message_id: str, thread_id: str, *, dry_run: bool = False, store: AgentStateStore | None = None) -> MessageOutcome:
-    """Run the full loop for one email."""
+    """Run the full loop for one email (one frozen "today" for triage and agent, app.agent.clock)."""
 
+    with clock.frozen():
+        return _handle_message(message_id, thread_id, dry_run=dry_run, store=store)
+
+
+def _handle_message(message_id: str, thread_id: str, *, dry_run: bool, store: AgentStateStore | None) -> MessageOutcome:
     store = store or AgentStateStore()
     outcome = MessageOutcome(message_id=message_id, thread_id=thread_id)
 
@@ -228,6 +244,8 @@ def handle_message(message_id: str, thread_id: str, *, dry_run: bool = False, st
                     "target_subject": target.get("subject", ""),
                     "reply_recipient": target.get("reply_to") or target.get("from", ""),
                     "participants": sorted(thread_participants(thread)),
+                    "thread_last_message_id": thread[-1].get("id", ""),
+                    "thread_file_ids": _thread_file_ids(thread),
                     "dry_run": dry_run,
                 },
                 config={"recursion_limit": AGENT_RECURSION_LIMIT},
@@ -321,6 +339,57 @@ def process_inbox(query: str = DEFAULT_QUERY, max_messages: int = 10, dry_run: b
         store.release_lock(INBOX_LOCK, holder)
 
 
+RECHECKED_ALREADY = "already_handled"
+
+
+def recheck_stale_approval(approval_id: int, store: AgentStateStore | None = None) -> MessageOutcome:
+    """
+    The Re-check button on a stale card (the thread or the slot changed before the owner tapped).
+
+    Re-reads the email's thread and handles its newest incoming message again, so a fresh
+    card reflects the conversation as it is now. If that newest message is a newer email that
+    an inbox check already handled, it is not handled twice (status RECHECKED_ALREADY).
+    Holds the inbox lock like an inbox run; returns BUSY_STATUS when one is in progress (the
+    card stays stale, so the owner can tap again). A second tap does nothing.
+    """
+
+    store = store or AgentStateStore()
+    approval = store.get_approval(approval_id)
+    if not approval or approval["status"] != "stale" or not approval.get("thread_id"):
+        return MessageOutcome("-", status=RECHECKED_ALREADY, reason="Nothing to re-check.")
+
+    thread_id = approval["thread_id"]
+    holder = f"pid {os.getpid()} {uuid4().hex[:8]}"
+    if not store.acquire_lock(INBOX_LOCK, holder):
+        return MessageOutcome("-", thread_id, status=BUSY_STATUS, reason="I'm checking your inbox right now. Tap Re-check again in a minute.")
+
+    try:
+        if not store.claim_stale_approval(approval_id):
+            return MessageOutcome("-", thread_id, status=RECHECKED_ALREADY, reason="This was already re-checked.")
+        try:
+            return _recheck(approval, thread_id, store)
+        except BaseException:
+            # Nothing new was proposed (Google or the AI failed): keep the button usable.
+            store.finish_approval(approval_id, "stale", approval.get("resolution") or "", approval.get("result"))
+            raise
+    finally:
+        store.release_lock(INBOX_LOCK, holder)
+
+
+def _recheck(approval: dict, thread_id: str, store: AgentStateStore) -> MessageOutcome:
+    thread = get_thread_details(thread_id)
+    target = _latest_inbound(thread)
+    if target is None:
+        return MessageOutcome("-", thread_id, status="no_action", reason="Every message in this thread was sent by you.")
+    newer = target["id"] != approval.get("message_id")
+    if newer and store.is_processed(target["id"]):
+        return MessageOutcome(target["id"], thread_id, status=RECHECKED_ALREADY, reason="The newer email was already handled.")
+    store.reopen_message(target["id"])
+    if newer and approval.get("message_id"):
+        store.mark_processed(approval["message_id"], thread_id, status="superseded", summary=f"Handled via newer message {target['id']}")
+    return handle_message(target["id"], thread_id, store=store)
+
+
 def _process_inbox(store: AgentStateStore, query: str, max_messages: int, dry_run: bool, renew_lock=None) -> list[MessageOutcome] | None:
     """The inbox run itself. Returns None if the lock was lost before any email was handled."""
 
@@ -388,7 +457,9 @@ def _process_inbox(store: AgentStateStore, query: str, max_messages: int, dry_ru
     return outcomes
 
 
-def handle_owner_command(text: str, *, dry_run: bool = False, history: list | None = None, context: str = "") -> OwnerCommandResult:
+def handle_owner_command(
+    text: str, *, dry_run: bool = False, history: list | None = None, context: str = "", received_at: datetime | None = None,
+) -> OwnerCommandResult:
     """
     Run a direct instruction from the owner (e.g. a Telegram message).
 
@@ -397,7 +468,8 @@ def handle_owner_command(text: str, *, dry_run: bool = False, history: list | No
     Multi-part instructions are split across worker subagents by the supervisor
     (app.agent.supervisor); single tasks run the owner-mode agent directly.
     history is optional earlier HumanMessage/AIMessage turns for context; context is the
-    chat's <active_context> block (app.memory.context_anchor).
+    chat's <active_context> block (app.memory.context_anchor). received_at (when the owner sent
+    it) fixes "today" for the whole request (app.agent.clock); default: now.
     """
 
-    return handle_owner_request(text, dry_run=dry_run, history=history, context=context)
+    return handle_owner_request(text, dry_run=dry_run, history=history, context=context, received_at=received_at)

@@ -42,8 +42,9 @@ GOOGLE_FILE_URL = re.compile(r"https://docs\.google\.com/(?:spreadsheets|documen
 # Where the model marked the link in the email body: [link], [LINK], [Link to the sheet],
 # {link}, {{url}}, <link>, [Google Sheet URL] ... (short, one line; not a Markdown "[text](url)").
 _WORD = r"\b(?:link|url|hyperlink)\b"
+# "[OWNER: ...]" is a gap only the owner fills, never a link spot, even if it says "link".
 LINK_PLACEHOLDER = re.compile(
-    rf"\[[^\[\]\n]{{0,40}}?{_WORD}[^\[\]\n]{{0,40}}?\](?!\()"
+    rf"\[(?!OWNER:)[^\[\]\n]{{0,40}}?{_WORD}[^\[\]\n]{{0,40}}?\](?!\()"
     rf"|\{{\{{?[^{{}}\n]{{0,40}}?{_WORD}[^{{}}\n]{{0,40}}?\}}\}}?"
     rf"|<[^<>\n]{{0,40}}?{_WORD}[^<>\n]{{0,40}}?>",
     re.IGNORECASE,
@@ -172,6 +173,41 @@ def shareable_file(reference: str) -> dict[str, Any]:
             "You can share it from Google Drive."
         )
     return {"id": file["id"], "name": file.get("name", ""), "url": file.get("webViewLink", "")}
+
+
+# Drive permission role -> the owner's word, and how much each allows (to compare).
+ROLE_NAMES = {"owner": "owner", "writer": "editor", "fileOrganizer": "editor", "organizer": "editor",
+              "commenter": "commenter", "reader": "viewer"}
+ROLE_RANK = {"viewer": 1, "commenter": 2, "editor": 3, "owner": 4}
+
+
+def current_access(file_id: str, email: str) -> str | None:
+    """
+    The access one person already has to a file Socio created ("editor", "commenter",
+    "viewer", "owner"), or None. "Anyone with the link" counts for everyone. Read-only.
+    """
+
+    address = validate_recipient(email)
+    permissions = execute_with_retry(
+        get_drive_service().permissions().list(fileId=file_id, fields="permissions(type, role, emailAddress)"),
+        operation_name="drive_list_permissions",
+    ).get("permissions", [])
+    best = None
+    for permission in permissions:
+        applies = permission.get("type") == "anyone" or (
+            permission.get("type") == "user" and (permission.get("emailAddress") or "").lower() == address
+        )
+        role = ROLE_NAMES.get(permission.get("role", ""))
+        if applies and role and (best is None or ROLE_RANK[role] > ROLE_RANK[best]):
+            best = role
+    return best
+
+
+def has_access(file_id: str, email: str, role: str) -> str | None:
+    """The access the person has if it is at least `role`, else None."""
+
+    have = current_access(file_id, email)
+    return have if have and ROLE_RANK[have] >= ROLE_RANK[validate_role(role)] else None
 
 
 def share_file(file_id: str, email: str, role: str = "editor", notify: bool = True) -> dict[str, Any]:

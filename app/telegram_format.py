@@ -25,8 +25,11 @@ from app.agent.approvals import (
     EMAIL_TYPES,
     EXECUTABLE_TYPES,
     SHARE_TYPES,
+    GAP_MARKER,
+    clock_12,
     format_time,
     invitees,
+    reply_gaps,
 )
 from app.calendar.events import parse_ist
 from app.workspace.sharing import with_link, with_links
@@ -40,7 +43,7 @@ EXPANDABLE_AFTER = 600  # longer quotes start collapsed
 # The /help card and Telegram's "/" suggestion menu (setMyCommands) both come from this list.
 BOT_COMMANDS = [
     ("run", "", "Trigger immediate inbox check"),
-    ("status", "", "Inspect active holds, pending approvals & system health"),
+    ("status", "", "What's waiting for you and how Socio is doing"),
     ("approvals", "", "Review pending decision cards"),
     ("memories", "", "View your saved rules and standing preferences"),
     ("schedules", "", "See or cancel your scheduled routines"),
@@ -91,8 +94,8 @@ I triage your inbox, coordinate your calendar, and manage your documents with st
 • Prepares professional context-aware replies for your 1-tap review.
 
 📅 <b>Calendar &amp; Meeting Coordination</b>
-• Identifies scheduling requests and locates free windows (11:00–16:00 IST).
-• Places local 24-hr soft-holds on proposed slots to prevent double-booking.
+• Identifies scheduling requests and finds free times (11 AM–4 PM IST).
+• Never offers the same time to two people while you decide.
 • Books, reschedules, or moves events only after explicit authorization.
 
 📁 <b>Workspace &amp; File Actions</b>
@@ -257,15 +260,18 @@ def _pretty_date(value: str) -> str:
 
 
 def slot_text(start: str | None, end: str | None) -> str:
-    """'Fri 16 Oct, 11:00–11:30 (IST)' (both dates shown if the slot spans midnight)."""
+    """'Fri 16 Oct, 3:00–3:30 PM IST' (12-hour; both dates shown if the slot spans midnight)."""
 
     try:
         first, last = parse_ist(start or ""), parse_ist(end or "")
     except ValueError:
         return f"{format_time(start)} – {format_time(end)}"
     if first.date() == last.date():
-        return f"{first:%a %d %b, %H:%M}–{last:%H:%M} (IST)"
-    return f"{first:%a %d %b, %H:%M} – {last:%a %d %b, %H:%M} (IST)"
+        start_text = clock_12(first)
+        if (first.hour < 12) == (last.hour < 12):  # same half of the day: "3:00–3:30 PM"
+            start_text = start_text[:-3]
+        return f"{first:%a %d %b}, {start_text}–{clock_12(last)} IST"
+    return f"{first:%a %d %b}, {clock_12(first)} – {last:%a %d %b}, {clock_12(last)} IST"
 
 
 def _field(label: str, value: Any) -> str:
@@ -351,10 +357,12 @@ def _buttons(approval: dict[str, Any]) -> list:
     def button(text: str, action: str) -> dict:
         return {"text": text, "callback_data": f"{action}:{approval_id}"}
 
+    if kind in EMAIL_TYPES and reply_gaps(approval):  # nothing to send until the owner fills the gap
+        return [[button("💬 Answer", "answer")], [button("✏️ Edit in Gmail", "draft"), button("❌ Reject", "reject")]]
     if kind in EMAIL_TYPES:
         return [[button("✅ Approve & Send", "approve"), button("✏️ Edit in Gmail", "draft")], [button("❌ Reject", "reject")]]
     if kind not in EXECUTABLE_TYPES:
-        return [[button("✔️ Mark done", "approve")]]
+        return [[button("✔️ Done", "approve")]]
     approve_label = {
         "trash_email": "🗑️ Approve & Trash",
         "book_meeting": "✅ Approve & Book",
@@ -393,12 +401,12 @@ def _follow_up(payload: dict[str, Any]) -> list[str]:
     return ["", _field("Then reply to", reply.get("to")), quote(reply.get("body"))]
 
 
-def _reason(payload: dict[str, Any]) -> list[str]:
-    return [_field("Reason", payload["reason"])] if payload.get("reason") else []
-
-
-def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
-    """One approval request as an HTML card (without buttons)."""
+def card_text(approval: dict[str, Any]) -> str:
+    """
+    One approval request as an HTML card (without buttons). Only what the owner decides on:
+    no reason line and no hold status (developer decision 2026-10-11; a proposed slot is
+    still held in the background, see app.calendar.holds). Times are 12-hour.
+    """
 
     payload = approval.get("payload") or {}
     kind = approval.get("type")
@@ -409,7 +417,7 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
             f"{title}", "",
             _field("Subject", payload.get("subject") or "(no subject)"),
             _field("From", payload.get("sender")),
-            *_reason(payload), "",
+            "",
             "<i>Note: Recoverable from Gmail Trash for 30 days.</i>",
         ]
     elif kind in EMAIL_TYPES:
@@ -417,14 +425,22 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
         to = payload.get("to") if kind == "send_email" else reply.get("to")
         subject = payload.get("subject") if kind == "send_email" else reply.get("subject")
         body = payload.get("body") if kind == "send_email" else reply.get("body")
-        lines = ["✉️ <b>Outgoing Email Proposal</b>", "", _field("To", to or "the sender")]
+        gaps = reply_gaps(approval)
+        lines = ["✉️ <b>Reply Needs Your Input</b>" if gaps else "✉️ <b>Outgoing Email Proposal</b>", "",
+                 _field("To", to or "the sender")]
         if subject or kind == "send_email":
             lines.append(_field("Subject", subject or "(no subject)"))
         lines += _link_lines(payload)
         if payload.get("attachments"):
             lines.append(_field("Files", ", ".join(a["name"] for a in payload["attachments"])))
-        # The message exactly as it will be sent: a Google file's real link where it goes.
-        lines += ["", "<b>Draft:</b>", quote(with_links(body, payload.get("links") or []))]
+        if gaps:
+            lines += ["", f"❓ <b>{esc(gap_question(approval))}</b>"]
+        # The message exactly as it will be sent: a Google file's real link where it goes; a gap
+        # shows as a blank to fill in, never as the raw "[OWNER: ...]" marker.
+        draft = quote(with_links(body, payload.get("links") or []))
+        lines += ["", "<b>Draft:</b>", GAP_MARKER.sub(GAP_BLANK, draft)]
+        if gaps:
+            lines.append("<i>Tap 💬 Answer and type it; I'll fill in the blank. Or finish it yourself with Edit in Gmail.</i>")
     elif kind == "book_meeting":
         lines = [
             "📅 <b>Meeting Proposal</b>", "",
@@ -434,9 +450,7 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
         ]
         if payload.get("meeting_link"):
             lines.append(_field("Link", payload["meeting_link"]))
-        if hold_active:
-            lines.append("<b>Hold Status:</b> Local 24h soft-hold active")
-        lines += _reason(payload) + _follow_up(payload)
+        lines += _follow_up(payload)
     elif kind == "move_event":
         lines = [
             "🔁 <b>Move Meeting</b>", "",
@@ -445,16 +459,14 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
             _field("To", slot_text(payload.get("new_start"), payload.get("new_end"))),
             _field("Attendees notified", ", ".join(payload.get("other_attendees", [])) or "none"),
         ]
-        if hold_active:
-            lines.append("<b>Hold Status:</b> Local 24h soft-hold active")
-        lines += _reason(payload) + _follow_up(payload)
+        lines += _follow_up(payload)
     elif kind == "cancel_event":
         lines = [
             "🚫 <b>Cancel Meeting</b>", "",
             _field("Title", payload.get("title")),
             _field("When", format_time(payload.get("old_start"))),
             _field("Attendees notified", ", ".join(payload.get("other_attendees", [])) or "none"),
-            *_reason(payload), *_follow_up(payload),
+            *_follow_up(payload),
         ]
     elif kind in DOCUMENT_TYPES:
         lines = ["📝 <b>Workspace Update</b>", ""]
@@ -477,7 +489,7 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
                 f"+ {header[i] if i < len(header) and header[i] else f'column {i + 1}'}: {value}"
                 for i, value in enumerate(payload.get("values") or [])
             ]
-        lines += [_pre(diff), *_reason(payload)]
+        lines.append(_pre(diff))
     elif kind == "create_and_share":
         sheet = payload.get("kind") == "spreadsheet"
         lines = [
@@ -500,8 +512,11 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
             "🔗 <b>Share File</b>", "",
             f"• {_field('File', payload.get('title'))}",
             f"• {_field('Recipient', payload.get('recipient'))} ({esc(str(payload.get('role') or 'editor').capitalize())})",
-            "<i>Google emails them the link.</i>",
         ]
+        if payload.get("reply"):
+            lines += _follow_up(payload)
+        else:
+            lines.append("<i>Google emails them the link.</i>")
     elif kind == "create_task":
         lines = [
             "📌 <b>New Task</b>", "",
@@ -511,7 +526,6 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
             lines.append(_field("Due", payload["due"]))
         if payload.get("notes"):
             lines.append(_field("Notes", _short(payload["notes"], 600)))
-        lines += _reason(payload)
     elif kind == "close_old_reminders":
         lines = [
             "🧹 <b>Tidy up old reminders?</b>", "",
@@ -534,7 +548,7 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
         ]
         if payload.get("due"):
             lines.append(_field("Due", _pretty_date(payload["due"])))
-        lines += _reason(payload) + ["", "<i>You can reopen it in Google Tasks later.</i>"]
+        lines += ["", "<i>You can reopen it in Google Tasks later.</i>"]
     elif kind == "enable_skill_script":
         lines = [
             "🔐 <b>Trust Skill Script</b>", "",
@@ -545,15 +559,21 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
         ]
     elif kind == "review_draft":
         lines = [
-            "📝 <b>Draft Ready in Gmail</b>", "",
-            _field("What to check", payload.get("target") or approval.get("target")),
-            "<i>Edit and send it from Gmail Drafts, then tap Mark done.</i>",
+            "📝 <b>Reply Drafted in Gmail</b>", "",
         ]
+        if payload.get("sender"):
+            lines.append(_field("To", payload["sender"]))
+        if payload.get("subject"):
+            lines.append(_field("Subject", payload["subject"]))
+        lines.append(_field("You need to", payload.get("target") or approval.get("target")))
+        if payload.get("body"):
+            lines += ["", "<b>Draft:</b>", quote(payload["body"])]
+        lines.append("<i>Finish it in Gmail Drafts and send it from there, then tap Done.</i>")
     elif kind == "review_decision":
         lines = [
             "🤔 <b>Needs Your Decision</b>", "",
             _field("Subject", payload.get("subject") or "(no subject)"),
-            _field("Why", payload.get("reason")),
+            _field("What I'm unsure about", payload.get("reason")),
         ]
     else:
         lines = ["📌 <b>Approval needed</b>", "", esc(approval.get("target") or kind)]
@@ -561,7 +581,33 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
     return "\n".join(lines)
 
 
-def approval_card(approval: dict[str, Any], hold_active: bool = False) -> tuple[str, list]:
+def stale_notice(reason: str, recheck: bool) -> str:
+    """
+    What a card says when the owner approved it but the world changed first (nothing was done).
+    No <br>: Telegram HTML has none, so title and text are separated by a newline.
+    """
+
+    follow = (
+        "Tap Re-check and I'll read the conversation again and suggest what to do now."
+        if recheck else
+        "Ask me again if you still want it."
+    )
+    return f"⚠️ <b>Things changed since this was proposed</b>\n{esc(reason)}\n{follow}"
+
+
+# How a reply's gap looks on its card (the marker itself never shows).
+GAP_BLANK = "<b>✍️ ______</b>"
+
+
+def gap_question(approval: dict[str, Any]) -> str:
+    """What the owner is asked for a reply with gaps (the agent's question, else the gaps' hints)."""
+
+    gaps = reply_gaps(approval)
+    asked = ((approval.get("payload") or {}).get("question") or "").strip()
+    return asked or "; ".join(gap[7:-1].strip() for gap in gaps) or "What should go in the blank?"
+
+
+def approval_card(approval: dict[str, Any]) -> tuple[str, list]:
     """The card text and its inline keyboard for an open approval request."""
 
-    return card_text(approval, hold_active), _buttons(approval)
+    return card_text(approval), _buttons(approval)

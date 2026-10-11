@@ -81,6 +81,13 @@ def print_status() -> None:
     if interrupted_runs:
         print(f"\nInterrupted instructions (not re-run): {', '.join('#' + str(r['id']) for r in interrupted_runs)}")
 
+    stuck = store.stuck_approvals()
+    if stuck:
+        # Never retried automatically: the email / event change may already have happened.
+        print("\nApprovals cut off while running (check Gmail / Calendar before doing them again):")
+        for approval in stuck:
+            print(f"  #{approval['id']} [{approval['type']}] {approval['target']} (tapped {approval['locked_at']} UTC)")
+
     failures = store.failures()[:5]
     print(f"\nRecent failures: {len(failures)} shown")
     for failure in failures:

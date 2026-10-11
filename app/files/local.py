@@ -70,9 +70,48 @@ def _tokens(text: str) -> set[str]:
 
 SYNONYMS = {"resume": {"cv"}, "cv": {"resume"}}
 
+# Words that say what KIND of file it is, or are filler, not WHICH file: "send the sheet" names
+# no file, so it must not match "Socio test sheet" (developer test 2026-10-11: a random sheet was
+# offered for "could you send the sheet answers?").
+GENERIC_WORDS = {
+    "sheet", "sheets", "spreadsheet", "spreadsheets", "excel", "xls", "xlsx", "csv",
+    "doc", "docs", "document", "documents", "word", "docx", "pdf", "file", "files", "copy",
+    "google", "drive", "link", "attachment", "attached", "slides", "presentation", "ppt", "pptx",
+    "the", "my", "your", "our", "this", "that", "these", "those", "an", "of", "for", "to", "me",
+    "please", "send", "share", "can", "could", "you", "it", "with", "and", "or", "in", "on",
+}
+# The kind of file a request asks for: never a match on its own, but among files that match by
+# name, the right kind ranks first ("Socio test sheet" -> the sheet, not "Socio test doc").
+KIND_WORDS = {
+    "spreadsheet": {"sheet", "sheets", "spreadsheet", "spreadsheets", "excel", "xls", "xlsx", "csv"},
+    "document": {"doc", "docs", "document", "documents", "word", "docx"},
+    "pdf": {"pdf"},
+    "presentation": {"slides", "presentation", "ppt", "pptx"},
+}
+KIND_OF_TYPE = {"Google Sheet": "spreadsheet", "Google Doc": "document", "Google Slides": "presentation"}
+KIND_OF_EXTENSION = {".xls": "spreadsheet", ".xlsx": "spreadsheet", ".csv": "spreadsheet", ".doc": "document",
+                     ".docx": "document", ".odt": "document", ".rtf": "document", ".txt": "document", ".pdf": "pdf",
+                     ".ppt": "presentation", ".pptx": "presentation"}
+KIND_BONUS = 0.25
+
+
+def _asked_kinds(query: str) -> set[str]:
+    words = _tokens(query)
+    return {kind for kind, names in KIND_WORDS.items() if words & names}
+
+
+def _kind(name: str, google_type: str = "") -> str:
+    return KIND_OF_TYPE.get(google_type) or KIND_OF_EXTENSION.get(Path(name).suffix.lower(), "")
+
+
+NO_NAME_NOTE = (
+    "The request doesn't say which file: it only names a kind of file (sheet, doc, file...). "
+    "Nothing is offered; ask the sender which file they mean."
+)
+
 
 def _query_tokens(query: str) -> set[str]:
-    tokens = _tokens(query)
+    tokens = _tokens(query) - GENERIC_WORDS
     for token in list(tokens):
         tokens |= SYNONYMS.get(token, set())
     return tokens
@@ -88,6 +127,9 @@ def search_documents(query: str, max_results: int = 5) -> list[dict]:
     unavailable, a {"note": ...} entry explains why.
     """
 
+    if not _query_tokens(query):
+        return [{"note": NO_NAME_NOTE}]
+
     matches = search_local_files(query, max_results=max_results)
     notes = []
 
@@ -96,11 +138,14 @@ def search_documents(query: str, max_results: int = 5) -> list[dict]:
     if drive_available():
         try:
             query_tokens = _query_tokens(query)
+            asked = _asked_kinds(query)
 
             for document in search_drive(query_tokens, ALLOWED_EXTENSIONS):
                 name_score = len(query_tokens & _tokens(f"{document['folder']} {Path(document['name']).stem}"))
                 if name_score == 0 and folder_limited():
                     continue  # folder listing has no content search; keep only name matches
+                if name_score and _kind(document["name"], document.get("type", "")) in asked:
+                    name_score += KIND_BONUS
                 matches.append(
                     {
                         "path": document["path"],
@@ -130,6 +175,8 @@ def search_local_files(query: str, max_results: int = 5) -> list[dict]:
 
     query_tokens = _query_tokens(query)
     matches = []
+    if not query_tokens:  # only generic words ("the sheet"): no file is named
+        return matches
 
     for root in shareable_roots():
         for file_path in root.rglob("*"):
@@ -140,8 +187,10 @@ def search_local_files(query: str, max_results: int = 5) -> list[dict]:
             name_tokens = _tokens(str(relative.with_suffix("")))
             score = len(query_tokens & name_tokens)
 
-            if score == 0 and query_tokens:
+            if score == 0:
                 continue
+            if _kind(file_path.name) in _asked_kinds(query):
+                score += KIND_BONUS
 
             stat = file_path.stat()
             matches.append(

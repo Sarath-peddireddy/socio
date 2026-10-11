@@ -27,6 +27,7 @@ stay one at a time in app.agent.runner.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -41,9 +42,9 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from app.agent import clock
 from app.agent.approvals import merge_same_emails
-from app.agent.graph import AGENT_TOOLS, create_agent_graph
-from app.calendar.tools import INDIA_TZ
+from app.agent.graph import AGENT_TOOLS, EMAIL_ONLY_TOOLS, create_agent_graph
 from app.agent.llm import get_llm, invoke_llm
 from app.agent.prompts import CARDS_ONLY
 from app.agent.state import AgentStateStore
@@ -63,7 +64,7 @@ OWNER_RECURSION_LIMIT = 30
 # A rejected plan goes back to the planner once with the reason.
 PLAN_ATTEMPTS = 2
 # Tools a worker may be given (all owner-mode tools; gates still apply inside them).
-WORKER_TOOLS = {agent_tool.name for agent_tool in AGENT_TOOLS}
+WORKER_TOOLS = {agent_tool.name for agent_tool in AGENT_TOOLS} - EMAIL_ONLY_TOOLS
 
 # Only instructions that look like several jobs are worth a planning call.
 MULTI_PART = re.compile(
@@ -253,6 +254,7 @@ class PlannedTasks(BaseModel):
 PLANNER_PROMPT = """You are Socio's supervisor. You plan; you never act yourself.
 Return the plan for the owner's instruction: the full list of worker tasks, all at once.
 Today is {today} (India Standard Time).
+{temporal_anchor}
 
 CRITICAL ARCHITECTURAL RULE (§4c):
 You are a pure Coordinator and Dispatcher, NEVER a monolithic executor.
@@ -374,7 +376,8 @@ def plan_request(
 
     memory_block = "\n\n".join(block for block in (format_memories(memories or []), notes_block()) if block)
     system = PLANNER_PROMPT.format(
-        today=datetime.now(INDIA_TZ).strftime("%A %d %B %Y"),
+        today=clock.now().strftime("%A %d %B %Y"),
+        temporal_anchor=clock.temporal_anchor(),
         max_tasks=MAX_TASKS,
         tools=_tool_catalog(),
         memories=f"\n{memory_block}" if memory_block else "",
@@ -476,7 +479,8 @@ def run_plan(
                     del waiting[task_id]
                     upstream = {d: results[d] for d in task["depends_on"]}
                     store.update_worker_task(run_id, task_id, "running")
-                    running[pool.submit(worker, task, upstream, dry_run=dry_run)] = task_id
+                    # The request's frozen "now" (app.agent.clock) goes with it into the thread.
+                    running[pool.submit(contextvars.copy_context().run, worker, task, upstream, dry_run=dry_run)] = task_id
 
             if not running:
                 if waiting:  # cannot happen for a validated DAG; never spin
@@ -881,14 +885,24 @@ def handle_owner_request(
     history: list | None = None,
     store: AgentStateStore | None = None,
     context: str = "",
+    received_at: datetime | None = None,
 ) -> OwnerCommandResult:
     """
     Plan, fan out, fan in, report. Questions and one-task requests run the single agent.
 
     context is the chat's <active_context> block (app.memory.context_anchor). It reaches the
     single agent and the planner; workers never see it (or the history), only their task.
+    received_at is when the owner sent it (the Telegram message's timestamp): every prompt of
+    this request resolves "today" / "tomorrow" against it (app.agent.clock).
     """
 
+    with clock.frozen(received_at):
+        return _handle_owner_request(text, dry_run=dry_run, history=history, store=store, context=context)
+
+
+def _handle_owner_request(
+    text: str, *, dry_run: bool, history: list | None, store: AgentStateStore | None, context: str,
+) -> OwnerCommandResult:
     store = store or AgentStateStore()
     memories = recall(text, store=store)
     skills = find_skills(text) if is_action_request(text) else []

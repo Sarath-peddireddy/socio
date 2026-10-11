@@ -12,7 +12,7 @@ from typing_extensions import TypedDict
 from app.agent.llm import SUPERVISOR, WORKER, get_llm, invoke_llm
 from app.agent.prompts import build_system_prompt
 from app.agent.state import AgentStateStore
-from app.agent.approvals import describe
+from app.agent.approvals import GAP_MARKER, describe
 from app.agent.tools import (
     append_sheet_row,
     append_to_document,
@@ -33,6 +33,7 @@ from app.agent.tools import (
     propose_cancel_calendar_event,
     propose_complete_task,
     propose_create_task,
+    propose_file_access,
     propose_move_calendar_event,
     propose_trash_email,
     remember_rule,
@@ -78,6 +79,7 @@ AGENT_TOOLS = [
     create_spreadsheet,
     create_and_share_file,
     share_drive_file,
+    propose_file_access,
     list_tasks,
     propose_create_task,
     propose_complete_task,
@@ -135,8 +137,9 @@ OWNER_GATED_TOOLS = {
 }
 
 # Tools that run directly when allowed and otherwise return {"proposal": ...}
-# (an owner-written skill script runs only once its exact content is approved).
-CONDITIONAL_PROPOSAL_TOOLS = {"run_skill_script"}
+# (an owner-written skill script runs only once its exact content is approved; a file
+# access request needs a card only if the person doesn't have that access yet).
+CONDITIONAL_PROPOSAL_TOOLS = {"run_skill_script", "propose_file_access"}
 
 # Supervisor workers run in parallel threads: checking a slot against the holds and
 # recording a new hold must happen as one step.
@@ -158,7 +161,12 @@ EMAIL_MODE_TOOLS = {
     "propose_book_meeting",
     "propose_move_calendar_event",
     "propose_cancel_calendar_event",
+    "propose_file_access",
 }
+
+# Only for an incoming email (the owner shares with share_drive_file); not bound in owner mode
+# or for workers, so their prompts stay smaller.
+EMAIL_ONLY_TOOLS = {"propose_file_access"}
 
 
 def _is_email_mode(state: "AgentState") -> bool:
@@ -169,6 +177,8 @@ def _allowed_tools(state: "AgentState") -> list:
     tools = AGENT_TOOLS
     if _is_email_mode(state):
         tools = [agent_tool for agent_tool in tools if agent_tool.name in EMAIL_MODE_TOOLS]
+    else:
+        tools = [agent_tool for agent_tool in tools if agent_tool.name not in EMAIL_ONLY_TOOLS]
     # A supervisor worker only gets the tools its task was given.
     if state.get("tools_allowed") is not None:
         tools = [agent_tool for agent_tool in tools if agent_tool.name in set(state["tools_allowed"])]
@@ -188,6 +198,10 @@ class AgentState(TypedDict, total=False):
     target_subject: str
     reply_recipient: str
     participants: list[str]
+    # Newest message in the thread when the agent started: approval checks whether it changed.
+    thread_last_message_id: str
+    # Drive file ids of the Google Docs / Sheets linked in the thread (propose_file_access).
+    thread_file_ids: list[str]
     dry_run: bool
 
     # Set by the supervisor for a worker subagent (owner mode, restricted tools).
@@ -236,7 +250,7 @@ def _action_target(tool_name: str, args: dict[str, Any]) -> str:
         return args.get("to", "")
     if tool_name in {"create_document", "create_spreadsheet", "create_and_share_file"}:
         return args.get("title", "")
-    if tool_name == "share_drive_file":
+    if tool_name in {"share_drive_file", "propose_file_access"}:
         return args.get("file", "")
     if tool_name == "append_to_document":
         return args.get("document", "")
@@ -276,6 +290,20 @@ def _scope_violation(tool_name: str, args: dict[str, Any], state: AgentState) ->
             return (
                 f"Refused: {', '.join(outsiders)} {'is' if len(outsiders) == 1 else 'are'} not part of this conversation, "
                 "so they cannot be invited."
+            )
+
+    # Access is only given to someone in this conversation, and only to a file already
+    # linked in it (an email cannot ask for any other file of the owner's).
+    if tool_name == "propose_file_access" and target_thread_id:
+        from app.files.drive import _file_id_from_reference
+
+        asker = {address.lower() for _, address in getaddresses([args.get("email") or ""]) if address}
+        if not asker or not asker <= participants:
+            return "Refused: access can only be given to someone in this conversation."
+        if _file_id_from_reference(args.get("file") or "") not in set(state.get("thread_file_ids") or []):
+            return (
+                "Refused: that file's link is not in this conversation, so access to it cannot be "
+                "granted from an email. Use create_reply_draft."
             )
 
     # The held reply always goes to the runner's recipient; still refuse (and log)
@@ -332,6 +360,15 @@ def _real_line_breaks(args: dict[str, Any]) -> dict[str, Any]:
         if isinstance(fixed.get(field), str):
             fixed[field] = fixed[field].replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
     return fixed
+
+
+def _as_reply_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """create_reply_draft's arguments in send_gmail_reply's shape (one attachment -> a list)."""
+
+    if tool_name != "create_reply_draft":
+        return args
+    path = (args.get("attachment_path") or "").strip()
+    return {**args, "attachment_paths": [path] if path else []}
 
 
 def _reply_proposal(args: dict[str, Any]) -> dict[str, Any]:
@@ -451,6 +488,7 @@ def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any
         proposal["reply"] = {
             "thread_id": thread_id, "message_id": message_id, "to": to,
             "subject": subject, "body": proposal.pop("reply_body"),
+            "last_seen_message_id": thread[-1].get("id", "") if thread else "",
         }
         proposal.pop("reason", None)
         return proposal
@@ -594,6 +632,7 @@ def _record_proposal(
                 "to": state.get("reply_recipient", ""),
                 "subject": state.get("target_subject", ""),
                 "body": reply_body,
+                "last_seen_message_id": state.get("thread_last_message_id", ""),
             }
 
     summary = describe({"type": kind, "payload": proposal})
@@ -708,13 +747,20 @@ def execute_tools(state: AgentState):
             tool_results.append(_tool_message(refusal, tool_call))
             continue
 
-        # In email mode, every reply waits for the owner's approval; in owner mode,
-        # emails and Docs/Sheets writes do.
-        gated = tool_name == "send_gmail_reply" if _is_email_mode(state) else tool_name in OWNER_GATED_TOOLS
+        # In email mode, every reply waits for the owner's approval (a "draft" too: it becomes
+        # the same card, and the owner answers its [OWNER: ...] question in chat instead of
+        # opening Gmail); in owner mode, emails and Docs/Sheets writes do.
+        email_reply = tool_name in {"send_gmail_reply", "create_reply_draft"}
+        gated = email_reply if _is_email_mode(state) else tool_name in OWNER_GATED_TOOLS
         if gated:
             args = _real_line_breaks(args)
             try:
-                proposal = _reply_proposal(args) if _is_email_mode(state) else _owner_write_proposal(tool_name, args)
+                if _is_email_mode(state):
+                    proposal = _reply_proposal(_as_reply_args(tool_name, args))
+                    if tool_name == "create_reply_draft" and GAP_MARKER.search(proposal["reply_body"]):
+                        proposal["question"] = (args.get("reason") or "").strip()
+                else:
+                    proposal = _owner_write_proposal(tool_name, args)
             except Exception as exc:
                 failures.append(f"{tool_name}: {exc}")
                 if not isinstance(exc, ValueError):
@@ -795,6 +841,10 @@ def execute_tools(state: AgentState):
                 "draft_id": result.get("draft_id"),
                 "message_id": args.get("message_id"),
                 "thread_id": args.get("thread_id"),
+                # The card shows the draft itself, so the owner doesn't open Gmail just to read it.
+                "subject": state.get("target_subject", ""),
+                "sender": state.get("reply_recipient", ""),
+                "body": args.get("body", ""),
             }
             store.add_pending_approval(
                 "review_draft",

@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "agent_state.sqlite3"
@@ -44,12 +45,35 @@ class AgentStateStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """
+        A short-lived connection: commits (or rolls back) and is closed when the block
+        ends, so no process keeps a transaction or a read snapshot open between calls
+        (an open reader stops SQLite from emptying the WAL file).
+        """
+
         # The bot and the CLI can run at the same time: wait for a writer instead of
         # failing with "database is locked".
         conn = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_SECONDS)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            # Safe with WAL (a power cut can lose the last commit, never corrupt the file).
+            conn.execute("PRAGMA synchronous=NORMAL")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def checkpoint(self) -> dict[str, int]:
+        """
+        Copy the WAL file into the database and truncate it (maintenance, bot start + daily).
+        busy = 1 means another connection was reading and part of it stays for next time.
+        """
+
+        with self._connect() as conn:
+            busy, wal_pages, moved = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        return {"busy": busy, "wal_pages": wal_pages, "checkpointed": moved}
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -354,6 +378,18 @@ class AgentStateStore:
         # Equality column first: "is_active = 1 AND next_run_at <= ?" is one index range scan.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_next_run ON scheduled_jobs (is_active, next_run_at)")
 
+    @classmethod
+    def _migrate_v7_approval_locks(cls, conn: sqlite3.Connection) -> None:
+        """When a tap claimed an approval (status 'executing'), to spot one a crash left half-done."""
+
+        cls._ensure_column(conn, "pending_approvals", "locked_at", "TEXT")
+
+    @classmethod
+    def _migrate_v8_card_messages(cls, conn: sqlite3.Connection) -> None:
+        """The Telegram message showing each card, so a reply to that message reaches its card."""
+
+        cls._ensure_column(conn, "pending_approvals", "card_message_id", "INTEGER")
+
     # ----- processed messages -------------------------------------------------
 
     def mark_processed(self, message_id: str, thread_id: str | None = None, status: str = "processed", summary: str | None = None, metadata: dict[str, Any] | None = None) -> None:
@@ -421,6 +457,12 @@ class AgentStateStore:
                 "SELECT * FROM processed_messages WHERE message_id = ?", (message_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    def reopen_message(self, message_id: str) -> None:
+        """Forget an email's outcome so it is handled again from scratch (Re-check of a stale card)."""
+
+        with self._connect() as conn:
+            conn.execute("DELETE FROM processed_messages WHERE message_id = ?", (message_id,))
 
     def is_processed(self, message_id: str) -> bool:
         """True when the message reached a final outcome and must not be handled again."""
@@ -532,17 +574,49 @@ class AgentStateStore:
         return approval
 
     def claim_approval(self, approval_id: int) -> bool:
-        """Atomically move an open approval to 'executing'. False if it was already decided."""
+        """
+        Atomically move an open approval to 'executing'. False if it was already decided or
+        another tap (a double tap, a repeated Telegram update, the CLI) got there first.
+        """
 
         with self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE pending_approvals SET status = 'executing' WHERE id = ? AND status = 'open'",
+                "UPDATE pending_approvals SET status = 'executing', locked_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND status = 'open'",
                 (approval_id,),
             )
             return cursor.rowcount > 0
 
+    def claim_stale_approval(self, approval_id: int) -> bool:
+        """Move a stale approval to 'rechecked' (Re-check button). False if that already happened."""
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE pending_approvals SET status = 'rechecked', decided_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND status = 'stale'",
+                (approval_id,),
+            )
+            return cursor.rowcount > 0
+
+    def stuck_approvals(self, minutes: int = 15) -> list[dict[str, Any]]:
+        """
+        Approvals still 'executing' long after the tap: the process stopped while carrying one
+        out, so it may or may not have happened. Never retried automatically (it may be a send).
+        """
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, action_type AS type, target, locked_at FROM pending_approvals "
+                "WHERE status = 'executing' AND locked_at IS NOT NULL AND locked_at <= datetime('now', ?) ORDER BY id",
+                (f"-{int(minutes)} minutes",),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def finish_approval(self, approval_id: int, status: str, resolution: str, result: Any = None) -> None:
-        """Record the final decision: 'approved', 'rejected', 'failed', or 'resolved'."""
+        """
+        Record the final decision: 'approved', 'rejected', 'failed', 'resolved', or 'stale'
+        (not carried out: the thread or the calendar changed since it was proposed).
+        """
 
         with self._connect() as conn:
             conn.execute(
@@ -590,9 +664,23 @@ class AgentStateStore:
             )
             return cursor.rowcount > 0
 
-    def mark_approval_notified(self, approval_id: int) -> None:
+    def mark_approval_notified(self, approval_id: int, card_message_id: int | None = None) -> None:
+        """The card was shown (card_message_id: the Telegram message that shows it)."""
+
         with self._connect() as conn:
-            conn.execute("UPDATE pending_approvals SET notified = 1 WHERE id = ?", (approval_id,))
+            conn.execute(
+                "UPDATE pending_approvals SET notified = 1, card_message_id = COALESCE(?, card_message_id) WHERE id = ?",
+                (card_message_id, approval_id),
+            )
+
+    def approval_for_card(self, card_message_id: int) -> dict[str, Any] | None:
+        """The approval shown by a Telegram message (newest if a message was reused)."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM pending_approvals WHERE card_message_id = ? ORDER BY id DESC LIMIT 1", (card_message_id,)
+            ).fetchone()
+        return self.get_approval(row["id"]) if row else None
 
     # ----- soft holds on calendar slots (see app.calendar.holds) -----------------
 
@@ -990,14 +1078,11 @@ class AgentStateStore:
         WAL a reader never waits for, or blocks, a writer.
         """
 
-        conn = self._connect()
-        try:
+        with self._connect() as conn:
             rows = conn.execute(
                 f"SELECT {self._JOB_COLUMNS} FROM scheduled_jobs WHERE is_active = 1 AND next_run_at <= ? ORDER BY next_run_at",
                 (now_utc,),
             ).fetchall()
-        finally:
-            conn.close()
         return [dict(row) for row in rows]
 
     def claim_scheduled_job(self, job_id: str, expected_next_run: str, ran_at: str, next_run_at: str | None, status: str) -> bool:
@@ -1051,5 +1136,7 @@ MIGRATIONS = [
     (4, AgentStateStore._migrate_v4_tracked_tasks),
     (5, AgentStateStore._migrate_v5_conversation_context),
     (6, AgentStateStore._migrate_v6_scheduled_jobs),
+    (7, AgentStateStore._migrate_v7_approval_locks),
+    (8, AgentStateStore._migrate_v8_card_messages),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]

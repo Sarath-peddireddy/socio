@@ -13,13 +13,24 @@ Fan-in contract: a worker never returns its conversation, only
 modified_entities come from what the tools actually recorded (never from the
 model's own claims), so a worker that crashes halfway still reports what changed.
 A crash is logged in full (app.errors); diff_summary only carries a fixed message.
+
+Time budget: every model call (60 s) and Google call (30 s) already has its own
+socket timeout, and a timed-out model call fails over to the next provider
+(app.agent.llm_router). On top of that a worker has a wall-clock budget
+(AGENT_WORKER_TIMEOUT, default 180 s), checked after every graph step: past it,
+the worker stops before its next model call or tool round and reports FAILED.
+Python threads cannot be killed, so a step already running finishes first (each
+step is bounded by the timeouts above). Independent workers carry on; tasks that
+depend on a stopped one are not started (supervisor.run_plan).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import time
 from typing import Any, Callable
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -31,6 +42,9 @@ from app.errors import plain_message, report_failure
 logger = logging.getLogger(__name__)
 
 WORKER_RECURSION_LIMIT = 20
+# Wall-clock budget per worker, in seconds (see the module docstring).
+WORKER_TIMEOUT_SECONDS = float(os.getenv("AGENT_WORKER_TIMEOUT", "180"))
+TIMEOUT_TEXT = "It took too long, so I stopped it. Please try this part again."
 MAX_DIFF_CHARS = 600
 MAX_UPSTREAM_CHARS = 1500
 # NEEDS_INPUT: the worker could not go on without the person's answer; diff_summary is
@@ -158,8 +172,12 @@ def run_worker(
     *,
     dry_run: bool = False,
     graph_factory: Callable = create_agent_graph,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """Run one task in a clean context and return its fan-in payload. Never raises."""
+
+    budget = WORKER_TIMEOUT_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + budget
 
     state: dict[str, Any] = {
         "messages": [HumanMessage(content=worker_prompt(task, upstream or {}))],
@@ -174,10 +192,20 @@ def run_worker(
 
     last = state
     error: BaseException | None = None
+    timed_out = False
     try:
         # Stream the graph so the state after the last finished step survives a crash.
-        for snapshot in graph_factory().stream(state, config={"recursion_limit": WORKER_RECURSION_LIMIT}, stream_mode="values"):
+        steps = graph_factory().stream(state, config={"recursion_limit": WORKER_RECURSION_LIMIT}, stream_mode="values")
+        for snapshot in steps:
             last = snapshot
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
+        if timed_out:
+            close = getattr(steps, "close", None)
+            if close:
+                close()  # no further model call or tool round
+            logger.warning("Worker %s stopped after its %.0f s budget.", task["task_id"], budget)
     except Exception as exc:
         error = exc
         report_failure(exc, "worker", task_id=task["task_id"], tools=",".join(task["tools_allowed"]))
@@ -187,7 +215,12 @@ def run_worker(
     messages = last.get("messages", [])
     reported, summary = _final_report(_message_text(messages[-1]) if messages else "")
 
-    if error is not None:
+    if timed_out and error is None:
+        summary = TIMEOUT_TEXT
+        if entities:
+            summary += " Part of it was done before it stopped."
+        failed = True
+    elif error is not None:
         summary = f"It stopped because of an error. {plain_message(error)}"
         if entities:
             summary += " Part of it was done before it stopped."

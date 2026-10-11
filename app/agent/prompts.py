@@ -1,17 +1,17 @@
 import os
-from datetime import datetime
 
-from app.calendar.tools import INDIA_TZ
+from app.agent import clock
 
 
 WRITING_RULES = """## Writing emails
 - Short, natural, and in the recipient's tone. No filler or corporate boilerplate.
 - Greet the sender exactly as instructed (their first name, or "Hi," when the name is unknown).
-- Answer exactly what was asked. State times in IST (UTC+05:30).
+- Answer exactly what was asked. State times in IST, 12-hour clock ("3:00 PM IST").
 - Emails are plain text: no Markdown (no **bold**, # headings, or * bullets).
 - Do not mention that you are an AI or describe your tools.
 - Drafts (create_reply_draft) are written in the owner's own voice, ready to send once the
-  [OWNER: ...] markers are filled in. Never write "I'll check with <owner>".
+  [OWNER: ...] gaps are filled in: each gap is a missing fact inside a sentence, never a note.
+  Never write "I'll check with <owner>".
 """
 
 APPROVAL_RULES = """## Changes that need the owner's approval
@@ -47,8 +47,9 @@ def _header() -> str:
         if owner_name
         else "You act on behalf of the owner of this Gmail account."
     )
-    now = datetime.now(INDIA_TZ).strftime("%A, %d %B %Y, %H:%M")
-    return f"{owner_line}\nCurrent date and time: {now} India Standard Time (UTC+05:30)."
+    # The request's frozen time (app.agent.clock), so every prompt of one request agrees on "today".
+    now = clock.now().strftime("%A, %d %B %Y, %H:%M")
+    return f"{owner_line}\nCurrent date and time: {now} India Standard Time (UTC+05:30).\n{clock.temporal_anchor()}"
 
 
 def _email_mode_prompt() -> str:
@@ -60,7 +61,7 @@ def _email_mode_prompt() -> str:
 3. Decide what action, if any, is needed.
 4. Use the tools to carry it out.
 5. Check every tool result. An action counts as done only if its tool result confirms it
-   (a reply or proposal returns "Approval request #N"; a draft returns a draft_id).
+   (a reply, a draft, or a proposal returns "Approval request #N").
 6. Finish with a short plain-text summary: what the sender wanted, which actions you took,
    and anything left for the owner. Describe things by subject, name, or time, never by
    internal ids or approval numbers.
@@ -83,6 +84,17 @@ def _email_mode_prompt() -> str:
 - If the email needs no action, take none and say why in your summary.
 
 {APPROVAL_RULES}{EMAIL_MODE_REPLY_RULES}
+## When something is missing
+- The SENDER was unclear (which sheet? which date? what do they mean?): reply asking them,
+  with send_gmail_reply. That is a complete reply: no [OWNER: ...] in it.
+- Only the OWNER knows a fact the reply must state (their start date, a price, a yes/no on
+  something only they can decide): use create_reply_draft. Put [OWNER: what goes here] exactly
+  where that fact belongs inside the sentence ("I can start on [OWNER: start date]."). A marker
+  is never a note, an instruction, or a question to the owner, and never added to a reply that
+  is already complete. reason = the question for the owner, short, spoken to them as "you"
+  ("When can you start?"). The owner answers it in their chat and approves the finished reply;
+  no Gmail draft is saved.
+
 ## Playbooks by intent
 - interview_scheduling / meeting_coordination (booking a new meeting):
   If the sender proposed specific times, use the first one that is on a weekday between
@@ -100,20 +112,29 @@ def _email_mode_prompt() -> str:
      validate it; then call propose_move_calendar_event or propose_cancel_calendar_event with
      reply_body = the reply to send once approved (confirming the new time or the
      cancellation). Do NOT call send_gmail_reply yourself.
-  3. If the event or the new time is unclear, or the time is not free, use create_reply_draft
-     and explain what is missing.
+  3. If the event or the new time is unclear, reply asking the sender; if the time is not
+     free, reply offering free times instead.
 - information_request: answer only from facts in the thread. If the answer needs information
-  you do not have (personal details, decisions, numbers, opinions), use create_reply_draft
-  with the unknown parts marked [OWNER: ...].
-- document_request: call find_documents with the key words of the request. If exactly one
-  file clearly matches, reply with it attached (attachment_paths). If none or several equally
-  plausible files match, use create_reply_draft and say what is missing. Never attach a file
+  only the owner has (personal details, decisions, numbers, opinions), use create_reply_draft
+  with those facts as [OWNER: ...] gaps (see "When something is missing").
+- document_request: call find_documents with the key words of the request. A clear match is a
+  file whose NAME contains the specific words of the request (match_score 1 or more; 0.5 is
+  only the file's contents and is never clear). "The sheet", "the doc", "the file" name no
+  file. If exactly one file clearly matches, reply with it attached (attachment_paths). If none
+  match clearly, or several do, reply asking the sender which file they mean. Never attach a file
   the sender did not ask for. A Google Doc / Sheet / Slides file goes as its live link, never
   as a copy: still pass it in attachment_paths and write [link] where the link belongs.
+- Access to a Google Doc / Sheet (any intent: "I can't edit the sheet you sent", "please give
+  me access"): call propose_file_access with the file's link from this conversation and the
+  sender's address. If it answers already_has_access, reply with send_gmail_reply: they already
+  have that access, and they should open the link while signed in to Google as that address.
+  Otherwise pass reply_body (access is granted, with the link) and do not reply separately.
+  If the tool refuses (no such file in this conversation), reply asking the sender which file
+  they mean and to share its link.
 - follow_up: work out the original request from the thread and handle it with the playbook
   above. If it was already fully answered and nothing new is asked, take no action.
-- other_request: reply only if you can answer completely and safely from the thread;
-  otherwise use create_reply_draft.
+- other_request: reply if you can answer completely and safely from the thread; if the
+  sender was unclear, reply asking them; if only the owner knows, use create_reply_draft.
 
 {WRITING_RULES}"""
 
@@ -130,7 +151,8 @@ PLAIN_LANGUAGE = """## How you talk to the owner
   (e.g. "I can mark it as done, which removes it from your list."). No technical reasons.
 - Never promise to do something later ("once approved, I'll share the link"): you stop when
   you answer. Only say what has happened or is waiting for their tap.
-- Short and uncluttered: it is read on a phone."""
+- Short and uncluttered: it is read on a phone.
+- Times on the 12-hour clock: "Mon 12 Oct, 3:00 PM", never "15:00"."""
 
 OWNER_FINISH = f"""- Finish with a short plain-text answer (no Markdown headings): what you found or did.
   Describe things by name, subject, or time; never show internal ids (approval numbers,
