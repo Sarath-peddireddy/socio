@@ -4,7 +4,7 @@
 your Gmail, decides what needs a response, and prepares it: scheduling
 meetings, answering requests, sending the documents people ask for. Nothing
 reaches anyone else, and none of your files changes, until you tap once to
-approve it. It learns from those taps. You talk to it from Telegram.
+approve it. It remembers the rules you give it. You talk to it from Telegram.
 
 > Status: early access. Run it against a test Google account while you
 > evaluate it.
@@ -36,17 +36,30 @@ Several things in one message ("send my resume to X, add a row to my sheet,
 and remind me Friday") are split into separate tasks that run in parallel,
 and you get one combined report.
 
-When something needs you (a draft to review, a change to approve), Socio
-also adds it to **Google Tasks**, and completes it once you've acted.
+Socio only touches your **Google Tasks** when you ask, and adding or
+completing a task waits for your tap like everything else. It also keeps an
+eye on your open tasks and offers to close them, so you don't have to:
+
+- The day after a task's due date (daytime only), it asks once: "Is this
+  done?" (**Yes, close it** / **Not yet**).
+- When you tell it you did something ("I sent the invoice"), it asks "Can I
+  close this task?" for the matching one.
+- If you tick a task in the Tasks app yourself, it simply stops asking.
+- Old reminders it added automatically in the past get one "Tidy up old
+  reminders?" card that closes them all.
+
+(Automatic follow-up tasks for emails that need you are off;
+`AGENT_AUTO_TASKS=1` turns them back on.)
 
 ## It learns from you
 
 - **Only when you say so.** Approving, rejecting, or editing a request
-  teaches Socio nothing by itself. A rejection ends quietly ("❌ Proposal
-  rejected. No changes were made.") with an optional **+ Add Permanent Rule**
-  button. Tap it and type why: a lasting rule ("I never take calls before
-  noon") is saved and recalled whenever it's relevant; a one-off reason
-  ("already talked to him", "I'm tired today") is kept for 24 hours only.
+  teaches Socio nothing by itself; a rejection just ends quietly ("❌ Proposal
+  rejected. No changes were made."). To add a rule, tell Socio in chat
+  ("remember: I never take calls before noon", "make it a rule to ask me
+  before ..."): a lasting rule is saved and recalled whenever it's relevant; a
+  one-off note ("I'm busy today") is kept for 24 hours only. Rules are never
+  stored in your Docs or Sheets.
   Teach it directly with `/remember`, see what it knows with `/memories`, and
   remove something with `/forget`. Memories are stored on your machine and
   embedded with a small local model, so they never leave it.
@@ -60,10 +73,10 @@ also adds it to **Google Tasks**, and completes it once you've acted.
   [`skills/README.md`](skills/README.md).
 - Memory only informs Socio. It never skips an approval.
 
-When something fails, Telegram only gets a short message (for example
-"⚠️ Google services are busy or unreachable right now. Please try again in a
-few minutes."). The full error with its stack trace goes to `logs/agent.log`
-on your computer.
+When something fails, Telegram only gets a short status card (for example
+"⚠️ **Google Service Busy** Google services are busy or unreachable right now.
+Please try again in a few minutes."). The full error with its stack trace goes
+to `logs/agent.log` on your computer.
 
 ## Safety model
 
@@ -77,7 +90,7 @@ on your computer.
   | Moving email to Trash | Asks you (only when you asked for it) |
   | Creating or adding to Google Docs / Sheets | Asks you, showing exactly what will be added |
   | Running one of your skill scripts for the first time (or after it changed) | Asks you, showing its code |
-  | Google Tasks | Does it |
+  | Adding or completing (deleting) a Google Task you asked for | Asks you |
 
   Approved actions are re-validated at the moment you tap (for example, the
   slot must still be free). Trash is never a permanent delete (Gmail keeps it
@@ -144,8 +157,18 @@ everything runs offline on your CPU.
 
 Bot commands: `/run` (check inbox now), `/dryrun`, `/status`, `/approvals`,
 `/new`, `/remember TEXT`, `/memories`, `/forget ID`, `/save_skill NAME`,
-`/skills`, `/forget_skill NAME`, `/help`. The inbox is also checked every
-`AGENT_POLL_MINUTES`.
+`/skills`, `/forget_skill NAME`, `/help`. `/start`, `/help`, or asking "what
+can you do?" shows an overview of what Socio does. The inbox is also checked
+every `AGENT_POLL_MINUTES`.
+
+Each approval request arrives as one card (for example "🗑️ **Trash
+Conversation**" with the subject, sender, and reason) with its buttons. Messages
+never show internal numbers; things are named by subject, name, or time. If you
+ask to add a sheet row that is already there, Socio tells you where it is
+instead of adding it twice. If an instruction only produced approval requests, the cards are all
+you get; anything Socio did directly (such as saving a rule) or found is
+reported in one message. Messages use Telegram's HTML formatting, so email
+subjects and names are shown exactly as written.
 
 ## Configuration
 
@@ -156,7 +179,7 @@ See [`.env.example`](.env.example).
 | `GEMINI_API_KEY` | LLM used for decisions and writing |
 | `AGENT_OWNER_NAME` | Name used to sign emails |
 | `AGENT_DRIVE_FOLDER` | Optional: limit Socio to one Drive folder (default: your whole Drive) |
-| `AGENT_AUTO_TASKS` | Add a Google Task when something needs you (default on; `0` = off) |
+| `AGENT_AUTO_TASKS` | Add a Google Task automatically when an email needs you (default off; `1` = on) |
 | `AGENT_FILES_DIR` | Optional local documents folder (default `./documents`) |
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
 | `TELEGRAM_OWNER_CHAT_ID` | The only chat allowed to use the bot |
@@ -220,6 +243,7 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 app/
   main.py           CLI entry point
   telegram_bot.py   Telegram interface: instructions, approvals, scheduled checks
+  telegram_format.py  Telegram HTML: escaping, approval cards, welcome card
   google_api.py     Shared Google API timeouts, retries, token refresh
   errors.py         Error gateway: logs/agent.log + short owner-facing messages
   agent/            Runner, LangGraph agent, supervisor + workers, decisions, prompts, approvals, state

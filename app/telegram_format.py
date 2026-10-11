@@ -1,0 +1,380 @@
+"""
+Telegram HTML formatting for Socio.
+
+Every message the bot sends uses parse_mode="HTML" (Telegram's small HTML
+subset: b, i, u, s, code, pre, blockquote, a; no <br>, newlines are literal).
+
+- esc() escapes any dynamic value (subjects, senders, file names, model text)
+  before it goes into a template.
+- md_to_html() turns the agent's free text into safe HTML: it escapes first,
+  then converts the Markdown the model tends to write (**bold**, `code`,
+  "* " bullets, "# " headings), so no raw ** ever reaches the chat.
+- clip_html() shortens a message without cutting a tag or entity in half.
+- approval_card() renders one approval request as a single card with its buttons.
+"""
+
+from __future__ import annotations
+
+import html
+import re
+from datetime import date
+from typing import Any
+
+from app.agent.approvals import DOCUMENT_TYPES, EMAIL_TYPES, EXECUTABLE_TYPES, format_time
+from app.calendar.events import parse_ist
+
+
+MAX_MESSAGE_CHARS = 4000  # Telegram allows 4096 characters per message
+BODY_CHARS = 2500  # longest email body / diff shown on a card
+EXPANDABLE_AFTER = 600  # longer quotes start collapsed
+
+WELCOME_HTML = """👋 <b>Welcome to Socio</b>
+Your autonomous Workspace Chief of Staff.
+
+I triage your inbox, coordinate your calendar, and manage your documents with strict Human-in-the-Loop governance.
+
+━━━━━━━━━━━━━━━━━━━━
+⚡ <b>Core Capabilities:</b>
+
+📬 <b>Email Triage &amp; Drafting</b>
+• Scans new threads in the background.
+• Filters noise, newsletters, and automated no-replies.
+• Prepares professional context-aware replies for your 1-tap review.
+
+📅 <b>Calendar &amp; Meeting Coordination</b>
+• Identifies scheduling requests and locates free windows (11:00–16:00 IST).
+• Places local 24-hr soft-holds on proposed slots to prevent double-booking.
+• Books, reschedules, or moves events only after explicit authorization.
+
+📁 <b>Workspace &amp; File Actions</b>
+• Locates attachments and references across Google Drive.
+• Creates notes and appends structured rows to Google Docs and Sheets.
+• Adds Google Tasks for action items needing your personal follow-up.
+
+🛡️ <b>Security &amp; Memory</b>
+• Inbound content is strictly quarantined inside untrusted XML boundaries.
+• Zero-touch sends and file deletions are disabled—nothing mutates without approval.
+• Learns your preferences over time via <code>/remember</code>.
+
+━━━━━━━━━━━━━━━━━━━━
+💡 <b>Quick Commands:</b>
+• <code>/run</code> — Trigger immediate inbox check
+• <code>/status</code> — Inspect active holds, pending approvals &amp; system health
+• <code>/approvals</code> — Review pending decision cards
+• <code>/memories</code> — View your saved rules and standing preferences
+• <code>/dryrun</code> · <code>/new</code> · <code>/forget ID</code> · <code>/save_skill NAME</code> · <code>/skills</code> · <code>/forget_skill NAME</code>
+
+<i>You can also message me naturally (e.g., "What's on my calendar tomorrow?" or "Draft an email to Alex").</i>"""
+
+# "what can you do?", "how can you help", "features" ... (the whole message, not a mention inside a request).
+CAPABILITY_QUESTION = re.compile(
+    r"^\s*(?:(?:hi|hello|hey)\b[\s,!.]*)?(?:socio\b[\s,!.]*)?"
+    r"(?:what (?:else )?(?:can|do) you do(?: for me)?"
+    r"|how (?:can|do|could) you help(?: me)?"
+    r"|what (?:are|is) (?:your|socio'?s) (?:features|capabilities|commands)"
+    r"|(?:show me |list )?(?:your )?(?:features|capabilities|commands)"
+    r"|help|what are you|who are you)"
+    r"[\s?!.]*$",
+    re.IGNORECASE,
+)
+
+
+def is_capability_question(text: str) -> bool:
+    return bool(CAPABILITY_QUESTION.match(text or ""))
+
+
+# ----- escaping and conversion ----------------------------------------------------------
+
+
+def esc(value: Any) -> str:
+    """Escape a dynamic value for Telegram HTML."""
+
+    return html.escape("" if value is None else str(value), quote=False)
+
+
+def strip_html(text: str) -> str:
+    """Plain text from our HTML (tags dropped, entities decoded)."""
+
+    return html.unescape(re.sub(r"<[^>]+>", "", text or ""))
+
+
+_BULLET = re.compile(r"^(\s*)[*\-+]\s+(?=\S)")
+_HEADING = re.compile(r"^\s*#{1,6}\s+(.+?)\s*#*\s*$")
+_BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
+_ITALIC = re.compile(r"(?<![\w*])\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?![\w*])")
+
+
+def md_to_html(text: str) -> str:
+    """The agent's (possibly Markdown) text as safe Telegram HTML."""
+
+    lines = []
+    for line in (text or "").splitlines():
+        heading = _HEADING.match(line)
+        if heading:
+            line = f"**{heading.group(1)}**"
+        line = _BULLET.sub(r"\1• ", line)
+        lines.append(line)
+
+    parts = re.split(r"(`[^`\n]+`)", "\n".join(lines))
+    out = []
+    for part in parts:
+        if len(part) > 1 and part.startswith("`") and part.endswith("`"):
+            out.append(f"<code>{esc(part[1:-1])}</code>")
+            continue
+        part = esc(part)
+        part = _BOLD.sub(r"<b>\1</b>", part)
+        part = _ITALIC.sub(r"<i>\1</i>", part)
+        out.append(part.replace("**", ""))
+    return "".join(out)
+
+
+_TAG = re.compile(r"<(/?)([a-z\-]+)[^>]*>", re.IGNORECASE)
+
+
+def clip_html(text: str, limit: int = MAX_MESSAGE_CHARS) -> str:
+    """Shorten HTML to the limit, never splitting a tag or an entity, and close open tags."""
+
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 120]
+    if cut.rfind("<") > cut.rfind(">"):
+        cut = cut[: cut.rfind("<")]
+    if cut.rfind("&") > cut.rfind(";"):
+        cut = cut[: cut.rfind("&")]
+
+    open_tags: list[str] = []
+    for closing, name in _TAG.findall(cut):
+        name = name.lower()
+        if not closing:
+            open_tags.append(name)
+        elif name in open_tags:
+            del open_tags[len(open_tags) - 1 - open_tags[::-1].index(name)]
+    return cut + "".join(f"</{name}>" for name in reversed(open_tags)) + "\n… (truncated)"
+
+
+def _short(text: Any, limit: int = BODY_CHARS) -> str:
+    text = "" if text is None else str(text).strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def quote(text: Any) -> str:
+    """An email body (or other long text) as a blockquote; long ones start collapsed."""
+
+    body = _short(text)
+    tag = "blockquote expandable" if len(body) > EXPANDABLE_AFTER or body.count("\n") > 10 else "blockquote"
+    return f"<{tag}>{esc(body) or '(empty)'}</blockquote>"
+
+
+def _pre(lines: list[str]) -> str:
+    return f"<pre>{esc(_short(chr(10).join(lines)))}</pre>"
+
+
+def _pretty_date(value: str) -> str:
+    """'2026-10-16' -> 'Fri 16 Oct'."""
+
+    try:
+        return date.fromisoformat(value[:10]).strftime("%a %d %b")
+    except ValueError:
+        return value
+
+
+def slot_text(start: str | None, end: str | None) -> str:
+    """'Fri 16 Oct, 11:00–11:30 (IST)' (both dates shown if the slot spans midnight)."""
+
+    try:
+        first, last = parse_ist(start or ""), parse_ist(end or "")
+    except ValueError:
+        return f"{format_time(start)} – {format_time(end)}"
+    if first.date() == last.date():
+        return f"{first:%a %d %b, %H:%M}–{last:%H:%M} (IST)"
+    return f"{first:%a %d %b, %H:%M} – {last:%a %d %b, %H:%M} (IST)"
+
+
+def _field(label: str, value: Any) -> str:
+    return f"<b>{label}:</b> {esc(value)}"
+
+
+# ----- approval cards -----------------------------------------------------------------------
+
+
+def _buttons(approval: dict[str, Any]) -> list:
+    approval_id = approval["id"]
+    kind = approval["type"]
+
+    def button(text: str, action: str) -> dict:
+        return {"text": text, "callback_data": f"{action}:{approval_id}"}
+
+    if kind in EMAIL_TYPES:
+        return [[button("✅ Approve & Send", "approve"), button("✏️ Edit in Gmail", "draft")], [button("❌ Reject", "reject")]]
+    if kind not in EXECUTABLE_TYPES:
+        return [[button("✔️ Mark done", "approve")]]
+    approve_label = {
+        "trash_email": "🗑️ Approve & Trash",
+        "book_meeting": "✅ Approve & Book",
+        "move_event": "✅ Approve & Move",
+        "cancel_event": "✅ Approve & Cancel",
+        "enable_skill_script": "✅ Trust Script",
+        "create_task": "✅ Approve & Add",
+    }.get(kind, "✅ Approve")
+    if kind == "close_old_reminders":
+        return [[button("✅ Close all", "approve"), button("Keep them", "reject")]]
+    if kind == "complete_task":
+        due_question = (approval.get("payload") or {}).get("trigger") == "due"
+        return [[button("✅ Yes, close it" if due_question else "✅ Close task", "approve"),
+                 button("Not yet" if due_question else "Keep open", "reject")]]
+    return [[button(approve_label, "approve"), button("❌ Reject", "reject")]]
+
+
+def _follow_up(payload: dict[str, Any]) -> list[str]:
+    reply = payload.get("reply")
+    if not reply:
+        return []
+    return ["", _field("Then reply to", reply.get("to")), quote(reply.get("body"))]
+
+
+def _reason(payload: dict[str, Any]) -> list[str]:
+    return [_field("Reason", payload["reason"])] if payload.get("reason") else []
+
+
+def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
+    """One approval request as an HTML card (without buttons)."""
+
+    payload = approval.get("payload") or {}
+    kind = approval.get("type")
+
+    if kind == "trash_email":
+        title = "🗑️ <b>Trash Conversation</b>" if payload.get("whole_thread") else "🗑️ <b>Trash Email</b>"
+        lines = [
+            f"{title}", "",
+            _field("Subject", payload.get("subject") or "(no subject)"),
+            _field("From", payload.get("sender")),
+            *_reason(payload), "",
+            "<i>Note: Recoverable from Gmail Trash for 30 days.</i>",
+        ]
+    elif kind in EMAIL_TYPES:
+        reply = payload.get("reply") or {}
+        to = payload.get("to") if kind == "send_email" else reply.get("to")
+        subject = payload.get("subject") if kind == "send_email" else reply.get("subject")
+        body = payload.get("body") if kind == "send_email" else reply.get("body")
+        lines = ["✉️ <b>Outgoing Email Proposal</b>", "", _field("To", to or "the sender")]
+        if subject or kind == "send_email":
+            lines.append(_field("Subject", subject or "(no subject)"))
+        if payload.get("attachments"):
+            lines.append(_field("Files", ", ".join(a["name"] for a in payload["attachments"])))
+        lines += ["", "<b>Draft:</b>", quote(body)]
+    elif kind == "book_meeting":
+        lines = [
+            "📅 <b>Meeting Proposal</b>", "",
+            _field("Title", payload.get("title")),
+            _field("With", payload.get("attendee_email") or "nobody (no invite)"),
+            _field("Proposed Slot", slot_text(payload.get("new_start"), payload.get("new_end"))),
+        ]
+        if payload.get("meeting_link"):
+            lines.append(_field("Link", payload["meeting_link"]))
+        if hold_active:
+            lines.append("<b>Hold Status:</b> Local 24h soft-hold active")
+        lines += _reason(payload) + _follow_up(payload)
+    elif kind == "move_event":
+        lines = [
+            "🔁 <b>Move Meeting</b>", "",
+            _field("Title", payload.get("title")),
+            _field("From", format_time(payload.get("old_start"))),
+            _field("To", slot_text(payload.get("new_start"), payload.get("new_end"))),
+            _field("Attendees notified", ", ".join(payload.get("other_attendees", [])) or "none"),
+        ]
+        if hold_active:
+            lines.append("<b>Hold Status:</b> Local 24h soft-hold active")
+        lines += _reason(payload) + _follow_up(payload)
+    elif kind == "cancel_event":
+        lines = [
+            "🚫 <b>Cancel Meeting</b>", "",
+            _field("Title", payload.get("title")),
+            _field("When", format_time(payload.get("old_start"))),
+            _field("Attendees notified", ", ".join(payload.get("other_attendees", [])) or "none"),
+            *_reason(payload), *_follow_up(payload),
+        ]
+    elif kind in DOCUMENT_TYPES:
+        lines = ["📝 <b>Workspace Update</b>", ""]
+        if kind == "create_document":
+            lines += [_field("Target", f"New Google Doc '{payload.get('title')}' (Socio folder)"), _field("Action", "Create document")]
+            diff = [f"+ {line}" for line in str(payload.get("content") or "").splitlines()] or ["+ (empty)"]
+        elif kind == "append_document":
+            lines += [_field("Target", payload.get("document_title") or payload.get("document")), _field("Action", "Append text")]
+            diff = [f"+ {line}" for line in str(payload.get("text") or "").splitlines()] or ["+ (empty)"]
+        elif kind == "create_spreadsheet":
+            lines += [_field("Target", f"New Google Sheet '{payload.get('title')}' (Socio folder)"), _field("Action", "Create spreadsheet")]
+            diff = ["+ " + (" | ".join(payload.get("headers") or []) or "(no header row)")]
+        else:
+            target = payload.get("document_title") or payload.get("document")
+            if payload.get("tab"):
+                target = f"{target} (tab {payload['tab']})"
+            header = payload.get("header") or []
+            lines += [_field("Target", target), _field("Action", "Append row")]
+            diff = [
+                f"+ {header[i] if i < len(header) and header[i] else f'column {i + 1}'}: {value}"
+                for i, value in enumerate(payload.get("values") or [])
+            ]
+        lines += [_pre(diff), *_reason(payload)]
+    elif kind == "create_task":
+        lines = [
+            "📌 <b>New Task</b>", "",
+            _field("Task", payload.get("title") or "(untitled)"),
+        ]
+        if payload.get("due"):
+            lines.append(_field("Due", payload["due"]))
+        if payload.get("notes"):
+            lines.append(_field("Notes", _short(payload["notes"], 600)))
+        lines += _reason(payload)
+    elif kind == "close_old_reminders":
+        lines = [
+            "🧹 <b>Tidy up old reminders?</b>", "",
+            f"I found <b>{int(payload.get('count') or 0)}</b> reminder tasks I added automatically for emails "
+            "(that feature is off now). For example:",
+            *[f"• {esc(example)}" for example in payload.get("examples", [])[:5]],
+            "", "<i>Closing marks them completed; you can reopen any of them in Google Tasks.</i>",
+        ]
+    elif kind == "complete_task" and payload.get("trigger") == "due":
+        lines = [
+            "🗓️ <b>Is this done?</b>", "",
+            _field("Task", payload.get("title") or "(untitled)"),
+            _field("Was due", _pretty_date(payload.get("due") or "")),
+            "", "<i>If it's done, I'll close it in Google Tasks for you.</i>",
+        ]
+    elif kind == "complete_task":
+        lines = [
+            "☑️ <b>Can I close this task?</b>", "",
+            _field("Task", payload.get("title") or "(untitled)"),
+        ]
+        if payload.get("due"):
+            lines.append(_field("Due", _pretty_date(payload["due"])))
+        lines += _reason(payload) + ["", "<i>You can reopen it in Google Tasks later.</i>"]
+    elif kind == "enable_skill_script":
+        lines = [
+            "🔐 <b>Trust Skill Script</b>", "",
+            _field("Script", f"skills/{payload.get('name')}.py"),
+            _field("SHA-256", f"{str(payload.get('sha256'))[:12]}…"),
+            "It will run with your user's permissions on files from your documents folder. Only approve code you wrote or reviewed.",
+            "<b>First lines:</b>", _pre(str(payload.get("preview") or "").splitlines()),
+        ]
+    elif kind == "review_draft":
+        lines = [
+            "📝 <b>Draft Ready in Gmail</b>", "",
+            _field("What to check", payload.get("target") or approval.get("target")),
+            "<i>Edit and send it from Gmail Drafts, then tap Mark done.</i>",
+        ]
+    elif kind == "review_decision":
+        lines = [
+            "🤔 <b>Needs Your Decision</b>", "",
+            _field("Subject", payload.get("subject") or "(no subject)"),
+            _field("Why", payload.get("reason")),
+        ]
+    else:
+        lines = ["📌 <b>Approval needed</b>", "", esc(approval.get("target") or kind)]
+
+    return "\n".join(lines)
+
+
+def approval_card(approval: dict[str, Any], hold_active: bool = False) -> tuple[str, list]:
+    """The card text and its inline keyboard for an open approval request."""
+
+    return card_text(approval, hold_active), _buttons(approval)

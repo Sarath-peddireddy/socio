@@ -11,7 +11,7 @@ can instead be moved to Gmail Drafts for editing (to_draft). Everything is
 re-validated at execution time.
 
 A decision teaches Socio nothing by itself; the owner can turn a rejection or an
-edit into a rule explicitly ("+ Add Permanent Rule", see app.memory.learning).
+edit into a rule explicitly (by asking Socio to remember it, see app.memory.learning).
 Failures are logged in full (app.errors) and reported with a short fixed message.
 """
 
@@ -41,12 +41,41 @@ EMAIL_TYPES = REPLY_TYPES | {"send_email"}
 DOCUMENT_TYPES = {"create_document", "append_document", "create_spreadsheet", "append_sheet_row"}
 # Approvals that perform an action when approved.
 EXECUTABLE_TYPES = (
-    {"trash_email", "book_meeting", "move_event", "cancel_event", "enable_skill_script"}
+    {"trash_email", "book_meeting", "move_event", "cancel_event", "enable_skill_script", "create_task", "complete_task",
+     "close_old_reminders"}
     | EMAIL_TYPES
     | DOCUMENT_TYPES
 )
 # Approvals that only ask the owner to look at something; approving closes them.
 REVIEW_TYPES = {"review_draft", "review_decision"}
+
+# How a decided request is described to the owner ("This was already ...").
+STATUS_WORDS = {
+    "approved": "approved", "rejected": "rejected", "resolved": "handled",
+    "failed": "tried and it failed", "executing": "being handled",
+}
+
+# What the owner is told after approving (no internal numbers; the CLI adds them).
+DONE_TEXT = {
+    "trash_email": "Moved to Trash. You can restore it from Gmail Trash for 30 days.",
+    "send_reply": "Reply sent.",
+    "send_reply_with_attachment": "Reply sent with the file.",
+    "send_email": "Email sent.",
+    "book_meeting": "Meeting booked.",
+    "move_event": "Meeting moved.",
+    "cancel_event": "Meeting cancelled.",
+    "create_document": "Document created.",
+    "append_document": "Text added to the document.",
+    "create_spreadsheet": "Spreadsheet created.",
+    "append_sheet_row": "Row added to the sheet.",
+    "enable_skill_script": "Script approved. It can run now.",
+    "create_task": "Task added to Google Tasks.",
+    "complete_task": "Task marked as completed.",
+}
+
+
+def _already(approval: dict[str, Any]) -> str:
+    return f"This request was already {STATUS_WORDS.get(approval['status'], approval['status'])}."
 
 
 def format_time(value: str | None) -> str:
@@ -115,6 +144,19 @@ def describe(approval: dict[str, Any]) -> str:
         ]
         tab = f" (tab {payload['tab']})" if payload.get("tab") else ""
         text = f"Add a row to Google Sheet '{payload.get('document_title') or payload.get('document')}'{tab}:\n" + "\n".join(cells)
+    elif kind == "create_task":
+        due = f" (due {payload['due']})" if payload.get("due") else ""
+        text = f"Add Google Task '{payload.get('title', '')}'{due}"
+        if payload.get("notes"):
+            text += f"\nNotes: {payload['notes'][:300]}"
+    elif kind == "close_old_reminders":
+        text = (
+            f"Close {payload.get('count', 0)} old reminder tasks Socio added automatically "
+            f"(e.g. {', '.join(repr(e) for e in payload.get('examples', [])[:3])})"
+        )
+    elif kind == "complete_task":
+        due = f" (due {payload['due']})" if payload.get("due") else ""
+        text = f"Mark Google Task '{payload.get('title', '')}'{due} as completed"
     elif kind == "enable_skill_script":
         text = (
             f"Trust skill script skills/{payload.get('name')}.py (sha256 {str(payload.get('sha256'))[:12]}…)?\n"
@@ -192,6 +234,46 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
             return {"spreadsheet": sheets.create_spreadsheet(payload["title"], payload.get("headers") or None)}
         return {"spreadsheet": sheets.append_sheet_row(payload["document"], payload["values"], payload.get("tab", ""))}
 
+    if kind == "create_task":
+        from app.tasks import tasks
+
+        # Not retried inside create_task: a timed-out insert may still have created it.
+        task = tasks.create_task(payload["title"], payload.get("notes", ""), payload.get("due", ""))
+        if not task.get("verified"):
+            raise RuntimeError(f"Google did not confirm the task was created: {task}")
+        return {"task": task}
+
+    if kind == "close_old_reminders":
+        from app.tasks import tasks
+
+        closed, gone = 0, 0
+        for task_id in payload.get("task_ids", []):
+            try:
+                if tasks.complete_task(task_id).get("verified"):
+                    closed += 1
+            except Exception as exc:  # one missing task must not stop the rest
+                gone += 1
+                logger.warning("Could not close old reminder %s: %s", task_id, exc)
+        return {"closed": closed, "not_closed": gone}
+
+    if kind == "complete_task":
+        from googleapiclient.errors import HttpError
+
+        from app.tasks import tasks
+
+        try:
+            current = tasks.get_task(payload["task_id"])
+        except HttpError as exc:
+            if getattr(getattr(exc, "resp", None), "status", None) in (404, "404"):
+                raise ValueError("That task is no longer in Google Tasks.") from exc
+            raise
+        if current.get("status") == "completed":  # already ticked in the app: nothing to do
+            return {"task": {**current, "verified": True}}
+        task = tasks.complete_task(payload["task_id"])
+        if not task.get("verified"):
+            raise RuntimeError(f"Google did not confirm the task was completed: {task}")
+        return {"task": task}
+
     if kind == "enable_skill_script":
         from app.memory.skills import trust_script
 
@@ -237,21 +319,21 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
     approval = store.get_approval(approval_id)
 
     if approval is None:
-        return {"ok": False, "message": f"Approval #{approval_id} not found."}
+        return {"ok": False, "message": "That request no longer exists."}
 
     if approval["status"] != "open":
-        return {"ok": False, "message": f"Approval #{approval_id} was already {approval['status']}."}
+        return {"ok": False, "message": _already(approval)}
 
     if approval["type"] in REVIEW_TYPES:
         store.resolve_pending_approval(approval_id, "Marked done by owner")
         complete_followup_task(store, approval.get("message_id"))
-        return {"ok": True, "message": f"#{approval_id} marked done."}
+        return {"ok": True, "message": "Marked as done."}
 
     if approval["type"] not in EXECUTABLE_TYPES:
-        return {"ok": False, "message": f"Approval #{approval_id} has unknown type {approval['type']}."}
+        return {"ok": False, "message": "Socio doesn't know how to carry out this request."}
 
     if not store.claim_approval(approval_id):
-        return {"ok": False, "message": f"Approval #{approval_id} is already being handled."}
+        return {"ok": False, "message": "This request is already being handled."}
 
     message_id, thread_id = approval.get("message_id"), approval.get("thread_id")
 
@@ -264,22 +346,29 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
         store.add_failure(f"approval:{approval['type']}", error, message_id=message_id)
         if message_id:
             store.mark_processed(message_id, thread_id, status="needs_attention", summary=f"Approved change failed: {error}")
-        return {"ok": False, "message": f"#{approval_id} failed, nothing was changed. {safe_error_text(exc)}", "error": error}
+        return {"ok": False, "message": f"That didn't go through, so nothing was changed. {safe_error_text(exc)}", "error": error}
 
     store.finish_approval(approval_id, "approved", "Approved and executed", result)
     complete_followup_task(store, message_id)
     store.add_action(approval["type"], approval.get("target"), approval["payload"], "completed", message_id=message_id, result=result)
+    task = result.get("task") or {}
+    if approval["type"] == "create_task" and task.get("task_id"):
+        store.upsert_tracked_task(task["task_id"], task.get("title") or approval["payload"]["title"], task.get("due") or "")
+    elif approval["type"] == "complete_task":
+        store.close_tracked_task(approval["payload"]["task_id"], "closed_by_socio")
 
-    message = f"#{approval_id} done."
-    if result.get("reply"):
-        message += " Reply sent in the thread."
-    if result.get("email"):
-        message += " Email sent."
+    message = DONE_TEXT.get(approval["type"], "Done.")
+    if approval["type"] == "close_old_reminders":
+        message = f"Closed {result['closed']} old reminder tasks. You can reopen any of them in Google Tasks."
+        if result["not_closed"]:
+            message += f" {result['not_closed']} were already gone."
+        for task_id in approval["payload"].get("task_ids", []):
+            store.close_tracked_task(task_id, "closed_by_socio_cleanup")
+    if result.get("reply") and approval["type"] not in REPLY_TYPES:
+        message += " The reply was sent in the conversation."
     for key in ("document", "spreadsheet"):
         if (result.get(key) or {}).get("url"):
             message += f" {result[key]['url']}"
-    if result.get("skill"):
-        message += " The script can run now."
     if result.get("reply_error"):
         message += f" The calendar was updated, but the reply failed. {result.get('reply_error_text', '')}".rstrip()
 
@@ -297,10 +386,10 @@ def reject(approval_id: int, store: AgentStateStore | None = None) -> dict[str, 
     approval = store.get_approval(approval_id)
 
     if approval is None:
-        return {"ok": False, "message": f"Approval #{approval_id} not found."}
+        return {"ok": False, "message": "That request no longer exists."}
 
     if not store.claim_approval(approval_id):
-        return {"ok": False, "message": f"Approval #{approval_id} was already {approval['status']}."}
+        return {"ok": False, "message": _already(approval)}
 
     store.finish_approval(approval_id, "rejected", f"Rejected by owner at {datetime.now().isoformat(timespec='seconds')}")
     complete_followup_task(store, approval.get("message_id"))
@@ -311,7 +400,7 @@ def reject(approval_id: int, store: AgentStateStore | None = None) -> dict[str, 
             summary="Owner rejected the proposed change; handle this email manually.",
         )
 
-    return {"ok": True, "message": f"#{approval_id} rejected. No changes were made."}
+    return {"ok": True, "message": "Rejected. No changes were made."}
 
 
 def to_draft(approval_id: int, store: AgentStateStore | None = None) -> dict[str, Any]:
@@ -325,13 +414,13 @@ def to_draft(approval_id: int, store: AgentStateStore | None = None) -> dict[str
     approval = store.get_approval(approval_id)
 
     if approval is None:
-        return {"ok": False, "message": f"Approval #{approval_id} not found."}
+        return {"ok": False, "message": "That request no longer exists."}
 
     if approval["type"] not in EMAIL_TYPES:
-        return {"ok": False, "message": f"Approval #{approval_id} is not an email, so it cannot be moved to Drafts."}
+        return {"ok": False, "message": "This is not an email, so it cannot be moved to Gmail Drafts."}
 
     if not store.claim_approval(approval_id):
-        return {"ok": False, "message": f"Approval #{approval_id} was already {approval['status']}."}
+        return {"ok": False, "message": _already(approval)}
 
     payload = approval["payload"]
     attachments = payload.get("attachments", [])
@@ -349,11 +438,11 @@ def to_draft(approval_id: int, store: AgentStateStore | None = None) -> dict[str
         report_failure(exc, "approval.to_draft", approval_id=approval_id, type=approval["type"])
         store.finish_approval(approval_id, "failed", error)
         store.add_failure("approval:to_draft", error, message_id=approval.get("message_id"))
-        return {"ok": False, "message": f"#{approval_id}: could not create the draft, nothing was sent. {safe_error_text(exc)}", "error": error}
+        return {"ok": False, "message": f"The draft could not be created, and nothing was sent. {safe_error_text(exc)}", "error": error}
 
     store.finish_approval(approval_id, "resolved", "Moved to Gmail Drafts by owner", {"draft_id": draft.get("id")})
 
-    message = f"#{approval_id} saved to Gmail Drafts. Nothing was sent; edit and send it from Gmail."
+    message = "Saved to Gmail Drafts. Nothing was sent; edit and send it from Gmail."
     if len(attachments) > 1:
         message += " Attach the files there yourself."
 

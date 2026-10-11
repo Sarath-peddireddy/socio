@@ -1,9 +1,11 @@
 """
-Automatic Google Tasks for emails that need the owner.
+Optional automatic Google Tasks for emails that need the owner. OFF by default.
 
-When an email ends up waiting on the owner (draft to review, approval
-pending, something to check), Socio adds a task to the owner's Google Tasks.
-The task is completed when the owner approves/rejects/resolves it.
+Developer decision (2026-10-11): Socio creates a task only when the owner asks
+(and approves the card). With AGENT_AUTO_TASKS=1, an email that ends up waiting
+on the owner (draft to review, approval pending, something to check) gets a
+task, completed when the owner approves/rejects/resolves it. With it off,
+Socio neither creates nor completes these tasks.
 A failure here never affects how the email itself was handled.
 """
 
@@ -27,7 +29,7 @@ AUTO_TASK_LABELS = {
 
 
 def auto_tasks_enabled() -> bool:
-    return os.getenv("AGENT_AUTO_TASKS", "1").strip().lower() not in {"0", "false", "no", "off"}
+    return os.getenv("AGENT_AUTO_TASKS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def create_followup_task(store: AgentStateStore, message_id: str, thread_id: str, status: str, subject: str, sender: str, details: str) -> dict[str, Any] | None:
@@ -64,7 +66,7 @@ def create_followup_task(store: AgentStateStore, message_id: str, thread_id: str
 def complete_followup_task(store: AgentStateStore, message_id: str | None) -> None:
     """Complete the follow-up task for an email, if Socio created one."""
 
-    if not message_id:
+    if not message_id or not auto_tasks_enabled():
         return
 
     from app.tasks.tasks import complete_task

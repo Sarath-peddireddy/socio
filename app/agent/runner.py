@@ -225,6 +225,7 @@ def handle_message(message_id: str, thread_id: str, *, dry_run: bool = False, st
                     "failures": [],
                     "target_message_id": target["id"],
                     "target_thread_id": thread_id,
+                    "target_subject": target.get("subject", ""),
                     "reply_recipient": target.get("reply_to") or target.get("from", ""),
                     "participants": sorted(thread_participants(thread)),
                     "dry_run": dry_run,

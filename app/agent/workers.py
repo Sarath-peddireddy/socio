@@ -63,6 +63,8 @@ def entity_key(kind: str, args: dict[str, Any]) -> str:
         return f"skill:{args.get('name')}"
     if kind == "create_task":
         return f"task:{str(args.get('title', '')).strip().lower()}"
+    if kind == "remember_rule":
+        return f"rule:{str(args.get('rule', '')).strip().lower()}"
     if kind == "complete_task":
         return f"task-id:{args.get('task_id')}"
     return f"{kind}:{json.dumps(args, sort_keys=True, default=str)[:200]}"

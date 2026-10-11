@@ -13,6 +13,8 @@ Error gateway: full details go to logs/agent.log, the owner gets one short fixed
 - user_message() maps an exception to one of a few predefined strings. They never
   contain tracebacks, class names, or file paths, and they only promise what
   actually happens (nothing is queued or re-run behind the owner's back).
+  user_html() is the same text as a Telegram HTML card (bold title + body);
+  report_failure(..., html=True) returns that.
 """
 
 from __future__ import annotations
@@ -31,11 +33,18 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
-GOOGLE_BUSY = "⚠️ Google services are busy or unreachable right now. Please try again in a few minutes."
-SYSTEM_BUSY = "⚠️ System is handling another task. Please try again in a moment."
-AI_SLOW = "⚠️ The AI model took too long to respond. Please tap /run or retry."
-AI_QUOTA = "⚠️ The AI model's daily limit is used up. Please try again later."
-GENERIC = "⚠️ Unable to complete that task right now. I've logged the issue for review."
+# category -> (card title, sentence). Truthful on purpose: nothing here is retried or queued.
+CARDS = {
+    "google_busy": ("Google Service Busy", "Google services are busy or unreachable right now. Please try again in a few minutes."),
+    "system_busy": ("Workspace Busy", "The system is completing another task. Please try again in a moment."),
+    "ai_timeout": ("AI Reasoning Timeout", "The AI model took too long to respond. Tap /run or send the request again."),
+    "ai_quota": ("AI Daily Limit Reached", "The AI model's daily limit is used up. Please try again later."),
+    "generic": ("Task Paused", "Unable to complete that action right now. The details have been logged for review."),
+}
+
+GOOGLE_BUSY, SYSTEM_BUSY, AI_SLOW, AI_QUOTA, GENERIC = (
+    f"⚠️ {CARDS[key][1]}" for key in ("google_busy", "system_busy", "ai_timeout", "ai_quota", "generic")
+)
 
 # Google HTTP statuses that mean "busy / try later" (not "you asked for something wrong").
 GOOGLE_BUSY_STATUSES = {429, 500, 502, 503, 504}
@@ -157,6 +166,13 @@ def user_message(exc: BaseException) -> str:
     return MESSAGES[classify(exc)]
 
 
+def user_html(exc: BaseException) -> str:
+    """The same message as a Telegram HTML status card (the texts contain no HTML specials)."""
+
+    title, sentence = CARDS[classify(exc)]
+    return f"⚠️ <b>{title}</b>\n{sentence.replace('/run', '<code>/run</code>')}"
+
+
 def plain_message(exc: BaseException) -> str:
     """user_message() without the ⚠️ prefix, for text that already has its own marker."""
 
@@ -174,8 +190,11 @@ def _context_text(context: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def report_failure(exc: BaseException, where: str, **context: Any) -> str:
-    """Log the full stack trace with context to logs/agent.log; return the owner-facing text."""
+def report_failure(exc: BaseException, where: str, *, html: bool = False, **context: Any) -> str:
+    """
+    Log the full stack trace with context to logs/agent.log; return the owner-facing
+    text (plain, or the Telegram HTML card with html=True).
+    """
 
     try:
         logger = _ensure_gateway_logger()
@@ -185,7 +204,7 @@ def report_failure(exc: BaseException, where: str, **context: Any) -> str:
         )
     except Exception:  # logging must never turn one failure into two
         logging.getLogger(__name__).exception("Could not write to %s", log_path())
-    return user_message(exc)
+    return user_html(exc) if html else user_message(exc)
 
 
 def is_validation_error(exc: BaseException) -> bool:

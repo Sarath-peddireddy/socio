@@ -14,7 +14,9 @@
    emails too), every Google Docs/Sheets write, booking, moving, or cancelling
    events, trashing email, and trusting a skill script is held as an approval.
    Only the owner's approval executes it. The agent has no direct booking tool
-   at all (`propose_book_meeting` only). Google Tasks changes are direct.
+   at all (`propose_book_meeting` only). Creating and completing Google Tasks are
+   approvals too (`propose_create_task`, `propose_complete_task`, developer decision
+   2026-10-11); Socio never adds tasks on its own (automatic follow-ups are off).
 4. **Never claim what didn't happen.** An action counts as done only when the
    API result confirms it; sends are re-checked in the thread.
 5. **Memory informs, never authorizes.** Learned preferences and saved skills
@@ -24,6 +26,8 @@
 
 ```
 app/telegram_bot.py      owner-only Telegram front end, approval buttons, scheduled inbox checks
+app/telegram_format.py   Telegram HTML: esc(), agent Markdown -> HTML, HTML-safe clipping, cards
+app/errors.py            error gateway: logs/agent.log + predefined owner messages / status cards
 app/main.py              CLI front end
         │
 app/agent/runner.py      process_inbox / handle_message (email mode), handle_owner_command (owner mode)
@@ -38,7 +42,8 @@ app/agent/approvals.py   execute / reject approval requests (re-validated at exe
 app/agent/state.py       SQLite: message outcomes, attempts, actions, approvals, slot holds, failures
 app/agent/untrusted.py   sanitize + wrap email content in <untrusted_email_body> tags
 app/memory/              semantic.py (long-term memory), embeddings.py (local fastembed),
-                         learning.py (decisions -> memories), skills.py (procedural memory)
+                         learning.py (explicit owner rules), episodic.py (24 h notes),
+                         skills.py (procedural memory)
         │
 app/gmail/               read, search, reply, send, draft, trash (never permanent delete)
 app/calendar/            availability, create, find, move, cancel; holds.py: local soft holds
@@ -87,7 +92,31 @@ Sheets, Tasks, skill scripts) plus `propose_trash_email`. Emails
 event changes, and trashing all become approvals (`OWNER_GATED_TOOLS` in
 `graph.py`), validated first (recipient addresses, reply target, attachments
 in the whitelist, the document must exist), so the card shows the exact email
-or the exact lines / cells to be added (`+ ` lines). Tasks stay direct.
+or the exact lines / cells to be added (`+ ` lines). `append_sheet_row` is refused
+(no card) when an identical row is already in the sheet; the model gets the row
+number and link to tell the owner. Tasks are created and completed only through
+`propose_create_task` / `propose_complete_task` (the tool refuses an empty title or a bad
+due date before any card). Rules the owner states in chat go to
+memory through the `remember_rule` tool (never to Docs/Sheets/Tasks).
+
+Owner-facing text never shows internal ids: cards have no approval numbers,
+`approvals` messages are plain ("Meeting moved.", "This request was already
+approved."; the CLI prefixes `#ID:`), the supervisor report has no task ids,
+and the prompts tell the model to name things by subject, name, or time. The
+bot's follow-up context (last 3 exchanges) stores what each card proposed and
+how the owner decided ("The owner rejected: ..."), so "create a task for this"
+refers to it.
+
+The owner sees each approval request as its own card, so the owner-mode prompt
+(not workers) tells the model not to narrate them and to answer exactly
+`CARDS_ONLY` when approval requests are the only outcome.
+`supervisor.owner_reply()` turns that into an empty reply and the bot sends
+only the cards (no "I have sent an approval request..." preamble). If the
+model says `CARDS_ONLY` but also did something directly (a Google Task) or a
+tool failed, those are listed instead, so nothing done goes unreported.
+`/start`, `/help`, and capability questions ("what can you do?",
+`telegram_format.is_capability_question`) get a fixed welcome card without a
+model call.
 
 ### Supervisor and workers (fan-out / fan-in)
 
@@ -144,16 +173,41 @@ Sharing files by email: any email with an attachment (Drive or local) is an
 approval (`send_reply_with_attachment` / `send_email`; Telegram: Approve &
 Send / Edit in Gmail / Reject).
 
-Follow-up tasks: when an email ends as `needs_review`, `needs_attention`, or
-`awaiting_approval`, a Google Task is created (once per email) and completed
-when the owner approves, rejects, or resolves it. Failures never affect email handling.
+Task tracking (`app/tasks/tracker.py`, `tracked_tasks` table, schema v4): on the
+bot's schedule `check_tasks()` reads the default Google Tasks list once (no AI
+call) and keeps a local copy of the open tasks. It never changes a task itself;
+it creates `complete_task` approvals: overdue tasks get one "Is this done?" card
+(the day after the due date, 09:00-21:00 IST, at most 3 per check, once per due
+date; "Not yet" = rejected, not asked again), and tasks ticked or deleted in the
+Tasks app are untracked silently (any open card about them is resolved). A full
+page of 100 tasks closes nothing (the rest may be on the next page). The
+owner-mode single agent gets the open tasks in its instruction
+(`open_tasks_block`, ids for tool calls only) and proposes closing one when the
+owner says it is done. Old automatic reminders (titles starting "Socio: ") get
+one `close_old_reminders` card per batch ("Close all" / "Keep them"); approving
+completes each, skipping ones already gone. Approving `create_task` starts
+tracking the new task; approving `complete_task` stops it.
+
+Follow-up tasks (`app/agent/followups.py`) are OFF by default (developer decision
+2026-10-11: Socio creates tasks only when asked). With `AGENT_AUTO_TASKS=1`, an
+email that ends as `needs_review`, `needs_attention`, or `awaiting_approval` gets a
+Google Task (once per email), completed when the owner approves, rejects, or
+resolves it. With it off, Socio neither creates nor completes them. Failures never
+affect email handling.
 
 ## Approvals
 
 `propose_*` tools (and, in email mode, `send_gmail_reply`) validate the request
 and the graph records an approval (`pending_approvals` table). The Telegram bot
-pushes each new request with Approve / Reject buttons (replies also get Edit in
-Gmail). `approvals.approve()` claims the request atomically (so a double tap
+pushes each new request as one HTML card (`telegram_format.approval_card`):
+🗑️ Trash, ✉️ Outgoing Email Proposal (To, Subject, the full draft in a
+blockquote), 📅 Meeting Proposal (title, attendee, slot in IST, "Local 24h
+soft-hold active" only while a hold exists, the reply to send afterwards),
+🔁 Move / 🚫 Cancel Meeting, 📝 Workspace Update (target, action, `+` diff),
+🔐 Trust Skill Script. Buttons: Approve & Trash / Book / Move / Cancel, or
+Approve; emails get Approve & Send / Edit in Gmail / Reject. Every dynamic
+value is HTML-escaped. After a tap the card is rendered again from the stored
+request with the result line. `approvals.approve()` claims the request atomically (so a double tap
 cannot run it twice), re-validates (event exists, new slot still free),
 executes, then sends the follow-up reply if one was attached.
 
@@ -174,9 +228,10 @@ Gmail draft instead (one attachment carried over; with several, the owner
 attaches them) and marks the email `needs_review`. A failed execution changes
 nothing further and marks the email `needs_attention`; a rejection marks it
 `needs_review` for the owner. In Telegram a rejection ends silently: the card
-is edited to "❌ Proposal rejected. No changes were made." with an optional
-`+ Add Permanent Rule` button (also after Edit in Gmail), and nothing is
-learned unless the owner taps it (see Memory). Failure messages on the card
+is edited to "❌ Proposal rejected. No changes were made." (Edit in Gmail:
+"✏️ Saved to Gmail Drafts. Nothing was sent."), with no buttons, and nothing is
+learned (the "+ Add Permanent Rule" button was removed, developer decision
+2026-10-11; old buttons only explain how to add a rule). Failure messages on the card
 keep our own validation reasons (e.g. "overlaps 'Dentist'"); anything else is
 a predefined message, while `pending_approvals.resolution`, `failures`, and
 `logs/agent.log` keep the full error.
@@ -215,8 +270,8 @@ Three tiers:
    "after 5pm" (0.95 similar).
    Ingestion (`memory/learning.py`) is explicit only; a decision alone writes
    nothing. `/remember` text is turned into 1-3 tuples by Gemini (stored as
-   written if Gemini is unavailable). `+ Add Permanent Rule` sends one
-   force-reply prompt; the answer goes through one Gemini call that classifies
+   written if Gemini is unavailable). When the owner states a rule in chat, the
+   agent calls `remember_rule`; the text goes through one Gemini call that classifies
    it (`STANDING_POLICY` → upsert as `owner_rule`, confirmed "✓ Rule saved: …";
    `SITUATIONAL` → `episodic_notes` for 24 h, confirmed "Understood for
    today.") and extracts the tuples. Without Gemini a keyword check decides
@@ -267,15 +322,17 @@ loop, workers and the supervisor's fan-out, approval execution, the inbox
 runner, and graph tool calls go through `report_failure(exc, where, **ids)`. It
 writes the stack trace, the location, the ids (never email bodies or tool
 argument values), and a timestamp to `logs/agent.log` (`AGENT_LOG_DIR`;
-rotating, 2 MB x 3) and returns one predefined message:
+rotating, 2 MB x 3) and returns one predefined message: plain text (CLI,
+worker summaries, inbox reasons) or, with `html=True` (the bot), a status card
+"⚠️ <b>Title</b>" + newline + the sentence (Telegram HTML has no `<br>`).
 
-| Exception | Message |
-|---|---|
-| Google `HttpError` 429/5xx, `GoogleApiUnavailableError`, OAuth/DNS transport errors | ⚠️ Google services are busy or unreachable right now. Please try again in a few minutes. |
-| `sqlite3.OperationalError` (locked / busy) | ⚠️ System is handling another task. Please try again in a moment. |
-| Gemini timeout / unreachable / rate limit (`LLMUnavailableError`, `httpx.TimeoutException`) | ⚠️ The AI model took too long to respond. Please tap /run or retry. |
-| Gemini daily quota exhausted | ⚠️ The AI model's daily limit is used up. Please try again later. |
-| anything else | ⚠️ Unable to complete that task right now. I've logged the issue for review. |
+| Exception | Card title | Message |
+|---|---|---|
+| Google `HttpError` 429/5xx, `GoogleApiUnavailableError`, OAuth/DNS transport errors | Google Service Busy | Google services are busy or unreachable right now. Please try again in a few minutes. |
+| `sqlite3.OperationalError` (locked / busy) | Workspace Busy | The system is completing another task. Please try again in a moment. |
+| Gemini timeout / unreachable / rate limit (`LLMUnavailableError`, `httpx.TimeoutException`) | AI Reasoning Timeout | The AI model took too long to respond. Tap /run or send the request again. |
+| Gemini daily quota exhausted | AI Daily Limit Reached | The AI model's daily limit is used up. Please try again later. |
+| anything else | Task Paused | Unable to complete that action right now. The details have been logged for review. |
 
 The wording only promises what happens (developer decision): nothing is
 queued or re-run behind the owner's back, except that an email interrupted by
@@ -283,7 +340,9 @@ an outage is retried on the next inbox check (its reason says so). Our own
 validation errors (`ValueError` family, e.g. "that slot overlaps 'Dentist'")
 keep their message on approval cards and in tool results the model sees;
 everything else is replaced. `/status` shows only a failure count, and
-`Bot.send` drops any traceback-looking line as a last line of defence. The CLI
+`Bot.send` drops any traceback-looking line as a last line of defence. If
+Telegram ever rejects a message's HTML (a formatting bug), the bot logs it and
+resends the same text without tags instead of losing it. The CLI
 still prints `detail (local only)` for failed approvals.
 
 ## Outcome statuses

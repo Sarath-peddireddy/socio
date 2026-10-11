@@ -5,8 +5,8 @@ Approving, rejecting, or editing a request teaches Socio nothing by itself (a
 single decision is not a rule). Memories come from the owner's own words:
 
 1. /remember TEXT (Telegram) or --remember TEXT (CLI): a standing preference.
-2. "+ Add Permanent Rule" under a rejected or edited request: the owner's note is
-   classified first. A STANDING_POLICY ("never book calls before noon") goes to
+2. Asking Socio in chat ("remember: ...", "make it a rule ..."): the agent's
+   remember_rule tool passes the owner's words here, and they are classified first. A STANDING_POLICY ("never book calls before noon") goes to
    long-term memory; a SITUATIONAL note ("already talked to him", "I'm tired
    today") is kept for 24 hours only (app.memory.episodic).
 
@@ -179,7 +179,7 @@ def learn_from_owner_note(note: str, approval: dict[str, Any] | None = None, sto
     return saved
 
 
-# ----- "+ Add Permanent Rule": standing policy or situational note -----------------------
+# ----- owner rules from chat (remember_rule): standing policy or situational note --------
 
 STANDING_POLICY = "STANDING_POLICY"
 SITUATIONAL = "SITUATIONAL"

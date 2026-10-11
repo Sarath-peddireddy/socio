@@ -5,18 +5,25 @@ Telegram front end for Socio.
 
 - Only the owner's chat (TELEGRAM_OWNER_CHAT_ID) can use the bot. Until it is
   set, the bot only replies with the sender's chat id so it can be configured.
+- Every message is Telegram HTML (parse_mode="HTML", app.telegram_format):
+  dynamic values are escaped, the agent's Markdown is converted, never raw.
+- /start, /help, and "what can you do?" get the capabilities card (no model call).
 - Plain messages are instructions for the agent (owner mode); multi-part ones
   are split across worker subagents (app.agent.supervisor).
-- Approval requests arrive with Approve / Reject buttons (emails also get
-  Edit in Gmail, which saves them as a Gmail draft instead).
-- Reject ends quietly: the card says the proposal was rejected and offers an
-  optional "+ Add Permanent Rule" button (also after Edit in Gmail). Only if the
-  owner taps it and types a note is anything learned: a standing policy goes to
-  long-term memory, a situational note is kept for 24 hours. /remember too.
+- Each approval request is one card with its buttons (Approve / Reject; emails
+  also get Edit in Gmail, which saves them as a Gmail draft instead). When an
+  instruction only produced approval requests, the cards are all that is sent.
+- Reject / Edit in Gmail end quietly: the card is updated in place and nothing
+  else is sent. Nothing is learned from a tap; rules come only from the owner
+  asking ("remember: never book calls before noon", the remember_rule tool) or
+  /remember.
+- Owner-facing text never shows internal numbers (approval, message, task ids).
+- The follow-up context (last few exchanges) includes what each card proposed
+  and how the owner decided, so "create a task for this" refers to it.
 - /save_skill NAME saves the last successful multi-step instruction as a skill.
 - The inbox is processed every AGENT_POLL_MINUTES (default 10, 0 = off).
 - Every handler runs behind the error gateway (app.errors): details go to
-  logs/agent.log, the chat only ever gets a short predefined message.
+  logs/agent.log, the chat only ever gets a short predefined status card.
 
 Uses the Telegram Bot API over HTTPS long polling (no webhook, nothing exposed).
 """
@@ -33,53 +40,44 @@ import requests
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.agent.approvals import EMAIL_TYPES, EXECUTABLE_TYPES, approve, describe, reject, to_draft
+from app.agent.approvals import approve, describe, reject, to_draft
 from app.agent.llm import LLMUnavailableError
 from app.agent.runner import BUSY_STATUS, DEFAULT_QUERY, handle_owner_command, process_inbox
 from app.agent.state import AgentStateStore
 from app.agent.supervisor import save_last_plan
-from app.errors import log_path, report_failure, scrub, setup_logging
+from app.errors import report_failure, scrub, setup_logging
 from app.google_api import GoogleApiUnavailableError
 from app.memory import skills as skill_store
 from app.memory.embeddings import get_embedder
 from app.memory.episodic import active_notes
-from app.memory.learning import STANDING_POLICY, learn_from_owner_note, promote_owner_rule
+from app.memory.learning import learn_from_owner_note
 from app.memory.semantic import SemanticMemory, memory_enabled
+from app.tasks.tracker import check_tasks
+from app.telegram_format import (
+    MAX_MESSAGE_CHARS,
+    WELCOME_HTML,
+    approval_card,
+    card_text,
+    clip_html,
+    esc,
+    is_capability_question,
+    md_to_html,
+    strip_html,
+)
 
 
 load_dotenv()
 logger = logging.getLogger("telegram_bot")
 
-MAX_MESSAGE_CHARS = 4000
 HISTORY_TURNS = 3  # owner <-> agent exchanges kept for follow-up questions
-
-HELP_TEXT = """Socio commands:
-/run - check the inbox now
-/dryrun - check the inbox without sending or changing anything
-/status - outcomes, open approvals, recent failures
-/approvals - show open approval requests again
-/new - forget the conversation context
-/remember TEXT - teach me a preference (e.g. no calls before noon)
-/memories - what I have learned; /forget ID removes one
-/save_skill NAME - save your last multi-step instruction as a skill
-/skills - saved skills; /forget_skill NAME archives one
-
-Or just type an instruction, e.g.
-- send my resume to hr@company.com
-- what's on my calendar this week?
-- move my 3pm call with Raj to Friday 11am
-- trash the Swiggy email
-- add Acme, PM, applied today to my applications sheet
-- write a cover letter for Acme in a doc
-- remind me to send the invoice on Friday
-Every email, Docs/Sheets change, booking, moving or cancelling meetings, and
-deleting email asks for your approval first. An email can also be moved to
-Gmail Drafts (Edit in Gmail) so you can change it before sending. After you
-reject something, tap "+ Add Permanent Rule" if you want me to remember why."""
+HELP_TEXT = WELCOME_HTML
 
 REJECTED_TEXT = "❌ Proposal rejected. No changes were made."
-ADD_RULE_BUTTON = "+ Add Permanent Rule"
-RULE_PROMPT = "✍️ Reply to this message with the rule, e.g. \"never book calls before noon\"."
+KEPT_OPEN_TEXT = "👍 Okay, I'll leave it open."
+KEPT_ALL_TEXT = "👍 Okay, I'll leave them as they are."
+DRAFTED_TEXT = "✏️ Saved to Gmail Drafts. Nothing was sent."
+OLD_RULE_BUTTON_TEXT = "That button is no longer used. To add a rule, just tell me, e.g. \"remember: never book calls before noon\"."
+DECISION_WORDS = {"approve": "approved", "reject": "rejected", "draft": "moved to Gmail Drafts (not sent)"}
 
 INTERESTING_STATUSES = {
     "replied": "✅ Replied",
@@ -123,52 +121,51 @@ class Bot:
         self.history: list = []
         self.offset: int | None = None
         self.next_inbox_run = time.monotonic()
-        # The approval whose "+ Add Permanent Rule" was tapped last; the next plain message is the rule.
-        self.awaiting_rule: int | None = None
+        self.next_task_check = time.monotonic()
+        # Decisions taken on cards since the last instruction, for the follow-up context.
+        self.decisions: list[str] = []
 
     # ----- sending -------------------------------------------------------------
 
-    def send(self, text: str, buttons: list | None = None, force_reply: bool = False):
-        params = {"chat_id": self.owner_chat_id, "text": _clip(scrub(text)), "disable_web_page_preview": True}
+    def _call_html(self, method: str, params: dict):
+        """Send HTML; if Telegram cannot parse it (a formatting bug), resend as plain text."""
+
+        params = {**params, "text": clip_html(scrub(params["text"])), "parse_mode": "HTML"}
+        try:
+            return self.api.call(method, **params)
+        except TelegramError as exc:
+            if "parse entities" not in str(exc).lower():
+                raise
+            logger.warning("Telegram rejected the HTML of a %s (%s); sending it as plain text.", method, exc)
+            params.pop("parse_mode")
+            params["text"] = _clip(strip_html(params["text"]))
+            return self.api.call(method, **params)
+
+    def send(self, text: str, buttons: list | None = None):
+        """Send HTML text (callers escape dynamic values with esc / md_to_html)."""
+
+        params = {"chat_id": self.owner_chat_id, "text": text, "disable_web_page_preview": True}
         if buttons:
             params["reply_markup"] = {"inline_keyboard": buttons}
-        elif force_reply:
-            params["reply_markup"] = {"force_reply": True, "input_field_placeholder": "e.g. never book calls before noon"}
-        return self.api.call("sendMessage", **params)
+        return self._call_html("sendMessage", params)
+
+    def _held_approvals(self) -> set[int]:
+        return {hold["approval_id"] for hold in self.store.active_slot_holds()}
 
     def notify_approvals(self, resend_open: bool = False) -> int:
-        """Send approval requests the owner has not seen yet (or all open ones)."""
+        """Send approval requests the owner has not seen yet (or all open ones), one card each."""
 
         approvals = (
             [self.store.get_approval(a["id"]) for a in self.store.pending_approvals()][::-1]
             if resend_open
             else self.store.unnotified_approvals()
         )
+        held = self._held_approvals() if approvals else set()
 
         for approval in approvals:
-            approval_id = approval["id"]
-            if approval["type"] in EMAIL_TYPES:
-                title = {
-                    "send_reply_with_attachment": f"📎 Send this reply with a file? #{approval_id}",
-                    "send_email": f"✉️ Send this email? #{approval_id}",
-                }.get(approval["type"], f"✉️ Send this reply? #{approval_id}")
-                buttons = [
-                    [{"text": "✅ Approve & Send", "callback_data": f"approve:{approval_id}"},
-                     {"text": "✏️ Edit in Gmail", "callback_data": f"draft:{approval_id}"}],
-                    [{"text": "❌ Reject", "callback_data": f"reject:{approval_id}"}],
-                ]
-            elif approval["type"] in EXECUTABLE_TYPES:
-                title = f"🔐 Approval needed #{approval_id}"
-                buttons = [[
-                    {"text": "✅ Approve", "callback_data": f"approve:{approval_id}"},
-                    {"text": "❌ Reject", "callback_data": f"reject:{approval_id}"},
-                ]]
-            else:
-                title = f"📝 For your review #{approval_id}"
-                buttons = [[{"text": "✔️ Mark done", "callback_data": f"approve:{approval_id}"}]]
-
-            self.send(f"{title}\n\n{describe(approval)}", buttons)
-            self.store.mark_approval_notified(approval_id)
+            text, buttons = approval_card(approval, hold_active=approval["id"] in held)
+            self.send(text, buttons)
+            self.store.mark_approval_notified(approval["id"])
 
         return len(approvals)
 
@@ -181,7 +178,7 @@ class Bot:
         if outcomes and outcomes[0].status == BUSY_STATUS:
             # Another process (e.g. the CLI) is processing the inbox; the scheduled check stays quiet.
             if announce:
-                self.send(f"⏳ {outcomes[0].reason}")
+                self.send(f"⏳ {esc(outcomes[0].reason)}")
             return
 
         lines = []
@@ -191,15 +188,15 @@ class Bot:
             if not label:
                 quiet += 1
                 continue
-            line = f"{label}: {outcome.subject or '(no subject)'}"
+            line = f"{label}: <b>{esc(outcome.subject or '(no subject)')}</b>"
             if outcome.sender:
-                line += f"\n   from {outcome.sender}"
+                line += f"\n   from {esc(outcome.sender)}"
             if outcome.status in {"failed", "needs_attention", "needs_review"} and (outcome.reason or outcome.summary):
-                line += f"\n   {(outcome.summary or outcome.reason)[:300]}"
+                line += f"\n   <i>{esc((outcome.summary or outcome.reason)[:300])}</i>"
             lines.append(line)
 
         if lines or announce:
-            header = f"{'🧪 Dry run - ' if dry_run else ''}Inbox check: {len(lines)} handled"
+            header = f"{'🧪 Dry run - ' if dry_run else ''}📬 <b>Inbox check:</b> {len(lines)} handled"
             if quiet:
                 header += f", {quiet} needed nothing"
             self.send(header + ("\n\n" + "\n\n".join(lines) if lines else ""))
@@ -228,17 +225,17 @@ class Bot:
             return
 
         try:
-            if action == "rule":
-                self._ask_for_rule(int(raw_id), query)
+            if action == "rule":  # cards sent before the button was removed
+                self._answer(query, OLD_RULE_BUTTON_TEXT)
             else:
                 self._decide(action, int(raw_id), query)
         except Exception as exc:
-            text = report_failure(exc, "telegram.callback", action=action, approval_id=raw_id)
-            self._answer(query, text)
+            text = report_failure(exc, "telegram.callback", html=True, action=action, approval_id=raw_id)
+            self._answer(query, strip_html(text))
             self._report_error(text)
 
     def _answer(self, query: dict, text: str) -> None:
-        """Close the button's loading spinner (best effort: an old query cannot be answered)."""
+        """Close the button's loading spinner (best effort: an old query cannot be answered). Plain text."""
 
         try:
             self.api.call("answerCallbackQuery", callback_query_id=query["id"], text=scrub(text)[:190])
@@ -254,34 +251,32 @@ class Bot:
             outcome = approve(approval_id, self.store)
         self._answer(query, outcome["message"])
 
-        if action == "reject" and outcome["ok"]:
+        decided = self.store.get_approval(approval_id)
+        if action == "reject" and outcome["ok"] and decided and decided["type"] == "complete_task":
+            status_line = KEPT_OPEN_TEXT
+        elif action == "reject" and outcome["ok"] and decided and decided["type"] == "close_old_reminders":
+            status_line = KEPT_ALL_TEXT
+        elif action == "reject" and outcome["ok"]:
             status_line = REJECTED_TEXT
+        elif action == "draft" and outcome["ok"]:
+            extra = " Attach the files there yourself." if "Attach the files" in outcome["message"] else ""
+            status_line = DRAFTED_TEXT + extra
         else:
-            mark = {"draft": "✏️"}.get(action, "✅") if outcome["ok"] else "⚠️"
-            status_line = f"{mark} {outcome['message']}"
+            mark = "✅" if outcome["ok"] else "⚠️"
+            status_line = f"{mark} {esc(outcome['message'])}"
 
-        original = query.get("message", {}).get("text", "")
-        params = {
+        # The card is rendered again from the stored request (it is decided now, so no hold
+        # line and no buttons). Nothing else is sent.
+        approval = self.store.get_approval(approval_id)
+        original = card_text(approval) if approval else esc(query.get("message", {}).get("text", ""))
+        self._call_html("editMessageText", {
             "chat_id": query["message"]["chat"]["id"],
             "message_id": query["message"]["message_id"],
-            "text": _clip(scrub(f"{original}\n\n{status_line}")),
-        }
-        # Nothing else is sent: learning from a rejection or a rewrite is opt-in.
-        if outcome["ok"] and action in {"reject", "draft"} and memory_enabled():
-            params["reply_markup"] = {"inline_keyboard": [[{"text": ADD_RULE_BUTTON, "callback_data": f"rule:{approval_id}"}]]}
-        self.api.call("editMessageText", **params)
-
-    def _ask_for_rule(self, approval_id: int, query: dict) -> None:
-        approval = self.store.get_approval(approval_id)
-        if approval is None or approval["status"] not in {"rejected", "resolved"} or not memory_enabled():
-            self._answer(query, "There is nothing to add a rule for here.")
-            return
-
-        self._answer(query, "Type the rule as a reply.")
-        prompt = self.send(RULE_PROMPT, force_reply=True)
-        if isinstance(prompt, dict) and prompt.get("message_id"):
-            self.store.add_feedback_request(int(prompt["message_id"]), approval_id)
-        self.awaiting_rule = approval_id
+            "text": f"{original}\n\n{status_line}",
+            "disable_web_page_preview": True,
+        })
+        if outcome["ok"] and approval:
+            self.decisions.append(f"The owner {DECISION_WORDS[action]}: {describe(approval)}")
 
     def _handle_message(self, message: dict) -> None:
         chat_id = message.get("chat", {}).get("id")
@@ -292,7 +287,11 @@ class Bot:
             self.api.call(
                 "sendMessage",
                 chat_id=chat_id,
-                text=f"Your chat id is {chat_id}.\nAdd TELEGRAM_OWNER_CHAT_ID={chat_id} to .env and restart the bot.",
+                parse_mode="HTML",
+                text=(
+                    f"Your chat id is <code>{esc(chat_id)}</code>.\n"
+                    f"Add <code>TELEGRAM_OWNER_CHAT_ID={esc(chat_id)}</code> to .env and restart the bot."
+                ),
             )
             return
 
@@ -305,31 +304,16 @@ class Bot:
             self.send("Please send a text message.")
             return
 
-        # The owner answered the "+ Add Permanent Rule" prompt: classify and keep it
-        # instead of running it as an instruction.
-        replied_to = (message.get("reply_to_message") or {}).get("message_id")
-        if replied_to is not None:
-            approval_id = self.store.pop_feedback_request(int(replied_to))
-            if approval_id is not None:
-                self.awaiting_rule = None
-                self._promote(text, self.store.get_approval(approval_id))
-                return
-        if self.awaiting_rule is not None:
-            approval_id, self.awaiting_rule = self.awaiting_rule, None
-            if not text.startswith("/"):  # a command cancels the pending rule
-                self._promote(text, self.store.get_approval(approval_id))
-                return
-
         command = text.split()[0].split("@")[0].lower()
         argument = text[len(text.split()[0]):].strip()
 
-        if command in {"/start", "/help"}:
+        if command in {"/start", "/help"} or is_capability_question(text):
             self.send(HELP_TEXT)
         elif command == "/run":
-            self.send("Checking the inbox…")
+            self.send("📬 Checking the inbox…")
             self.run_inbox(announce=True)
         elif command == "/dryrun":
-            self.send("Dry run: checking the inbox without sending or changing anything…")
+            self.send("🧪 Dry run: checking the inbox without sending or changing anything…")
             self.run_inbox(dry_run=True, announce=True)
         elif command == "/status":
             self.send(self._status_text())
@@ -337,18 +321,18 @@ class Bot:
             if not self.notify_approvals(resend_open=True):
                 self.send("No open approval requests.")
         elif command == "/new":
-            self.history = []
+            self.history, self.decisions = [], []
             self.send("Okay, starting fresh.")
         elif command == "/remember":
             if argument:
                 self._learn(argument, None)
             else:
-                self.send("Tell me what to remember, e.g. /remember no calls before 12:00")
+                self.send("Tell me what to remember, e.g. <code>/remember no calls before 12:00</code>")
         elif command == "/memories":
             self.send(self._memories_text())
         elif command == "/forget":
             ok = argument.isdigit() and SemanticMemory(self.store).forget(int(argument))
-            self.send(f"Forgot memory {argument}." if ok else "Usage: /forget ID (see /memories).")
+            self.send(f"Forgot memory {esc(argument)}." if ok else "Usage: <code>/forget ID</code> (see /memories).")
         elif command == "/skills":
             self.send(self._skills_text())
         elif command == "/save_skill":
@@ -358,48 +342,60 @@ class Bot:
                 ok = bool(argument) and skill_store.archive_skill(argument)
             except skill_store.SkillError:
                 ok = False
-            self.send(f"Archived skill {argument} (skills/.archive)." if ok else "Usage: /forget_skill NAME (see /skills).")
+            self.send(f"Archived skill <b>{esc(argument)}</b> (skills/.archive)." if ok else "Usage: <code>/forget_skill NAME</code> (see /skills).")
         else:
             self._run_instruction(text)
 
     def _run_instruction(self, text: str) -> None:
         self.api.call("sendChatAction", chat_id=self.owner_chat_id, action="typing")
+        self._note_decisions()
         result = handle_owner_command(text, history=self.history)
-        self.send(result.reply)
 
-        self.history += [HumanMessage(content=f"Instruction from the owner:\n{text}"), AIMessage(content=result.reply)]
+        # An empty reply means the approval cards say it all: no "I have sent an approval request" preamble.
+        if result.reply.strip():
+            self.send(md_to_html(result.reply))
+        if result.approval_ids:
+            self.notify_approvals()
+
+        # The context for follow-ups says what each card proposed, not just that cards were sent.
+        remembered = result.reply
+        cards = [self.store.get_approval(i) for i in result.approval_ids]
+        if cards:
+            remembered += "\n(Shown to the owner as approval cards, waiting for their decision:\n" + "\n".join(
+                f"- {describe(card)}" for card in cards if card
+            ) + ")"
+        self.history += [HumanMessage(content=f"Instruction from the owner:\n{text}"), AIMessage(content=remembered.strip() or "Done.")]
         self.history = self.history[-2 * HISTORY_TURNS:]
+
+    def _note_decisions(self) -> None:
+        """Add the owner's taps since the last instruction to the last reply in the context."""
+
+        if self.decisions and self.history and isinstance(self.history[-1], AIMessage):
+            note = "\n(Afterwards: " + " / ".join(self.decisions) + ")"
+            self.history[-1] = AIMessage(content=self.history[-1].content + note)
+        self.decisions = []
 
     def _learn(self, text: str, approval: dict | None) -> None:
         if not memory_enabled():
             self.send("Memory is turned off (AGENT_MEMORY=0).")
             return
         saved = learn_from_owner_note(text, approval, store=self.store)
-        lines = [f"{'🧠 Noted' if item['created'] else '🧠 Updated'} [{item['id']}]: {item['entity']}: {item['preference']}" for item in saved]
+        lines = [f"🧠 {'Noted' if item['created'] else 'Updated'}: {esc(item['preference'])}" for item in saved]
         self.send("\n".join(lines) or "Nothing to remember.")
-
-    def _promote(self, text: str, approval: dict | None) -> None:
-        """The owner's note after "+ Add Permanent Rule": a standing policy or a note for today."""
-
-        if not memory_enabled():
-            self.send("Memory is turned off (AGENT_MEMORY=0).")
-            return
-        result = promote_owner_rule(text, approval, store=self.store)
-        if result["kind"] == STANDING_POLICY:
-            self.send(f"✓ Rule saved: {result['summary']}")
-        else:
-            self.send("Understood for today.")
 
     def _save_skill(self, name: str) -> None:
         if not name:
-            self.send("Usage: /save_skill NAME - saves your last successful multi-step instruction as a skill.")
+            self.send("Usage: <code>/save_skill NAME</code> - saves your last successful multi-step instruction as a skill.")
             return
         try:
             saved = save_last_plan(name, store=self.store)
         except skill_store.SkillError as exc:
-            self.send(f"⚠️ {exc}")
+            self.send(f"⚠️ {esc(exc)}")
             return
-        text = f"🧩 Saved skill '{saved.name}' ({saved.tasks} steps; parameters: {', '.join(saved.parameters) or 'none'})."
+        text = (
+            f"🧩 Saved skill <b>{esc(saved.name)}</b> ({saved.tasks} steps; "
+            f"parameters: {esc(', '.join(saved.parameters) or 'none')})."
+        )
         if not saved.generalized:
             text += " It was saved exactly as it ran, so it repeats the same names and dates."
         self.send(text + " A matching request will reuse it (/skills to see it).")
@@ -408,39 +404,46 @@ class Bot:
         memories = SemanticMemory(self.store).all(limit=20)
         notes = active_notes(self.store)
         if not memories and not notes:
-            return "I haven't learned anything yet. Use /remember, or tap \"+ Add Permanent Rule\" after rejecting something."
+            return "I haven't learned any rules yet. Just tell me one, e.g. \"remember: never book calls before noon\"."
         lines = []
         if memories:
-            lines.append("What I've learned (newest first):")
-            lines += [f"[{m.id}] {m.line()}" for m in memories]
+            lines.append("🧠 <b>Rules I follow</b> (newest first):")
+            lines += [
+                f"{m.id}. {esc(m.preference)}" + ("" if m.entity.lower() == "owner" else f" <i>({esc(m.entity)})</i>")
+                for m in memories
+            ]
+            lines.append("<i>To remove one, send /forget and its number.</i>")
         if notes:
-            lines.append("For today only:")
-            lines += [f"- [{n['entity']}] {n['note']}" for n in notes]
+            lines.append("🕒 <b>For today only:</b>")
+            lines += [f"• {esc(n['note'])}" for n in notes]
         return "\n".join(lines)
 
     def _skills_text(self) -> str:
         skills = skill_store.list_skills()
         if not skills:
-            return "No saved skills yet. After a multi-step instruction succeeds, save it with /save_skill NAME."
+            return "No saved skills yet. After a multi-step instruction succeeds, save it with <code>/save_skill NAME</code>."
         lines = []
         for skill in skills:
             kind = f"script {skill.script}" if skill.script else f"{len(skill.plan)} steps"
-            lines.append(f"- {skill.name} ({kind}, by {skill.author}): {skill.description}")
-        return "Saved skills:\n" + "\n".join(lines)
+            lines.append(f"• <b>{esc(skill.name)}</b> ({esc(kind)}, by {esc(skill.author)}): {esc(skill.description)}")
+        return "🧩 <b>Saved skills:</b>\n" + "\n".join(lines)
 
     def _status_text(self) -> str:
         counts = self.store.status_counts()
-        lines = ["Email outcomes: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none yet")]
-        lines.append(f"Open approval requests: {len(self.store.pending_approvals())} (/approvals to show)")
+        lines = ["📊 <b>Socio status</b>", ""]
+        lines.append("<b>Email outcomes:</b> " + (esc(", ".join(f"{k} {v}" for k, v in sorted(counts.items()))) or "none yet"))
+        lines.append(f"<b>Open approval requests:</b> {len(self.store.pending_approvals())} (/approvals to show)")
+        lines.append(f"<b>Active calendar holds:</b> {len(self.store.active_slot_holds())}")
+        lines.append(f"<b>Open tasks I'm keeping an eye on:</b> {len(self.store.tracked_tasks('open'))}")
         interrupted = self.store.interrupted_supervisor_runs()
         if interrupted:
-            lines.append(f"Interrupted instructions (not re-run): {', '.join('#' + str(r['id']) for r in interrupted)}")
+            lines.append(f"<b>Instructions stopped by a restart</b> (not re-run): {len(interrupted)}")
         if memory_enabled():
-            lines.append(f"Memories: {SemanticMemory(self.store).count()} (/memories); skills: {len(skill_store.list_skills())} (/skills)")
+            lines.append(f"<b>Memories:</b> {SemanticMemory(self.store).count()} (/memories); <b>skills:</b> {len(skill_store.list_skills())} (/skills)")
         # Raw failure messages hold internal details: only a count goes to the chat.
         failures = self.store.failures()
         if failures:
-            lines.append(f"Logged failures: {len(failures)} (details are in {log_path().parent.name}/{log_path().name} on this computer)")
+            lines.append(f"<b>Problems logged for review:</b> {len(failures)}")
         return "\n".join(lines)
 
     # ----- main loop ---------------------------------------------------------------
@@ -459,7 +462,7 @@ class Bot:
                 self.handle_update(update)
             except Exception as exc:
                 kind = "callback_query" if "callback_query" in update else "message"
-                self._report_error(report_failure(exc, "telegram.update", update_id=update.get("update_id"), kind=kind))
+                self._report_error(report_failure(exc, "telegram.update", html=True, update_id=update.get("update_id"), kind=kind))
 
         if self.owner_chat_id is not None:
             if self.poll_seconds and time.monotonic() >= self.next_inbox_run:
@@ -470,15 +473,23 @@ class Bot:
                     # An outage during a scheduled check stays quiet; the next check retries.
                     report_failure(exc, "telegram.scheduled_inbox")
                 except Exception as exc:
-                    self._report_error(report_failure(exc, "telegram.scheduled_inbox"))
+                    self._report_error(report_failure(exc, "telegram.scheduled_inbox", html=True))
+
+            if self.poll_seconds and time.monotonic() >= self.next_task_check:
+                self.next_task_check = time.monotonic() + self.poll_seconds
+                try:
+                    check_tasks(self.store)  # asks "Is this done?" through approval cards
+                except Exception as exc:
+                    # A background check (e.g. not signed in to Google Tasks) never interrupts the chat.
+                    report_failure(exc, "telegram.task_check")
 
             try:
                 self.notify_approvals()
             except Exception as exc:
-                self._report_error(report_failure(exc, "telegram.notify_approvals"))
+                self._report_error(report_failure(exc, "telegram.notify_approvals", html=True))
 
     def _report_error(self, text: str) -> None:
-        """Send a predefined gateway message (never raw exception text)."""
+        """Send a predefined gateway status card (never raw exception text)."""
 
         if self.owner_chat_id is None:
             return
@@ -489,7 +500,7 @@ class Bot:
 
     def run_forever(self) -> None:
         if self.owner_chat_id is not None:
-            self.send("🤖 Socio is online. Send /help for commands.")
+            self.send("🤖 <b>Socio is online.</b> Send /help for commands.")
 
         # Load the local embedding model in the background so the first recall is fast.
         if memory_enabled():

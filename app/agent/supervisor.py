@@ -35,8 +35,9 @@ from pydantic import BaseModel, Field
 
 from app.agent.graph import AGENT_TOOLS, create_agent_graph
 from app.agent.llm import get_llm, invoke_llm
+from app.agent.prompts import CARDS_ONLY
 from app.agent.state import AgentStateStore
-from app.agent.taskgraph import MAX_TASKS, PlanError, normalize_plan, parallel_width, topological_order
+from app.agent.taskgraph import MAX_TASKS, PlanError, normalize_plan, topological_order
 from app.agent.workers import run_worker
 from app.errors import plain_message, report_failure
 from app.memory.episodic import notes_block
@@ -279,21 +280,20 @@ def resolve_overlaps(results: dict[str, dict[str, Any]], store: AgentStateStore,
                     entity["duplicate_of"] = keep
                     if not dry_run:
                         store.resolve_pending_approval(entity["approval_id"], f"Duplicate of #{keep} from the same instruction")
-                    notes.append(f"#{entity['approval_id']} ({task_id}) duplicated #{keep} and was closed.")
+                    notes.append("Two parts of your request proposed the same change; you'll see it only once.")
                 else:
                     first_approval.setdefault(key, (task_id, entity["approval_id"]))
             elif entity.get("status") == "completed":
                 if key in first_change and first_change[key] != task_id:
-                    notes.append(f"{task_id} and {first_change[key]} both changed {key}.")
+                    notes.append("Two parts of your request changed the same item; please check it.")
                 first_change.setdefault(key, task_id)
     return notes
 
 
 def build_report(tasks: list[dict[str, Any]], results: dict[str, dict[str, Any]], notes: list[str], skill: str = "", dry_run: bool = False) -> str:
-    width = parallel_width(tasks)
-    header = f"{'🧪 Dry run - ' if dry_run else ''}🧭 Split into {len(tasks)} tasks" + (f" (up to {min(width, MAX_WORKERS)} at once)" if width > 1 else "")
+    header = f"{'🧪 Dry run - ' if dry_run else ''}🧭 I handled your request in {len(tasks)} parts"
     if skill:
-        header += f", using skill '{skill}'"
+        header += f" (using your saved skill '{skill}')"
     lines = [header + ":"]
 
     approvals: list[int] = []
@@ -302,14 +302,15 @@ def build_report(tasks: list[dict[str, Any]], results: dict[str, dict[str, Any]]
         mark = "✅" if payload["status"] == "SUCCESS" else "❌"
         goal = " ".join(task["goal_contract"].split())
         goal = goal if len(goal) <= 70 else goal[:69] + "…"
-        lines.append(f"{mark} {task['task_id']} · {goal}\n   {payload['diff_summary']}")
+        lines.append(f"{mark} {goal}\n   {payload['diff_summary']}")
         approvals += [
             e["approval_id"] for e in payload.get("modified_entities", [])
             if e.get("kind") == "approval" and e.get("approval_id") and not e.get("duplicate_of")
         ]
 
     if approvals:
-        lines.append("⏳ Waiting for your approval: " + ", ".join(f"#{a}" for a in approvals))
+        count = len(set(approvals))
+        lines.append(f"⏳ {count} {'item is' if count == 1 else 'items are'} waiting for your approval (see the cards).")
     lines += [f"⚠️ {note}" for note in notes]
     return "\n".join(lines)
 
@@ -436,8 +437,10 @@ def save_last_plan(name: str, store: AgentStateStore | None = None) -> SavedSkil
 def run_single_agent(text: str, *, history: list | None = None, dry_run: bool = False, memories: list[Memory] | None = None) -> OwnerCommandResult:
     """The plain owner-mode agent (one context, full owner toolset)."""
 
+    from app.tasks.tracker import open_tasks_block
+
     instruction = f"Instruction from the owner:\n{text}"
-    for block in (format_memories(memories or []), notes_block()):
+    for block in (format_memories(memories or []), notes_block(), open_tasks_block()):
         if block:
             instruction += f"\n\n{block}"
 
@@ -453,11 +456,57 @@ def run_single_agent(text: str, *, history: list | None = None, dry_run: bool = 
         config={"recursion_limit": OWNER_RECURSION_LIMIT},
     )
     messages = result.get("messages", [])
+    approval_ids = [approval["id"] for approval in result.get("pending_approvals", []) if "id" in approval]
+    actions = result.get("actions", [])
     return OwnerCommandResult(
-        reply=(messages[-1].text.strip() if messages else "") or "Done.",
-        actions=result.get("actions", []),
-        approval_ids=[approval["id"] for approval in result.get("pending_approvals", []) if "id" in approval],
+        reply=owner_reply(messages[-1].text if messages else "", approval_ids, dry_run=dry_run, actions=actions),
+        actions=actions,
+        approval_ids=approval_ids,
     )
+
+
+_CARDS_ONLY = re.compile(rf"[\s`*\"'(\[]*{CARDS_ONLY}[\s`*\"'.)\]]*")
+
+
+def _direct_outcomes(actions: list[dict[str, Any]]) -> list[str]:
+    """What the agent did without an approval card (or failed to do), one line each."""
+
+    lines = []
+    for action in actions:
+        kind, status, args = action.get("type", ""), action.get("status", ""), action.get("args") or {}
+        if status in {"failed", "unknown"}:
+            lines.append(f"⚠️ {kind.replace('_', ' ')} did not complete" + (" (it is unknown whether it happened)." if status == "unknown" else "."))
+        elif status == "completed" and kind == "remember_rule":
+            lines.append(f"✅ Rule saved: {(action.get('result') or {}).get('summary') or args.get('rule', '')}")
+        elif status == "completed" and kind == "create_reply_draft":
+            lines.append("✅ Saved a reply draft in Gmail Drafts.")
+        elif status == "completed":
+            lines.append(f"✅ Done: {kind.replace('_', ' ')}.")
+    return lines
+
+
+def owner_reply(text: str, approval_ids: list[int], dry_run: bool = False, actions: list[dict[str, Any]] | None = None) -> str:
+    """
+    The single agent's answer for the owner. Empty when the approval cards say it all
+    (the model answered CARDS_ONLY), so the owner gets the cards and no preamble.
+    If the model said CARDS_ONLY but also changed something directly (a Google Task) or
+    a tool failed, those are listed instead: nothing done is ever left unreported.
+    """
+
+    text = (text or "").strip()
+    said_cards_only = bool(_CARDS_ONLY.search(text))
+    reply = _CARDS_ONLY.sub(" ", text).strip() if said_cards_only else text
+    if not reply and said_cards_only:
+        reply = "\n".join(_direct_outcomes(actions or []))
+    if reply or approval_ids:
+        return reply
+    if said_cards_only:
+        # The model claimed approval requests that do not exist: nothing was done.
+        return (
+            "🧪 Dry run: nothing was proposed or changed." if dry_run
+            else "I'm not sure what you'd like me to do yet. Could you give me a few more details?"
+        )
+    return "Done."
 
 
 def should_plan(text: str, skills: list[tuple[Skill, float]]) -> bool:

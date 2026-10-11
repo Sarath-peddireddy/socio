@@ -127,7 +127,7 @@ def _memory_command(args) -> int:
         return 0 if forgotten else 1
 
     memories = memory.all(limit=100)
-    print(f"Memories: {len(memories)}" + ("" if memories else " (use --remember, or + Add Permanent Rule in Telegram)"))
+    print(f"Memories: {len(memories)}" + ("" if memories else " (use --remember, or tell Socio 'remember: ...' in Telegram)"))
     for item in memories:
         print(f"  [{item.id}] {item.line()}  <{item.source}, x{item.hits}>")
     return 0
@@ -195,7 +195,7 @@ def main(argv=None) -> int:
             outcome = reject(args.reject)
         else:
             outcome = to_draft(args.draft)
-        print(outcome["message"])
+        print(f"#{args.approve if args.approve is not None else args.reject if args.reject is not None else args.draft}: {outcome['message']}")
         if outcome.get("error"):
             print(f"  detail (local only): {outcome['error']}")
         return 0 if outcome["ok"] else 1
@@ -205,7 +205,8 @@ def main(argv=None) -> int:
 
     if args.ask:
         result = handle_owner_command(args.ask, dry_run=args.dry_run)
-        print(result.reply)
+        if result.reply:
+            print(result.reply)
         for approval_id in result.approval_ids:
             print(f"\nWaiting for your approval (#{approval_id}):")
             print(describe(AgentStateStore().get_approval(approval_id)))

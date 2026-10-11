@@ -16,10 +16,8 @@ from app.agent.tools import (
     append_sheet_row,
     append_to_document,
     check_reply_needed,
-    complete_task,
     create_document,
     create_spreadsheet,
-    create_task,
     list_tasks,
     propose_book_meeting,
     read_document,
@@ -31,8 +29,11 @@ from app.agent.tools import (
     get_recent_emails,
     get_thread,
     propose_cancel_calendar_event,
+    propose_complete_task,
+    propose_create_task,
     propose_move_calendar_event,
     propose_trash_email,
+    remember_rule,
     run_skill_script,
     search_gmail,
     send_gmail_reply,
@@ -69,8 +70,9 @@ AGENT_TOOLS = [
     append_sheet_row,
     create_spreadsheet,
     list_tasks,
-    create_task,
-    complete_task,
+    propose_create_task,
+    propose_complete_task,
+    remember_rule,
     run_skill_script,
 ]
 TOOLS_BY_NAME = {agent_tool.name: agent_tool for agent_tool in AGENT_TOOLS}
@@ -84,8 +86,7 @@ SIDE_EFFECT_TOOLS = {
     "append_to_document",
     "create_spreadsheet",
     "append_sheet_row",
-    "create_task",
-    "complete_task",
+    "remember_rule",
 }
 
 # Tools that only create an approval request for the owner (see app.agent.approvals).
@@ -96,6 +97,8 @@ PROPOSAL_TOOLS = {
     "propose_move_calendar_event",
     "propose_cancel_calendar_event",
     "propose_trash_email",
+    "propose_complete_task",
+    "propose_create_task",
 }
 
 # Proposals whose new time is held locally until the owner decides (see app.calendar.holds).
@@ -163,6 +166,7 @@ class AgentState(TypedDict, total=False):
     # Set by the runner when handling one specific email (optional otherwise).
     target_message_id: str
     target_thread_id: str
+    target_subject: str
     reply_recipient: str
     participants: list[str]
     dry_run: bool
@@ -210,14 +214,14 @@ def _action_target(tool_name: str, args: dict[str, Any]) -> str:
         return args.get("message_id", "")
     if tool_name == "send_new_email":
         return args.get("to", "")
-    if tool_name in {"create_document", "create_spreadsheet", "create_task"}:
+    if tool_name in {"create_document", "create_spreadsheet"}:
         return args.get("title", "")
     if tool_name == "append_to_document":
         return args.get("document", "")
     if tool_name == "append_sheet_row":
         return args.get("spreadsheet", "")
-    if tool_name == "complete_task":
-        return args.get("task_id", "")
+    if tool_name == "remember_rule":
+        return "owner rule"
     return ""
 
 
@@ -336,9 +340,14 @@ def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any
         from app.gmail.tools import get_thread_details
 
         thread_id, message_id, to = args.get("thread_id", ""), args.get("message_id", ""), args.get("to", "")
-        check_reply_target(get_thread_details(thread_id), thread_id, message_id, to)
+        thread = get_thread_details(thread_id)
+        check_reply_target(thread, thread_id, message_id, to)
+        subject = next((m.get("subject", "") for m in thread if m.get("id") == message_id), "")
         proposal = _reply_proposal(args)
-        proposal["reply"] = {"thread_id": thread_id, "message_id": message_id, "to": to, "body": proposal.pop("reply_body")}
+        proposal["reply"] = {
+            "thread_id": thread_id, "message_id": message_id, "to": to,
+            "subject": subject, "body": proposal.pop("reply_body"),
+        }
         proposal.pop("reason", None)
         return proposal
 
@@ -387,6 +396,15 @@ def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any
             raise ValueError("The row has no values.")
         sheet = sheets.read_sheet(args.get("spreadsheet", ""), args.get("tab", ""))
         header = sheet["rows"][0] if sheet.get("rows") else []
+        # The same row again is almost always a misunderstanding ("I don't see it, add it again").
+        wanted = [value.strip().lower() for value in values]
+        for number, row in enumerate(sheet.get("rows") or [], start=1):
+            cells = [str(cell).strip().lower() for cell in row]
+            if cells[: len(wanted)] == wanted and not any(cells[len(wanted):]):
+                raise ValueError(
+                    f"That exact row is already in '{sheet.get('title', 'the sheet')}' (row {number}), so nothing "
+                    f"was added. Tell the owner it is already there and give them the link: {sheet.get('url', '')}"
+                )
         return {
             "type": "append_sheet_row",
             "document": args["spreadsheet"],
@@ -430,6 +448,7 @@ def _record_proposal(
                 "thread_id": state.get("target_thread_id"),
                 "message_id": state.get("target_message_id"),
                 "to": state.get("reply_recipient", ""),
+                "subject": state.get("target_subject", ""),
                 "body": reply_body,
             }
 
@@ -477,7 +496,11 @@ def _record_proposal(
         f"Approval request #{approval_id} sent to the owner. NOTHING has changed yet. "
         + ("Do not send a reply now: your reply_body is sent automatically after approval. " if holds_reply else "")
         + ("Do not call the tool again for this change. " if not _is_email_mode(state) else "")
-        + "Say in your summary that this is waiting for the owner's approval."
+        + (
+            "The owner sees it as a card with every detail; do not describe it in your answer."
+            if not _is_email_mode(state) and not state.get("worker")
+            else "Say in your summary that this is waiting for the owner's approval."
+        )
     )
 
 

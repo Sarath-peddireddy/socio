@@ -277,6 +277,26 @@ class AgentStateStore:
         )
         cls._ensure_column(conn, "supervisor_runs", "skill", "TEXT")
 
+    @classmethod
+    def _migrate_v4_tracked_tasks(cls, conn: sqlite3.Connection) -> None:
+        """The owner's Google Tasks as Socio last saw them (app.tasks.tracker)."""
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracked_tasks (
+                task_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                due TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                closed_how TEXT,
+                due_asked_for TEXT,
+                cleanup_asked INTEGER NOT NULL DEFAULT 0,
+                first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
     # ----- processed messages -------------------------------------------------
 
     def mark_processed(self, message_id: str, thread_id: str | None = None, status: str = "processed", summary: str | None = None, metadata: dict[str, Any] | None = None) -> None:
@@ -736,7 +756,63 @@ class AgentStateStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    # ----- Telegram rule prompts (owner taps "+ Add Permanent Rule" after Reject / Edit in Gmail)
+    # ----- tracked Google Tasks (app.tasks.tracker) ---------------------------------
+
+    def upsert_tracked_task(self, task_id: str, title: str, due: str = "") -> bool:
+        """Record an open task (new, renamed, re-dated, or reopened). Returns True if it is new."""
+
+        with self._connect() as conn:
+            known = conn.execute("SELECT 1 FROM tracked_tasks WHERE task_id = ?", (task_id,)).fetchone()
+            conn.execute(
+                """
+                INSERT INTO tracked_tasks (task_id, title, due) VALUES (?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    title = excluded.title, due = excluded.due, status = 'open', closed_how = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (task_id, title, due or None),
+            )
+            return known is None
+
+    def tracked_tasks(self, status: str = "open") -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT task_id, title, due, status, closed_how, due_asked_for, cleanup_asked, first_seen FROM tracked_tasks "
+                "WHERE status = ? ORDER BY COALESCE(due, '9999-12-31'), first_seen",
+                (status,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def close_tracked_task(self, task_id: str, how: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE tracked_tasks SET status = 'closed', closed_how = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE task_id = ? AND status = 'open'",
+                (how, task_id),
+            )
+            return cursor.rowcount > 0
+
+    def mark_due_asked(self, task_id: str, due: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE tracked_tasks SET due_asked_for = ?, updated_at = CURRENT_TIMESTAMP WHERE task_id = ?",
+                (due, task_id),
+            )
+
+    def mark_cleanup_asked(self, task_ids: list[str]) -> None:
+        with self._connect() as conn:
+            conn.executemany("UPDATE tracked_tasks SET cleanup_asked = 1 WHERE task_id = ?", [(i,) for i in task_ids])
+
+    def open_approvals_of_type(self, action_type: str) -> list[dict[str, Any]]:
+        """Open approval requests of one type, with their payloads."""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM pending_approvals WHERE status = 'open' AND action_type = ? ORDER BY id", (action_type,)
+            ).fetchall()
+        return [self.get_approval(row["id"]) for row in rows]
+
+    # ----- Telegram rule prompts (no longer used: the "+ Add Permanent Rule" button was removed)
 
     def add_feedback_request(self, chat_message_id: int, approval_id: int) -> None:
         with self._connect() as conn:
@@ -761,5 +837,6 @@ MIGRATIONS = [
     (1, AgentStateStore._migrate_v1_baseline),
     (2, AgentStateStore._migrate_v2_memory_and_runs),
     (3, AgentStateStore._migrate_v3_notes_and_workflows),
+    (4, AgentStateStore._migrate_v4_tracked_tasks),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -27,6 +27,12 @@ def _summarize(task: dict) -> dict:
     }
 
 
+def validate_due(due: str) -> str:
+    """'2026-10-16' (or an ISO datetime) -> '2026-10-16'; ValueError otherwise."""
+
+    return _due_rfc3339(due)[:10]
+
+
 def _due_rfc3339(due: str) -> str:
     """Tasks only stores the date part of 'due'; accept YYYY-MM-DD or an ISO datetime."""
 
@@ -65,6 +71,14 @@ def create_task(title: str, notes: str = "", due: str = "") -> dict:
         retry=False,
     )
     return {**_summarize(task), "verified": bool(task.get("id"))}
+
+
+def get_task(task_id: str) -> dict:
+    task = execute_with_retry(
+        _service().tasks().get(tasklist=DEFAULT_LIST, task=task_id),
+        operation_name="tasks_get",
+    )
+    return _summarize(task)
 
 
 def complete_task(task_id: str) -> dict:
