@@ -31,10 +31,18 @@ And from Telegram, you can just ask:
 - *"add Acme, PM, applied today to my applications sheet"*
 - *"write a cover letter for Acme in a doc"*
 - *"remind me to send the invoice on Friday"*
+- *"create a sheet with columns Task | Status and send it to sam@x.com to fill in"*
 
 Several things in one message ("send my resume to X, add a row to my sheet,
-and remind me Friday") are split into separate tasks that run in parallel,
-and you get one combined report.
+and remind me Friday") are split into separate tasks that run in parallel.
+You get the approval cards and nothing else: a short plain message only
+appears when something failed or there is an answer to read. Questions
+("have you sent the sheet?") are answered directly, in one plain reply that
+knows the conversation.
+
+"Create a sheet (or doc) and send it to X" is one card: **Approve & Send**
+creates it, gives X edit access, and emails X the live link. Socio can only
+share files it created itself (your Socio folder).
 
 Socio only touches your **Google Tasks** when you ask, and adding or
 completing a task waits for your tap like everything else. It also keeps an
@@ -238,7 +246,10 @@ Schedule  ─┘                                         │
 - **Supervisor**: splits a multi-part instruction into a task graph (one task
   per domain: email, calendar, Drive/Docs/Sheets, tasks), runs independent
   tasks in parallel worker agents (each with a clean context and only its
-  domain's tools), and merges their results into one report.
+  domain's tools), and reports only what the approval cards don't show
+  (failures, answers). Questions are never split (routed by intent, no AI call).
+- **Plain language**: replies talk to you as "you", never mention APIs, tools,
+  or ids; a final filter strips raw JSON and internal ids from Socio's text.
 - **Memory**: SQLite for short-term state; your learned preferences with local
   embeddings (top 3 recalled per email or instruction); reusable skills in
   `skills/`.

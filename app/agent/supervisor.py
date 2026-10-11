@@ -12,14 +12,17 @@ Supervisor-worker harness for owner instructions (fan-out / fan-in).
          each in a clean context with only its domain's tools, on the worker
          model chain (llm_router: Mistral -> Groq -> Gemini)
       -> fan-in: strict JSON payloads -> aggregator closes duplicate approvals,
-         checkpoints the run in SQLite, and writes one report
+         checkpoints the run in SQLite, and writes a short plain report: only failures
+         and findings the approval cards do not show (often nothing: cards only)
       -> skills are never saved automatically: /save_skill NAME packages the last
          successful plan, and after the same tool graph succeeds 3 times the report
          offers it once
 
-A one-task instruction (or a follow-up that needs the conversation) runs the
-single owner-mode agent as before. Inbox emails are never fanned out
-(developer decision): they stay one at a time in app.agent.runner.
+Routing by intent (no model call): questions and status checks ("Have you sent the
+sheet?") always run the single owner-mode agent, which has the conversation; only
+action commands with several parts are planned. A one-task instruction runs the
+single agent as before. Inbox emails are never fanned out (developer decision): they
+stay one at a time in app.agent.runner.
 """
 
 from __future__ import annotations
@@ -43,7 +46,8 @@ from app.calendar.tools import INDIA_TZ
 from app.agent.llm import get_llm, invoke_llm
 from app.agent.prompts import CARDS_ONLY
 from app.agent.state import AgentStateStore
-from app.agent.taskgraph import DOMAIN_TOOLS, MAX_TASKS, PlanError, normalize_plan, topological_order
+from app.agent.plain_text import plain_reply, without_internal_ids  # noqa: F401  (re-exported for callers and tests)
+from app.agent.taskgraph import DOMAIN_TOOLS, MAX_TASKS, PlanError, covered_domains, normalize_plan, topological_order
 from app.agent.workers import run_worker
 from app.errors import plain_message, report_failure
 from app.memory.episodic import notes_block
@@ -82,6 +86,48 @@ def request_domains(text: str) -> set[str]:
     return {domain for domain, pattern in REQUEST_DOMAINS.items() if pattern.search(text or "")}
 
 
+# Intent: an action command has a clause that starts with an action verb ("Create ...",
+# "... and send it to X", "Can you book ..."). Anything else is a question or a status
+# check ("Have you sent the sheet?", "What's on my calendar?"): it goes to the single
+# agent, which has the conversation, and never to the planner (splitting a question into
+# tasks loses the context it is about). No model call: a missed action only costs the
+# fan-out (the single agent has every tool); a question taken for an action would be split.
+_CLAUSE_START = r"(?:^|[\n.;:!?,]|\b(?:and|then|also|but|plus|after that|if not|otherwise)\b)"
+_POLITE = (
+    r"(?:(?:please|pls|plz|kindly|just|now|also|then|and|ok|okay)\s+|"
+    r"(?:can|could|would|will)\s+(?:you|u)\s+(?:please\s+)?|"
+    r"i\s+(?:want|need|would like|'d like|wanted)\s+(?:you\s+)?to\s+|help\s+me\s+|go ahead and\s+)*"
+)
+_ACTION_VERB = (
+    r"(?:create|make|draft|write|send|e-?mail|mail|reply|respond|forward|schedule|book|reschedule|move|cancel|"
+    r"delete|remove|trash|archive|add|append|put|insert|remind|share|set\s?up|mark|complete|close|update|edit|"
+    r"save|remember|invite|attach|run|prepare|organi[sz]e|fill|notify|ask|tell(?!\s+me\b)|let\s+\w+\s+know|"
+    r"block|rename|upload)"
+)
+ACTION_REQUEST = re.compile(rf"{_CLAUSE_START}\s*{_POLITE}{_ACTION_VERB}\b", re.IGNORECASE)
+# Reads like a question or a request for information ("Have you sent ...", "What's on ...",
+# "Check whether ...", "Tell me ...", or a trailing "?").
+QUESTION = re.compile(
+    r"^\s*(?:(?:hey|hi|hello|ok|okay|so|socio)\b[\s,!.]*)*"
+    r"(?:what|what's|whats|when|where|who|whom|whose|which|why|how|is|are|am|was|were|"
+    r"(?:do|does|did|have|has|had)\s+(?:i|you|we|they|he|she|it|my|your|socio|anyone|there)|"
+    r"can i|could i|should|shall|any|tell me|show me|list|give me|check|find|search|look|let me know|status)\b",
+    re.IGNORECASE,
+)
+
+
+def is_action_request(text: str) -> bool:
+    """
+    False for a question or status check, True for anything else. An action clause
+    ("..., and send it to X", "If not, send it") makes it an action even inside a question.
+    """
+
+    text = (text or "").strip()
+    if ACTION_REQUEST.search(text):
+        return True
+    return not (QUESTION.match(text) or text.endswith("?"))
+
+
 @dataclass
 class OwnerCommandResult:
     reply: str
@@ -99,6 +145,11 @@ class SubTask(BaseModel):
     """One atomic worker task: one domain, only that domain's tools."""
 
     task_id: str = Field(description="Short unique id such as t1, t2.")
+    label: str = Field(
+        default="",
+        description="A few everyday words naming this part for the person, e.g. 'the email to Priya', "
+        "'the rent reminder'. Used only if it fails.",
+    )
     target_domain: Literal["email", "calendar", "workspace", "tasks", "memory", "script"] = Field(
         description="The one domain this task works in. The worker only gets that domain's tools."
     )
@@ -133,7 +184,8 @@ class PlannedTasks(BaseModel):
 
     @model_validator(mode="after")
     def _decomposed(self) -> "PlannedTasks":
-        if len(self.request_domains) >= 2 and len(self.tasks) < 2:
+        covered = set().union(*(covered_domains(task.target_domain, task.tools_allowed) for task in self.tasks))
+        if len(self.request_domains) >= 2 and len(self.tasks) < 2 and len(covered) < 2:
             raise ValueError(
                 f"The instruction touches {len(self.request_domains)} domains ({', '.join(sorted(self.request_domains))}) "
                 f"but the plan has {len(self.tasks)} task. Monolithic tasks are forbidden: split it into one task per domain."
@@ -152,6 +204,10 @@ files / Docs / Sheets, tasks = Google Tasks reminders), you MUST decompose it in
 tasks in the tasks list: one task per domain. A task that bundles several domains is STRICTLY
 FORBIDDEN and the plan is rejected. Sending a file by email is one email task (email workers can
 find the file to attach).
+One exception: creating a NEW Google Sheet or Doc AND sending or sharing it with someone is ONE
+workspace task with tools_allowed=[create_and_share_file]. A single approval creates it, gives
+them access, and emails them the link. Never split it into a create task and an email task: the
+email task cannot know the link, because the file only exists after approval.
 
 Rules:
 - target_domain: the one domain the task works in. tools_allowed: the fewest tools from that
@@ -164,6 +220,7 @@ Rules:
   resolve words like "him" or "that email" using the conversation so far.
 - Write every date as the exact date with its weekday (e.g. "Friday 16 Oct 2026", computed from
   today's date), never "Friday", "tomorrow" or "next week": workers must not work dates out.
+- label: a few everyday words naming the part for the person ("the email to Priya").
 - At most {max_tasks} tasks.
 - Emails, Docs/Sheets writes, calendar changes, and new or completed Google Tasks become approval
   requests for the owner inside the workers. That is expected; never plan around it.
@@ -183,6 +240,11 @@ Examples:
    t2: target_domain=workspace, tools_allowed=[find_documents, read_sheet, append_sheet_row]
    t3: target_domain=tasks, tools_allowed=[propose_create_task]
 3. "What's on my calendar tomorrow?" -> one task: target_domain=calendar, tools_allowed=[find_calendar_events].
+4. "Create a sheet with columns Task | Status and send it to sam@x.com to fill in, and remind me Monday to check it."
+   t1: target_domain=workspace, tools_allowed=[create_and_share_file]
+       goal: create the Google Sheet (headers Task, Status), share it with sam@x.com as editor, and
+       email them the link asking them to fill it in.
+   t2: target_domain=tasks, tools_allowed=[propose_create_task]
 
 Tools by domain:
 {tools}
@@ -334,6 +396,7 @@ def run_plan(
                         "status": "FAILED",
                         "modified_entities": [],
                         "diff_summary": f"Not started: it needs {', '.join(failed)}, which failed. Nothing was changed.",
+                        "not_started": True,
                     })
                 elif all(d in results for d in task["depends_on"]) and len(running) < max_workers:
                     del waiting[task_id]
@@ -344,7 +407,7 @@ def run_plan(
             if not running:
                 if waiting:  # cannot happen for a validated DAG; never spin
                     for task_id in list(waiting):
-                        finish(task_id, {"status": "FAILED", "modified_entities": [], "diff_summary": "Not started: unresolvable dependencies."})
+                        finish(task_id, {"status": "FAILED", "modified_entities": [], "diff_summary": "Not started: unresolvable dependencies.", "not_started": True})
                     waiting.clear()
                 break
 
@@ -355,7 +418,7 @@ def run_plan(
                     payload = future.result()
                 except Exception as exc:  # a worker function that raised anyway
                     report_failure(exc, "worker.crash", run_id=run_id, task_id=task_id)
-                    payload = {"status": "FAILED", "modified_entities": [], "diff_summary": f"Worker crashed. {plain_message(exc)}"}
+                    payload = {"status": "FAILED", "modified_entities": [], "diff_summary": f"It stopped because of an error. {plain_message(exc)}"}
                 if not dry_run and payload["status"] == "FAILED":
                     store.add_failure(f"worker:{task_id}", payload["diff_summary"])
                 finish(task_id, payload)
@@ -369,8 +432,9 @@ def run_plan(
 def resolve_overlaps(results: dict[str, dict[str, Any]], store: AgentStateStore, dry_run: bool = False) -> list[str]:
     """
     Two workers proposing the same change (same event, document, recipient...) would
-    show the owner two cards for one thing: keep the first approval, close the others.
-    Completed changes cannot be undone, so overlaps among them are only reported.
+    show the owner two cards for one thing: keep the first approval, close the others
+    quietly (the owner sees one card; how the work was split is not their concern).
+    Completed changes cannot be undone, so overlaps among them are reported.
     """
 
     notes: list[str] = []
@@ -386,52 +450,47 @@ def resolve_overlaps(results: dict[str, dict[str, Any]], store: AgentStateStore,
                     entity["duplicate_of"] = keep
                     if not dry_run:
                         store.resolve_pending_approval(entity["approval_id"], f"Duplicate of #{keep} from the same instruction")
-                    notes.append("Two parts of your request proposed the same change; you'll see it only once.")
                 else:
                     first_approval.setdefault(key, (task_id, entity["approval_id"]))
             elif entity.get("status") == "completed":
                 if key in first_change and first_change[key] != task_id:
-                    notes.append("Two parts of your request changed the same item; please check it.")
+                    notes.append("I changed the same item twice; please check it.")
                 first_change.setdefault(key, task_id)
     return notes
 
 
-# Tool results say "Approval request #12"; workers sometimes copy that despite the prompt.
-_APPROVAL_NUMBER = re.compile(r"\b(approval request|approval|request)\s*#\d+", re.IGNORECASE)
-_ASIDE_NUMBER = re.compile(r"\s*\((?:approval request|approval|request)?\s*#\d+\)", re.IGNORECASE)
-_BARE_NUMBER = re.compile(r"\s*#\d+")
-
-
-def without_internal_ids(text: str) -> str:
-    """Owner-facing worker summaries carry no approval numbers (plain language, no ids)."""
-
-    text = _ASIDE_NUMBER.sub("", text or "")
-    text = _APPROVAL_NUMBER.sub(lambda m: "The approval request" if m.group(0)[0].isupper() else "the approval request", text)
-    return _BARE_NUMBER.sub("", text)
-
-
 def build_report(tasks: list[dict[str, Any]], results: dict[str, dict[str, Any]], notes: list[str], skill: str = "", dry_run: bool = False) -> str:
-    header = f"{'🧪 Dry run - ' if dry_run else ''}🧭 I handled your request in {len(tasks)} parts"
-    if skill:
-        header += f" (using your saved skill '{skill}')"
-    lines = [header + ":"]
+    """
+    The text the owner gets next to the approval cards: only what the cards do not say.
 
-    approvals: list[int] = []
+    No header, no list of parts, no goals: the owner cares whether it got done. A part
+    that produced an approval card says nothing (the card is the answer); a step whose
+    result fed a later step says nothing either. What is left: failures (always), and
+    what a final step found or did directly. Empty when the cards say it all.
+    """
+
+    needed_later = {dependency for task in tasks for dependency in task["depends_on"]}
+    lines: list[str] = []
+    skipped_after_failure = False
+
     for task in tasks:
-        payload = results.get(task["task_id"], {"status": "FAILED", "diff_summary": "Did not run."})
-        mark = "✅" if payload["status"] == "SUCCESS" else "❌"
-        goal = " ".join(task["goal_contract"].split())
-        goal = goal if len(goal) <= 70 else goal[:69] + "…"
-        lines.append(f"{mark} {goal}\n   {without_internal_ids(payload['diff_summary'])}")
-        approvals += [
-            e["approval_id"] for e in payload.get("modified_entities", [])
-            if e.get("kind") == "approval" and e.get("approval_id") and not e.get("duplicate_of")
-        ]
+        payload = results.get(task["task_id"], {"status": "FAILED", "diff_summary": "It didn't run.", "modified_entities": []})
+        summary = plain_reply(payload.get("diff_summary", ""))
+        proposed = any(entity.get("kind") == "approval" for entity in payload.get("modified_entities", []))
 
-    if approvals:
-        count = len(set(approvals))
-        lines.append(f"⏳ {count} {'item is' if count == 1 else 'items are'} waiting for your approval (see the cards).")
+        if payload.get("not_started"):
+            skipped_after_failure = True
+        elif payload["status"] == "FAILED":
+            label = task.get("label", "")
+            lines.append(f"⚠️ {label[:1].upper() + label[1:]}: {summary}" if label else f"⚠️ {summary}")
+        elif not proposed and task["task_id"] not in needed_later and summary:
+            lines.append(summary)
+
+    if skipped_after_failure:
+        lines.append("I didn't do the steps that depended on it, so nothing else was changed.")
     lines += [f"⚠️ {note}" for note in notes]
+    if dry_run:
+        lines.insert(0, "🧪 Dry run: nothing was sent or changed.")
     return "\n".join(lines)
 
 
@@ -588,6 +647,21 @@ def run_single_agent(text: str, *, history: list | None = None, dry_run: bool = 
 _CARDS_ONLY = re.compile(rf"[\s`*\"'(\[]*{CARDS_ONLY}[\s`*\"'.)\]]*")
 
 
+# Everyday names for direct actions, for "⚠️ Saving the rule didn't work."
+ACTION_WORDS = {
+    "remember_rule": "Saving the rule",
+    "create_reply_draft": "Saving the reply draft",
+    "send_gmail_reply": "Sending the reply",
+    "send_new_email": "Sending the email",
+    "create_document": "Creating the document",
+    "append_to_document": "Adding to the document",
+    "create_spreadsheet": "Creating the spreadsheet",
+    "append_sheet_row": "Adding the row",
+    "create_and_share_file": "Creating and sharing the file",
+    "share_drive_file": "Sharing the file",
+}
+
+
 def _direct_outcomes(actions: list[dict[str, Any]]) -> list[str]:
     """What the agent did without an approval card (or failed to do), one line each."""
 
@@ -595,13 +669,14 @@ def _direct_outcomes(actions: list[dict[str, Any]]) -> list[str]:
     for action in actions:
         kind, status, args = action.get("type", ""), action.get("status", ""), action.get("args") or {}
         if status in {"failed", "unknown"}:
-            lines.append(f"⚠️ {kind.replace('_', ' ')} did not complete" + (" (it is unknown whether it happened)." if status == "unknown" else "."))
+            what = ACTION_WORDS.get(kind, "One step")
+            lines.append(f"⚠️ {what} didn't work." if status == "failed" else f"⚠️ {what} may not have worked (I can't tell whether it happened).")
         elif status == "completed" and kind == "remember_rule":
             lines.append(f"✅ Rule saved: {(action.get('result') or {}).get('summary') or args.get('rule', '')}")
         elif status == "completed" and kind == "create_reply_draft":
             lines.append("✅ Saved a reply draft in Gmail Drafts.")
         elif status == "completed":
-            lines.append(f"✅ Done: {kind.replace('_', ' ')}.")
+            lines.append(f"✅ Done: {ACTION_WORDS.get(kind, kind.replace('_', ' ')).lower()}.")
     return lines
 
 
@@ -613,7 +688,7 @@ def owner_reply(text: str, approval_ids: list[int], dry_run: bool = False, actio
     a tool failed, those are listed instead: nothing done is ever left unreported.
     """
 
-    text = (text or "").strip()
+    text = plain_reply(text)
     said_cards_only = bool(_CARDS_ONLY.search(text))
     reply = _CARDS_ONLY.sub(" ", text).strip() if said_cards_only else text
     if not reply and said_cards_only:
@@ -630,15 +705,23 @@ def owner_reply(text: str, approval_ids: list[int], dry_run: bool = False, actio
 
 
 def should_plan(text: str, skills: list[tuple[Skill, float]]) -> bool:
+    """
+    Only action commands are planned. Questions and status checks never are. A one-step
+    action skips the planner too: it would return one task, which runs the single agent
+    anyway (one model call saved, same result).
+    """
+
+    if not is_action_request(text):
+        return False
     return bool(skills) or bool(MULTI_PART.search(text or "")) or len(request_domains(text)) >= 2
 
 
 def handle_owner_request(text: str, *, dry_run: bool = False, history: list | None = None, store: AgentStateStore | None = None) -> OwnerCommandResult:
-    """Plan, fan out, fan in, report. Falls back to the single agent for one-task requests."""
+    """Plan, fan out, fan in, report. Questions and one-task requests run the single agent."""
 
     store = store or AgentStateStore()
     memories = recall(text, store=store)
-    skills = find_skills(text)
+    skills = find_skills(text) if is_action_request(text) else []
 
     if not should_plan(text, skills):
         return run_single_agent(text, history=history, dry_run=dry_run, memories=memories)
@@ -664,7 +747,11 @@ def handle_owner_request(text: str, *, dry_run: bool = False, history: list | No
     run_status = "done" if statuses == {"SUCCESS"} else ("failed" if statuses == {"FAILED"} else "partial")
 
     if run_status == "done" and not plan.skill and not dry_run:
-        report += note_workflow_success(plan.tasks, text, run_id, store)
+        report = (report + note_workflow_success(plan.tasks, text, run_id, store)).strip()
+    if not report and not any(
+        e.get("kind") == "approval" and not e.get("duplicate_of") for p in results.values() for e in p["modified_entities"]
+    ):
+        report = "Done."  # never silent: no card and nothing to report
 
     store.finish_supervisor_run(run_id, "dry_run" if dry_run else run_status, report)
 

@@ -16,6 +16,7 @@ from app.agent.tools import (
     append_sheet_row,
     append_to_document,
     check_reply_needed,
+    create_and_share_file,
     create_document,
     create_spreadsheet,
     list_tasks,
@@ -38,6 +39,7 @@ from app.agent.tools import (
     search_gmail,
     send_gmail_reply,
     send_new_email,
+    share_drive_file,
 )
 from app.calendar.events import parse_ist
 from app.calendar.holds import overlapping_holds
@@ -69,6 +71,8 @@ AGENT_TOOLS = [
     read_sheet,
     append_sheet_row,
     create_spreadsheet,
+    create_and_share_file,
+    share_drive_file,
     list_tasks,
     propose_create_task,
     propose_complete_task,
@@ -86,6 +90,8 @@ SIDE_EFFECT_TOOLS = {
     "append_to_document",
     "create_spreadsheet",
     "append_sheet_row",
+    "create_and_share_file",
+    "share_drive_file",
     "remember_rule",
 }
 
@@ -104,8 +110,8 @@ PROPOSAL_TOOLS = {
 # Proposals whose new time is held locally until the owner decides (see app.calendar.holds).
 SLOT_HOLD_TYPES = {"book_meeting", "move_event"}
 
-# Owner mode: emails and Google Docs/Sheets writes wait for one tap too (developer
-# decision); the tool call becomes an approval request with the exact change.
+# Owner mode: emails, Google Docs/Sheets writes, and sharing wait for one tap too
+# (developer decision); the tool call becomes an approval request with the exact change.
 OWNER_GATED_TOOLS = {
     "send_gmail_reply",
     "send_new_email",
@@ -113,6 +119,8 @@ OWNER_GATED_TOOLS = {
     "append_to_document",
     "create_spreadsheet",
     "append_sheet_row",
+    "create_and_share_file",
+    "share_drive_file",
 }
 
 # Tools that run directly when allowed and otherwise return {"proposal": ...}
@@ -215,8 +223,10 @@ def _action_target(tool_name: str, args: dict[str, Any]) -> str:
         return args.get("message_id", "")
     if tool_name == "send_new_email":
         return args.get("to", "")
-    if tool_name in {"create_document", "create_spreadsheet"}:
+    if tool_name in {"create_document", "create_spreadsheet", "create_and_share_file"}:
         return args.get("title", "")
+    if tool_name == "share_drive_file":
+        return args.get("file", "")
     if tool_name == "append_to_document":
         return args.get("document", "")
     if tool_name == "append_sheet_row":
@@ -414,6 +424,35 @@ def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any
             "header": header,
             "values": values,
         }
+
+    if tool_name == "create_and_share_file":
+        from app.workspace.sharing import FILE_KINDS, validate_recipient, validate_role
+
+        kind = (args.get("kind") or "").strip().lower()
+        if kind not in FILE_KINDS:
+            raise ValueError("kind must be spreadsheet or document.")
+        if not (args.get("title") or "").strip():
+            raise ValueError(f"The {kind} needs a title.")
+        if not (args.get("message") or "").strip():
+            raise ValueError("Write the email message that goes with the link.")
+        return {
+            "type": "create_and_share",
+            "kind": kind,
+            "title": args["title"].strip(),
+            "headers": [str(header) for header in args.get("headers") or []] if kind == "spreadsheet" else [],
+            "content": (args.get("content") or "") if kind == "document" else "",
+            "recipient": validate_recipient(args.get("recipient_email", "")),
+            "role": validate_role(args.get("role", "editor")),
+            "subject": (args.get("subject") or "").strip() or args["title"].strip(),
+            "body": args["message"].strip(),
+        }
+
+    if tool_name == "share_drive_file":
+        from app.workspace.sharing import shareable_file, validate_recipient, validate_role
+
+        recipient, role = validate_recipient(args.get("email", "")), validate_role(args.get("role", "editor"))
+        file = shareable_file(args.get("file", ""))
+        return {"type": "share_file", "file_id": file["id"], "title": file["name"], "url": file["url"], "recipient": recipient, "role": role}
 
     raise ValueError(f"{tool_name} cannot be proposed.")
 

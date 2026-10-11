@@ -533,6 +533,47 @@ def create_spreadsheet(title: str, headers: list[str] | None = None) -> dict:
 
 
 @tool
+def create_and_share_file(
+    kind: str,
+    title: str,
+    recipient_email: str,
+    subject: str,
+    message: str,
+    headers: list[str] | None = None,
+    content: str = "",
+    role: str = "editor",
+) -> dict:
+    """
+    Create a new Google Sheet (kind="spreadsheet", optional header row) or Google Doc
+    (kind="document", with content), give recipient_email access (role: editor,
+    commenter, or viewer), and email them the link. Use this whenever the owner asks to
+    create a sheet or doc AND send or share it with someone: it is one approval, never
+    a separate create and email. message is the email body (plain text); the link is
+    added below it, so call it a link, not an attachment.
+    """
+
+    from app.workspace.sharing import create_and_share
+
+    return create_and_share({
+        "kind": kind, "title": title, "recipient": recipient_email, "subject": subject, "body": message,
+        "headers": headers or [], "content": content, "role": role,
+    })
+
+
+@tool
+def share_drive_file(file: str, email: str, role: str = "editor") -> dict:
+    """
+    Give someone access to a Google Doc or Sheet that Socio created earlier (file is a
+    find_documents path or a Docs/Sheets URL; role: editor, commenter, or viewer).
+    Google emails them the link. Only files in the Socio folder can be shared.
+    """
+
+    from app.workspace.sharing import share_file, shareable_file
+
+    return share_file(shareable_file(file)["id"], email, role, notify=True)
+
+
+@tool
 def list_tasks(include_completed: bool = False) -> list[dict]:
     """List tasks in the owner's Google Tasks (default list)."""
 
@@ -577,11 +618,18 @@ def propose_complete_task(task_id: str, reason: str) -> dict:
     complete, close, remove, or delete a task, or says they have done what it describes.
     """
 
+    from googleapiclient.errors import HttpError
+
     from app.tasks import tasks
 
-    task = tasks.get_task(task_id)
+    try:
+        task = tasks.get_task(task_id)
+    except HttpError as exc:
+        if getattr(getattr(exc, "resp", None), "status", None) in (400, 404, "400", "404"):
+            raise ValueError("I couldn't find that task in Google Tasks.") from exc
+        raise
     if task.get("status") == "completed":
-        raise ValueError(f"The task '{task.get('title', '')}' is already completed.")
+        raise ValueError("That task is already marked completed.")
 
     return {
         "proposal": {

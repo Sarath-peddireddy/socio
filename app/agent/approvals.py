@@ -3,8 +3,9 @@ Human-in-the-loop approvals.
 
 Actions that reach other people or cannot be undone are never done by the
 agent directly: every email (replies to incoming email, and in owner mode
-replies and new emails too), Google Docs/Sheets writes, booking, moving, or
-cancelling meetings, trashing email, and trusting a skill script. The agent
+replies and new emails too), Google Docs/Sheets writes, sharing a file Socio
+created (and "create, share, and email the link" as one approval), booking,
+moving, or cancelling meetings, trashing email, and trusting a skill script. The agent
 records an approval request; only approve() below executes it, after the owner
 says yes (Telegram button or `python -m app.main --approve ID`). A held email
 can instead be moved to Gmail Drafts for editing (to_draft). Everything is
@@ -39,12 +40,16 @@ REPLY_TYPES = {"send_reply", "send_reply_with_attachment"}
 EMAIL_TYPES = REPLY_TYPES | {"send_email"}
 # Owner-mode Google Docs / Sheets writes.
 DOCUMENT_TYPES = {"create_document", "append_document", "create_spreadsheet", "append_sheet_row"}
+# Giving someone access to a file Socio created (and, for create_and_share, creating it
+# first and emailing them the link).
+SHARE_TYPES = {"create_and_share", "share_file"}
 # Approvals that perform an action when approved.
 EXECUTABLE_TYPES = (
     {"trash_email", "book_meeting", "move_event", "cancel_event", "enable_skill_script", "create_task", "complete_task",
      "close_old_reminders"}
     | EMAIL_TYPES
     | DOCUMENT_TYPES
+    | SHARE_TYPES
 )
 # Approvals that only ask the owner to look at something; approving closes them.
 REVIEW_TYPES = {"review_draft", "review_decision"}
@@ -144,6 +149,16 @@ def describe(approval: dict[str, Any]) -> str:
         ]
         tab = f" (tab {payload['tab']})" if payload.get("tab") else ""
         text = f"Add a row to Google Sheet '{payload.get('document_title') or payload.get('document')}'{tab}:\n" + "\n".join(cells)
+    elif kind == "create_and_share":
+        what = "Google Sheet" if payload.get("kind") == "spreadsheet" else "Google Doc"
+        text = (
+            f"Create {what} '{payload.get('title')}', give {payload.get('recipient')} {payload.get('role', 'editor')} access, "
+            f"and email them the link\nSubject: {payload.get('subject') or '(none)'}\n\"{payload.get('body', '')}\""
+        )
+        if payload.get("headers"):
+            text += "\nColumns: " + " | ".join(payload["headers"])
+    elif kind == "share_file":
+        text = f"Give {payload.get('recipient')} {payload.get('role', 'editor')} access to '{payload.get('title')}'"
     elif kind == "create_task":
         due = f" (due {payload['due']})" if payload.get("due") else ""
         text = f"Add Google Task '{payload.get('title', '')}'{due}"
@@ -234,6 +249,17 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
             return {"spreadsheet": sheets.create_spreadsheet(payload["title"], payload.get("headers") or None)}
         return {"spreadsheet": sheets.append_sheet_row(payload["document"], payload["values"], payload.get("tab", ""))}
 
+    if kind == "create_and_share":
+        from app.workspace.sharing import create_and_share
+
+        return create_and_share(payload)
+
+    if kind == "share_file":
+        from app.workspace.sharing import share_file, shareable_file
+
+        file = shareable_file(payload["file_id"])  # still Socio's and not trashed
+        return {"share": share_file(file["id"], payload["recipient"], payload.get("role", "editor"), notify=True)}
+
     if kind == "create_task":
         from app.tasks import tasks
 
@@ -312,6 +338,24 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def share_outcome(kind: str, payload: dict[str, Any], result: dict[str, Any]) -> str:
+    """What happened after a sharing approval, step by step and truthfully."""
+
+    title, recipient = payload.get("title", ""), payload.get("recipient", "")
+    if kind == "share_file":
+        return f"Shared \"{title}\" with {recipient}. Google emailed them the link."
+
+    url = (result.get("file") or {}).get("url", "")
+    if result.get("share_error"):
+        return f"Created \"{title}\", but I couldn't share it with {recipient}, so no email was sent. {result['share_error']} {url}".strip()
+    if result.get("email_error"):
+        return (
+            f"Created \"{title}\" and gave {recipient} access, but the email didn't go through. "
+            f"{result['email_error']} You can send them this link: {url}"
+        ).strip()
+    return f"Created \"{title}\" and sent edit link to {recipient}. {url}".strip()
+
+
 def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str, Any]:
     """Execute an approval. Safe to call twice: only the first call acts."""
 
@@ -358,6 +402,8 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
         store.close_tracked_task(approval["payload"]["task_id"], "closed_by_socio")
 
     message = DONE_TEXT.get(approval["type"], "Done.")
+    if approval["type"] in SHARE_TYPES:
+        message = share_outcome(approval["type"], approval["payload"], result)
     if approval["type"] == "close_old_reminders":
         message = f"Closed {result['closed']} old reminder tasks. You can reopen any of them in Google Tasks."
         if result["not_closed"]:
@@ -376,7 +422,12 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
         status = "needs_attention" if result.get("reply_error") else ("replied" if result.get("reply") else "no_action")
         store.mark_processed(message_id, thread_id, status=status, summary=message)
 
-    return {"ok": True, "message": message, "result": result}
+    # Part of it happened (e.g. the sheet was created but the email failed): not a full success.
+    partial = bool(result.get("reply_error") or result.get("share_error") or result.get("email_error"))
+    if result.get("share_error") or result.get("email_error"):
+        store.add_failure(f"approval:{approval['type']}", result.get("share_error") or result.get("email_error"), message_id=message_id)
+
+    return {"ok": True, "partial": partial, "message": message, "result": result}
 
 
 def reject(approval_id: int, store: AgentStateStore | None = None) -> dict[str, Any]:

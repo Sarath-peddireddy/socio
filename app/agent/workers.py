@@ -34,6 +34,9 @@ WORKER_RECURSION_LIMIT = 20
 MAX_DIFF_CHARS = 600
 MAX_UPSTREAM_CHARS = 1500
 STATUSES = ("SUCCESS", "FAILED")
+# Statuses models write instead of SUCCESS when their change is waiting for approval:
+# proposing it was the job, so the task succeeded.
+WAITING_STATUSES = {"WAITING", "PENDING", "AWAITING_APPROVAL", "WAITING_FOR_APPROVAL", "PENDING_APPROVAL", "PROPOSED", "DONE", "COMPLETED"}
 
 
 def entity_key(kind: str, args: dict[str, Any]) -> str:
@@ -55,8 +58,10 @@ def entity_key(kind: str, args: dict[str, Any]) -> str:
         return f"email:{str(args.get('to', '')).lower()}|{str(args.get('subject', '')).strip().lower()}"
     if kind in {"append_document", "append_sheet_row", "append_to_document"}:
         return f"document:{args.get('document') or args.get('spreadsheet')}"
-    if kind in {"create_document", "create_spreadsheet"}:
+    if kind in {"create_document", "create_spreadsheet", "create_and_share", "create_and_share_file"}:
         return f"new-document:{str(args.get('title', '')).strip().lower()}"
+    if kind in {"share_file", "share_drive_file"}:
+        return f"share:{args.get('file_id') or args.get('file')}|{str(args.get('recipient') or args.get('email') or '').lower()}"
     if kind == "trash_email":
         return f"message:{args.get('message_id')}"
     if kind == "enable_skill_script":
@@ -115,17 +120,25 @@ def worker_prompt(task: dict[str, Any], upstream: dict[str, dict[str, Any]]) -> 
 
 
 def _final_report(text: str) -> tuple[str | None, str]:
-    """The worker's closing JSON (status, diff_summary), and its text without that line."""
+    """
+    The worker's closing JSON (status, diff_summary), and its text without that line.
+
+    Any status object is removed from the text, whatever status it names: the summary
+    is read by the owner and must never carry raw JSON.
+    """
 
     for match in reversed(list(re.finditer(r"\{[^{}]*\}", text or ""))):
         try:
             data = json.loads(match.group(0))
         except json.JSONDecodeError:
             continue
-        status = str(data.get("status", "")).upper()
-        if status in STATUSES:
-            rest = (text[: match.start()] + text[match.end():]).strip()
-            return status, str(data.get("diff_summary") or rest)
+        if not isinstance(data, dict) or not ({"status", "diff_summary"} & set(data)):
+            continue
+        status = str(data.get("status", "")).strip().upper().replace(" ", "_")
+        status = "SUCCESS" if status in WAITING_STATUSES else status
+        rest = (text[: match.start()] + text[match.end():]).strip()
+        summary = str(data.get("diff_summary") or rest)
+        return (status if status in STATUSES else None), summary
     return None, (text or "").strip()
 
 
@@ -171,17 +184,17 @@ def run_worker(
     reported, summary = _final_report(_message_text(messages[-1]) if messages else "")
 
     if error is not None:
-        summary = f"Stopped by an error. {plain_message(error)}"
+        summary = f"It stopped because of an error. {plain_message(error)}"
         if entities:
-            summary += f". Recorded before it stopped: {len(entities)} change(s)."
+            summary += " Part of it was done before it stopped."
         failed = True
     else:
         uncertain = [a for a in actions if a.get("status") in {"failed", "unknown"}]
         failed = bool(uncertain) or reported == "FAILED" or not summary
         if uncertain and reported != "FAILED":
-            summary += f" ({len(uncertain)} action(s) failed or have an unknown outcome.)"
+            summary += " (Something didn't go through, or I can't tell whether it happened.)"
         if not summary:
-            summary = "The worker finished without a report."
+            summary = "It finished without saying what happened."
 
     return {
         "status": "FAILED" if failed else "SUCCESS",

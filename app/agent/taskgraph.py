@@ -36,13 +36,29 @@ DOMAIN_TOOLS: dict[str, frozenset[str]] = {
     }),
     "workspace": frozenset({
         "find_documents", "read_document", "create_document", "append_to_document",
-        "read_sheet", "append_sheet_row", "create_spreadsheet",
+        "read_sheet", "append_sheet_row", "create_spreadsheet", "create_and_share_file", "share_drive_file",
     }),
     "tasks": frozenset({"list_tasks", "propose_create_task", "propose_complete_task"}),
     "memory": frozenset({"remember_rule"}),
     "script": frozenset({"run_skill_script"}),
 }
 DOMAIN_ALIASES = {"drive": "workspace", "docs": "workspace", "sheets": "workspace", "gmail": "email", "google_tasks": "tasks"}
+# Compound tools that also do another domain's job inside one approval: "create a sheet
+# and send it to X" is one workspace task (the approval creates, shares, and emails the
+# link), not a create task plus an email task that cannot know the link yet.
+COMPOUND_DOMAINS: dict[str, frozenset[str]] = {
+    "create_and_share_file": frozenset({"email"}),
+    "share_drive_file": frozenset({"email"}),
+}
+
+
+def covered_domains(domain: str, tools: list[str]) -> set[str]:
+    """The domains a task takes care of: its own plus those its compound tools include."""
+
+    covered = {domain}
+    for name in tools:
+        covered |= COMPOUND_DOMAINS.get(name, frozenset())
+    return covered
 
 
 def domain_for(tools: list[str]) -> str | None:
@@ -112,6 +128,7 @@ def normalize_plan(tasks: list[dict[str, Any]], allowed_tools: set[str]) -> list
 
         cleaned.append({
             "task_id": task_id,
+            "label": " ".join(str(task.get("label") or "").split())[:80],
             "goal_contract": goal[:MAX_GOAL_CHARS],
             "context_slice": str(task.get("context_slice") or "").strip()[:MAX_CONTEXT_CHARS],
             "target_domain": domain,

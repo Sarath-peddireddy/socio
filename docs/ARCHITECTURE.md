@@ -89,7 +89,8 @@ toolset and the approvals above.
 Full toolset (search mail, send new email, calendar, documents, Google Docs,
 Sheets, Tasks, skill scripts) plus `propose_trash_email`. Emails
 (`send_gmail_reply`, `send_new_email`), Docs/Sheets writes (`create_document`,
-`append_to_document`, `create_spreadsheet`, `append_sheet_row`), bookings,
+`append_to_document`, `create_spreadsheet`, `append_sheet_row`), sharing
+(`create_and_share_file`, `share_drive_file`), bookings,
 event changes, and trashing all become approvals (`OWNER_GATED_TOOLS` in
 `graph.py`), validated first (recipient addresses, reply target, attachments
 in the whitelist, the document must exist), so the card shows the exact email
@@ -119,12 +120,27 @@ tool failed, those are listed instead, so nothing done goes unreported.
 `telegram_format.is_capability_question`) get a fixed welcome card without a
 model call.
 
+Plain language (developer requirement: the reader is an end user, not a
+developer): the owner/worker prompts (`PLAIN_LANGUAGE`) say to address the
+owner as "you", never write "the owner" / "the user", never mention APIs,
+tools, endpoints, JSON, ids, or how the work was split, never promise a later
+action ("once approved I'll share the link"), and answer a question in one
+natural paragraph. `app/agent/plain_text.plain_reply()` is the last filter on
+the agent's own text (single agent and supervisor report; never on cards,
+which must show exactly what will be sent): it removes raw JSON, approval
+numbers, Gmail / Drive / task ids (links and email addresses are kept, readable
+names like `Q3_Budget_Report_2026` too), and turns "for the owner" into "for
+you". Tool refusals the model sees are plain sentences too ("That task is
+already marked completed.", "I couldn't find that task in Google Tasks.").
+
 ### Supervisor and workers (fan-out / fan-in)
 
 `handle_owner_command` goes through `supervisor.handle_owner_request`:
 
 ```
-instruction ─► recall memories (top 3) + matching skills
+instruction ─► question / status check? (is_action_request, regex, no model call)
+               ─► single owner agent with the conversation (never planned)
+            ─► recall memories (top 3) + matching skills
             ─► one-task request? ─► single owner agent (as before)
             └► planner (1 LLM call, structured output PlannerOutput): tasks = [SubTask(task_id,
                target_domain, goal_contract, context_slice, tools_allowed, depends_on)] = a DAG,
@@ -133,13 +149,33 @@ instruction ─► recall memories (top 3) + matching skills
                domains, no cycles; a rejected plan goes back once with the reason)
             ─► checkpoint (supervisor_runs, worker_tasks)
             ─► ThreadPoolExecutor (AGENT_MAX_WORKERS = 3): a task starts when its dependencies succeeded
-            ─► fan-in payloads ─► close duplicate approvals ─► one report
+            ─► fan-in payloads ─► close duplicate approvals ─► short plain report (often empty)
             ─► count the workflow's success (3rd time: suggest /save_skill once)
 ```
 
-- Only instructions that look multi-part, name two or more domains (email,
+- Intent routing: a message is an action command if a clause starts with an
+  action verb ("Create ...", "..., and send it to X", "If not, send it",
+  "Can you book ..."); otherwise, if it reads like a question or status check
+  ("Have you sent ...", "What's ...", "Check ...", "Tell me ...", a trailing
+  "?"), it goes to the single agent, which has the conversation. A status
+  question was once split into a Drive task and a Gmail task that each lacked
+  the context ("the sheet is empty", "no sheet was sent"). A missed action only
+  loses the fan-out (the single agent has every tool).
+- Only action commands that look multi-part, name two or more domains (email,
   calendar, workspace = Drive/Docs/Sheets, tasks), or match a skill pay for a
   planning call; if the planner returns one task, the single agent runs instead.
+- Create & share: "create a sheet/doc and send it to X" is ONE workspace task with
+  `create_and_share_file` (`taskgraph.COMPOUND_DOMAINS` counts it as covering
+  email too, so the ≥ 2-domain rule accepts it). It was once split into a
+  create-only task (no email tool) whose worker promised to share the link
+  "once approved", which nothing did.
+- The report (`build_report`) has no header, task list, or goals: a part that
+  produced an approval card says nothing (the card is the answer), a step whose
+  result fed a later step says nothing; failures always show (with the
+  planner's plain `label`, e.g. "⚠️ The email to Priya: ..."), dependents of a
+  failure get one "I didn't do the steps that depended on it" line, and final
+  findings show as plain sentences. Empty when the cards say it all ("Done."
+  only if there is neither a card nor anything to say).
 - Decomposition rule (§4c): the planner prompt forbids monolithic tasks, with
   examples. The whole plan comes back as one structured answer (a list), not
   one tool call per task: Gemini tended to emit only the first call and wait,
@@ -156,9 +192,12 @@ instruction ─► recall memories (top 3) + matching skills
 - A worker is a fresh graph run (`worker=True`, `tools_allowed=[...]`): its
   only message is its goal, its context slice, and its dependencies' payloads.
   Tools outside its list are neither bound nor executed. Worker summaries in
-  the report are stripped of approval numbers (`without_internal_ids`).
+  the report go through `plain_reply` (no JSON, ids, or approval numbers).
 - Fan-in contract: `{"status": "SUCCESS"|"FAILED", "modified_entities": [...],
-  "diff_summary": "..."}`. Entities come from the actions the tools recorded
+  "diff_summary": "..."}`. A closing status object is always cut from the
+  worker's text; "WAITING" / "PENDING" (a change waiting for approval) counts
+  as SUCCESS (once leaked as raw `{"status": "WAITING", ...}` into Telegram).
+  Entities come from the actions the tools recorded
   (the graph is streamed, so a worker that crashes still reports what it
   changed); the status also fails on any failed/unknown action.
 - A failed task's dependents are not started; independent tasks continue; the
@@ -196,6 +235,20 @@ Sharing files by email: any email with an attachment (Drive or local) is an
 approval (`send_reply_with_attachment` / `send_email`; Telegram: Approve &
 Send / Edit in Gmail / Reject).
 
+Sharing access (`app/workspace/sharing.py`, Drive `permissions.create`): only
+files in Socio's output folder (the `drive.file` scope covers files Socio
+created; no new sign-in needed). `create_and_share_file` -> one
+`create_and_share` approval ("📊 Create & Share Spreadsheet" / "📄 ... Document":
+title, recipient (Editor), columns or content, subject, message; Approve & Send /
+Cancel). Approving creates the file, grants the role without Google's own
+notification (Google insists on it for non-Google addresses, then it is sent),
+and emails the live link from Gmail (so it is in Sent), in that order; each step
+runs only if the one before succeeded, the email is never retried, and the card
+says exactly how far it got ("Created ... and sent edit link to X." /
+"Created ..., but I couldn't share it ..., so no email was sent." / "... but the
+email didn't go through ... You can send them this link"). `share_drive_file` ->
+`share_file` approval for a file Socio created earlier (Google emails the link).
+
 Task tracking (`app/tasks/tracker.py`, `tracked_tasks` table, schema v4): on the
 bot's schedule `check_tasks()` reads the default Google Tasks list once (no AI
 call) and keeps a local copy of the open tasks. It never changes a task itself;
@@ -227,7 +280,7 @@ pushes each new request as one HTML card (`telegram_format.approval_card`):
 blockquote), 📅 Meeting Proposal (title, attendee, slot in IST, "Local 24h
 soft-hold active" only while a hold exists, the reply to send afterwards),
 🔁 Move / 🚫 Cancel Meeting, 📝 Workspace Update (target, action, `+` diff),
-🔐 Trust Skill Script. Buttons: Approve & Trash / Book / Move / Cancel, or
+📊 / 📄 Create & Share (Approve & Send / Cancel), 🔗 Share File, 🔐 Trust Skill Script. Buttons: Approve & Trash / Book / Move / Cancel, or
 Approve; emails get Approve & Send / Edit in Gmail / Reject. Every dynamic
 value is HTML-escaped. After a tap the card is rendered again from the stored
 request with the result line. `approvals.approve()` claims the request atomically (so a double tap
@@ -241,6 +294,8 @@ executes, then sends the follow-up reply if one was attached.
 | `send_email` | a new email (owner mode) |
 | `create_document` / `append_document` | create a Doc / append text (Socio folder) |
 | `create_spreadsheet` / `append_sheet_row` | create a Sheet / add one row (values RAW) |
+| `create_and_share` | create a Sheet/Doc, give the recipient access, email them the link |
+| `share_file` | give someone access to a file Socio created (Google emails them) |
 | `enable_skill_script` | trust `skills/<name>.py` at the SHA-256 shown (re-checked) |
 | `book_meeting` | create the event (conflict re-checked, attendee invited), then the reply |
 | `move_event` / `cancel_event` | patch / delete the event (attendees notified), then the reply |

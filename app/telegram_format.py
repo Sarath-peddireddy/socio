@@ -20,7 +20,7 @@ import re
 from datetime import date
 from typing import Any
 
-from app.agent.approvals import DOCUMENT_TYPES, EMAIL_TYPES, EXECUTABLE_TYPES, format_time
+from app.agent.approvals import DOCUMENT_TYPES, EMAIL_TYPES, EXECUTABLE_TYPES, SHARE_TYPES, format_time
 from app.calendar.events import parse_ist
 
 
@@ -218,6 +218,9 @@ def _buttons(approval: dict[str, Any]) -> list:
     }.get(kind, "✅ Approve")
     if kind == "close_old_reminders":
         return [[button("✅ Close all", "approve"), button("Keep them", "reject")]]
+    if kind in SHARE_TYPES:
+        return [[button("✅ Approve & Send" if kind == "create_and_share" else "✅ Approve & Share", "approve"),
+                 button("❌ Cancel", "reject")]]
     if kind == "complete_task":
         due_question = (approval.get("payload") or {}).get("trigger") == "due"
         return [[button("✅ Yes, close it" if due_question else "✅ Close task", "approve"),
@@ -315,6 +318,29 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
                 for i, value in enumerate(payload.get("values") or [])
             ]
         lines += [_pre(diff), *_reason(payload)]
+    elif kind == "create_and_share":
+        sheet = payload.get("kind") == "spreadsheet"
+        lines = [
+            "📊 <b>Create &amp; Share Spreadsheet</b>" if sheet else "📄 <b>Create &amp; Share Document</b>", "",
+            f"• {_field('Title', payload.get('title'))}",
+            f"• {_field('Recipient', payload.get('recipient'))} ({esc(str(payload.get('role') or 'editor').capitalize())})",
+        ]
+        if sheet and payload.get("headers"):
+            lines.append(f"• {_field('Columns', ' | '.join(payload['headers']))}")
+        if not sheet and payload.get("content"):
+            lines.append(f"• <b>Content:</b>\n{quote(payload['content'])}")
+        lines += [
+            f"• {_field('Subject', payload.get('subject') or '(no subject)')}",
+            f"• <b>Message:</b>\n{quote(payload.get('body'))}",
+            "<i>The link is added to the email once it's created.</i>",
+        ]
+    elif kind == "share_file":
+        lines = [
+            "🔗 <b>Share File</b>", "",
+            f"• {_field('File', payload.get('title'))}",
+            f"• {_field('Recipient', payload.get('recipient'))} ({esc(str(payload.get('role') or 'editor').capitalize())})",
+            "<i>Google emails them the link.</i>",
+        ]
     elif kind == "create_task":
         lines = [
             "📌 <b>New Task</b>", "",

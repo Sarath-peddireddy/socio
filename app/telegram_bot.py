@@ -262,7 +262,7 @@ class Bot:
             extra = " Attach the files there yourself." if "Attach the files" in outcome["message"] else ""
             status_line = DRAFTED_TEXT + extra
         else:
-            mark = "✅" if outcome["ok"] else "⚠️"
+            mark = "✅" if outcome["ok"] and not outcome.get("partial") else "⚠️"
             status_line = f"{mark} {esc(outcome['message'])}"
 
         # The card is rendered again from the stored request (it is decided now, so no hold
