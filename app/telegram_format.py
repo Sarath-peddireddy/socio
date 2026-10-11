@@ -20,9 +20,16 @@ import re
 from datetime import date
 from typing import Any
 
-from app.agent.approvals import DOCUMENT_TYPES, EMAIL_TYPES, EXECUTABLE_TYPES, SHARE_TYPES, format_time, invitees
+from app.agent.approvals import (
+    DOCUMENT_TYPES,
+    EMAIL_TYPES,
+    EXECUTABLE_TYPES,
+    SHARE_TYPES,
+    format_time,
+    invitees,
+)
 from app.calendar.events import parse_ist
-from app.workspace.sharing import with_link
+from app.workspace.sharing import with_link, with_links
 
 
 MAX_MESSAGE_CHARS = 4000  # Telegram allows 4096 characters per message
@@ -368,6 +375,17 @@ def _buttons(approval: dict[str, Any]) -> list:
     return [[button(approve_label, "approve"), button("❌ Reject", "reject")]]
 
 
+def _link_lines(payload: dict[str, Any]) -> list[str]:
+    """One line per Google file linked in an email: what it is and who can open it."""
+
+    role = str(payload.get("role") or "editor").capitalize()
+    return [
+        _field(link.get("type", "Google file"), f"{link.get('name')} (link in the message; "
+               + (f"they get {role} access)" if link.get("can_share") else "access unchanged, they may need to request it)"))
+        for link in payload.get("links") or []
+    ]
+
+
 def _follow_up(payload: dict[str, Any]) -> list[str]:
     reply = payload.get("reply")
     if not reply:
@@ -402,9 +420,11 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
         lines = ["✉️ <b>Outgoing Email Proposal</b>", "", _field("To", to or "the sender")]
         if subject or kind == "send_email":
             lines.append(_field("Subject", subject or "(no subject)"))
+        lines += _link_lines(payload)
         if payload.get("attachments"):
             lines.append(_field("Files", ", ".join(a["name"] for a in payload["attachments"])))
-        lines += ["", "<b>Draft:</b>", quote(body)]
+        # The message exactly as it will be sent: a Google file's real link where it goes.
+        lines += ["", "<b>Draft:</b>", quote(with_links(body, payload.get("links") or []))]
     elif kind == "book_meeting":
         lines = [
             "📅 <b>Meeting Proposal</b>", "",

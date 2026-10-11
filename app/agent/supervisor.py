@@ -97,8 +97,20 @@ RECURRING_REQUEST = re.compile(
 )
 
 
+# Work ON a Doc / Sheet (not just sending it): "create a sheet", "add a row to the sheet".
+WORKSPACE_WORK = re.compile(
+    r"\b(create|make|new|add|append|write|update|edit|insert|put|read|summari[sz]e|rename|copy)\b", re.IGNORECASE
+)
+
+
 def request_domains(text: str) -> set[str]:
-    return {domain for domain, pattern in REQUEST_DOMAINS.items() if pattern.search(text or "")}
+    domains = {domain for domain, pattern in REQUEST_DOMAINS.items() if pattern.search(text or "")}
+    # "Send the budget sheet to Sam": the sheet is what the email carries (one email task that
+    # finds the file and sends its link), not a second job. Developer report 2026-10-11: split
+    # into two tasks, the email worker never got the file and wrote "[link]" with no link.
+    if {"email", "workspace"} <= domains and not WORKSPACE_WORK.search(text or ""):
+        domains.discard("workspace")
+    return domains
 
 
 # Intent: an action command has a clause that starts with an action verb ("Create ...",

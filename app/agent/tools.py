@@ -159,6 +159,7 @@ def send_gmail_reply(
     subject: str,
     body: str,
     attachment_paths: list[str] | None = None,
+    access: str = "",
 ) -> dict:
     """
     Send a reply to a specific Gmail message.
@@ -176,7 +177,11 @@ def send_gmail_reply(
     Recipients must already be part of the conversation.
 
     attachment_paths is optional: a list of "path" values returned
-    by find_documents. Attach only files the sender asked for.
+    by find_documents. Attach only files the sender asked for. A Google Doc / Sheet / Slides file
+    (find_documents type "Google ...") is never attached as a copy: it goes as its live
+    link (write [link] in the body where it belongs), a Sheet as a Sheet and a Doc as a
+    Doc. access: "editor", "commenter" or "viewer" only when the owner said which
+    (default editor, so the link opens for them).
 
     The result includes "verified": true only when the reply was
     found in the original thread after sending.
@@ -469,7 +474,7 @@ def search_gmail(query: str, max_results: int = 10) -> list[dict]:
 
 
 @tool
-def send_new_email(to: str, subject: str, body: str, attachment_paths: list[str] | None = None) -> dict:
+def send_new_email(to: str, subject: str, body: str, attachment_paths: list[str] | None = None, access: str = "") -> dict:
     """
     Send a NEW email (not a reply) on the owner's explicit instruction.
 
@@ -477,7 +482,11 @@ def send_new_email(to: str, subject: str, body: str, attachment_paths: list[str]
     message to several people is ONE call with all of them in to, the way a person
     writes it; never one email per person unless the owner asks for separate emails
     or each person gets a different message.
-    attachment_paths are "path" values from find_documents.
+    attachment_paths are "path" values from find_documents. A Google Doc / Sheet / Slides file
+    (find_documents type "Google ...") is never attached as a copy: it goes as its live
+    link (write [link] in the body where it belongs), a Sheet as a Sheet and a Doc as a
+    Doc. access: "editor", "commenter" or "viewer" only when the owner said which
+    (default editor, so the link opens for them).
     """
 
     recipients = [address for _, address in getaddresses([to]) if address]
@@ -565,12 +574,13 @@ def create_and_share_file(
     message: str,
     headers: list[str] | None = None,
     content: str = "",
-    role: str = "editor",
+    role: str = "",
 ) -> dict:
     """
     Create a new Google Sheet (kind="spreadsheet", optional header row) or Google Doc
-    (kind="document", with content), give recipient_email access (role: editor,
-    commenter, or viewer), and email them the link. Use this whenever the owner asks to
+    (kind="document", with content), give recipient_email access, and email them the
+    link. role: "editor", "commenter" or "viewer" when the owner said which (default
+    editor). Use this whenever the owner asks to
     create a sheet or doc AND send or share it with someone: it is one approval, never
     a separate create and email. title: a short descriptive name taken from the request
     (e.g. "Insuff Comments Feedback"), never "Untitled". message is the email body (plain
@@ -587,11 +597,15 @@ def create_and_share_file(
 
 
 @tool
-def share_drive_file(file: str, email: str, role: str = "editor") -> dict:
+def share_drive_file(file: str, email: str, role: str = "") -> dict:
     """
-    Give someone access to a Google Doc or Sheet that Socio created earlier (file is a
-    find_documents path or a Docs/Sheets URL; role: editor, commenter, or viewer).
-    Google emails them the link. Only files in the Socio folder can be shared.
+    Only when the owner asks to SHARE a file or GIVE ACCESS to it and does not ask for an
+    email ("share the budget sheet with Sam", "give Raj view access to the notes doc"):
+    gives access to a Google Doc or Sheet that Socio created earlier (file is a
+    find_documents path or a Docs/Sheets URL; role editor unless the owner said
+    commenter or viewer), and Google sends its own notice. "Send / email the sheet to X"
+    is NOT this: use send_new_email with the file in attachment_paths (one email with
+    the link). Only files in the Socio folder can be shared.
     """
 
     from app.workspace.sharing import share_file, shareable_file

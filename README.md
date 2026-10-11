@@ -49,6 +49,14 @@ with everyone in To, and a "meeting invite" is one calendar invite for all.
 creates it, gives X edit access, and emails X the live link. Socio can only
 share files it created itself (your Socio folder).
 
+"Send the budget sheet to X" is a normal email card with the file's live link
+in the message: a Google Sheet goes as its Google Sheets link and a Google Doc
+as its Docs link, never as an Excel or PDF copy. If Socio created the file,
+approving also gives X edit access (or the access you asked for, e.g. "give
+view access") so the link opens; for other files the card says access is
+unchanged. "Share X with Y" (no email asked for) gives access and lets Google
+send its own notice.
+
 Socio only touches your **Google Tasks** when you ask, and adding or
 completing a task waits for your tap like everything else. It also keeps an
 eye on your open tasks and offers to close them, so you don't have to:

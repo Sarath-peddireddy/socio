@@ -345,29 +345,56 @@ def _reply_proposal(args: dict[str, Any]) -> dict[str, Any]:
 
     from pathlib import Path
 
-    from app.files.drive import get_drive_document
+    from app.files.drive import GOOGLE_TYPES, get_drive_document
     from app.files.local import ALLOWED_EXTENSIONS, resolve_shareable_file
+    from app.workspace.sharing import LINK_PLACEHOLDER, linked_file, links_in_text, normalize_role, with_links
 
     body = (args.get("body") or "").strip()
     if not body:
         raise ValueError("The reply body is empty.")
 
-    attachments = []
+    # A Google Doc / Sheet / Slides file goes as its live link, never as an exported
+    # copy (developer decision 2026-10-11); the owner picks the access on the card.
+    attachments, links = [], []
     for path in args.get("attachment_paths") or []:
         if path.startswith("drive:"):
-            name = get_drive_document(path, ALLOWED_EXTENSIONS)["name"]
+            document = get_drive_document(path, ALLOWED_EXTENSIONS)
+            if document["mime_type"] in GOOGLE_TYPES:
+                links.append(linked_file(path))
+                continue
+            name = document["name"]
         else:
             name = Path(resolve_shareable_file(path)).name
         attachments.append({"path": path, "name": name})
+    # A link the agent wrote in the text: the card offers access for it too.
+    for url in links_in_text(body):
+        try:
+            link = linked_file(url)
+        except ValueError:
+            continue  # not the owner's file, or gone: it stays a plain link in the text
+        if link and link["file_id"] not in {known["file_id"] for known in links}:
+            links.append({**link, "url": url})
+
+    # "[link]" left with no file behind it would go out as the literal text "[link]".
+    if LINK_PLACEHOLDER.search(with_links(body, links)):
+        raise ValueError(
+            "The message says [link] but no file goes with it. Find the file with find_documents and "
+            "pass its path in attachment_paths (a Google Doc / Sheet goes as its live link), or remove [link]."
+        )
+
+    extra: dict[str, Any] = {}
+    if links:
+        extra = {"links": links, "role": normalize_role(args.get("access")) or "editor"}
 
     if not attachments:
-        return {"type": "send_reply", "reply_body": body}
+        return {"type": "send_reply", "reply_body": body, **extra}
 
     return {
         "type": "send_reply_with_attachment",
         "attachments": attachments,
         "reason": "The reply includes a file.",
         "reply_body": body,
+        **extra,
     }
 
 
@@ -434,13 +461,16 @@ def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any
         if not recipients or invalid:
             raise ValueError(f"No valid recipient address was given{': ' + ', '.join(invalid) if invalid else ''}.")
         proposal = _reply_proposal(args)  # validates the body and the attachments
-        return {
+        email = {
             "type": "send_email",
             "to": ", ".join(recipients),
             "subject": (args.get("subject") or "").strip(),
             "body": proposal["reply_body"],
             "attachments": proposal.get("attachments", []),
         }
+        if proposal.get("links"):
+            email.update(links=proposal["links"], role=proposal["role"])
+        return email
 
     if tool_name == "create_document":
         if not (args.get("title") or "").strip():
@@ -496,7 +526,7 @@ def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any
         }
 
     if tool_name == "create_and_share_file":
-        from app.workspace.sharing import FILE_KINDS, validate_recipient, validate_role
+        from app.workspace.sharing import FILE_KINDS, normalize_role, validate_recipient
 
         kind = (args.get("kind") or "").strip().lower()
         if kind not in FILE_KINDS:
@@ -516,15 +546,15 @@ def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any
             "headers": [str(header) for header in args.get("headers") or []] if kind == "spreadsheet" else [],
             "content": (args.get("content") or "") if kind == "document" else "",
             "recipient": recipient,
-            "role": validate_role(args.get("role", "editor")),
+            "role": normalize_role(args.get("role")) or "editor",
             "subject": (args.get("subject") or "").strip() or title,
             "body": args["message"].strip(),
         }
 
     if tool_name == "share_drive_file":
-        from app.workspace.sharing import shareable_file, validate_recipient, validate_role
+        from app.workspace.sharing import normalize_role, shareable_file, validate_recipient
 
-        recipient, role = validate_recipient(args.get("email", "")), validate_role(args.get("role", "editor"))
+        recipient, role = validate_recipient(args.get("email", "")), normalize_role(args.get("role")) or "editor"
         file = shareable_file(args.get("file", ""))
         return {"type": "share_file", "file_id": file["id"], "title": file["name"], "url": file["url"], "recipient": recipient, "role": role}
 

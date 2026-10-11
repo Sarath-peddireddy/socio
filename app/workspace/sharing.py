@@ -1,9 +1,13 @@
 """
-Sharing files Socio created, and the compound "create, share, and email the link" action.
+Sharing files Socio created, the compound "create, share, and email the link" action,
+and live links to Google files in emails.
 
 Only files in Socio's own output folder can be shared: the Workspace token has
-drive.file (files Socio created), not full Drive write access. Both actions run
-only from app.agent.approvals, after the owner approves.
+drive.file (files Socio created), not full Drive write access. A Google Doc / Sheet /
+Slides file in an email always goes as its live link, never as an exported copy; a
+file Socio created is shared with the recipients (editor unless the owner said
+otherwise) so the link opens. Everything here runs only from app.agent.approvals,
+after the owner approves.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ from typing import Any
 from googleapiclient.errors import HttpError
 
 from app.drive.client import get_drive_service
-from app.files.drive import _file_id_from_reference, output_folder_id
+from app.files.drive import GOOGLE_TYPES, _file_id_from_reference, output_folder_id
 from app.google_api import execute_with_retry
 
 
@@ -24,7 +28,16 @@ logger = logging.getLogger(__name__)
 
 # What the owner says -> Drive permission role.
 ROLES = {"editor": "writer", "commenter": "commenter", "viewer": "reader"}
+ROLE_WORDS = {
+    "editor": "editor", "edit": "editor", "writer": "editor", "write": "editor",
+    "commenter": "commenter", "comment": "commenter",
+    "viewer": "viewer", "view": "viewer", "reader": "viewer", "read": "viewer", "read-only": "viewer",
+}
+# What the recipient can do, for the owner's messages ("sam@x.com can now edit it").
+ROLE_VERBS = {"editor": "edit", "commenter": "comment on", "viewer": "view"}
 FILE_KINDS = {"spreadsheet", "document"}
+# A Google Docs / Sheets / Slides link written in an email body.
+GOOGLE_FILE_URL = re.compile(r"https://docs\.google\.com/(?:spreadsheets|document|presentation)/d/[A-Za-z0-9_-]+[^\s<>()\[\]\"']*")
 
 # Where the model marked the link in the email body: [link], [LINK], [Link to the sheet],
 # {link}, {{url}}, <link>, [Google Sheet URL] ... (short, one line; not a Markdown "[text](url)").
@@ -35,6 +48,74 @@ LINK_PLACEHOLDER = re.compile(
     rf"|<[^<>\n]{{0,40}}?{_WORD}[^<>\n]{{0,40}}?>",
     re.IGNORECASE,
 )
+
+
+def linked_file(reference: str) -> dict[str, Any] | None:
+    """
+    A Google Doc / Sheet / Slides file as a link for an email: id, name, url, type, and
+    whether Socio may change its access (only files in the Socio folder). None for any
+    other kind of file. Raises ValueError if the file can't be found.
+    """
+
+    file_id = _file_id_from_reference(reference or "")
+    try:
+        file = execute_with_retry(
+            get_drive_service().files().get(fileId=file_id, fields="id, name, mimeType, parents, webViewLink, trashed"),
+            operation_name="drive_get_link_target",
+        )
+    except HttpError as exc:
+        raise ValueError("I couldn't find that file in your Google Drive.") from exc
+    google_type = GOOGLE_TYPES.get(file.get("mimeType", ""))
+    if not google_type:
+        return None
+    if file.get("trashed"):
+        raise ValueError(f"'{file.get('name', 'That file')}' is in your Google Drive trash.")
+    return {
+        "file_id": file["id"],
+        "name": file.get("name", ""),
+        "url": file.get("webViewLink") or reference,
+        "type": google_type,
+        "can_share": output_folder_id() in (file.get("parents") or []),
+    }
+
+
+def links_in_text(text: str) -> list[str]:
+    """Google Docs / Sheets / Slides URLs written in an email body, each once."""
+
+    return list(dict.fromkeys(match.rstrip(".,;:!?") for match in GOOGLE_FILE_URL.findall(text or "")))
+
+
+def with_links(body: str, links: list[dict[str, Any]]) -> str:
+    """The email body with each file's link: in place of the next [link] placeholder, else below the text."""
+
+    body = (body or "").rstrip()
+    below = []
+    for link in links:
+        url = link["url"]
+        if url in body:
+            continue
+        body, count = LINK_PLACEHOLDER.subn(lambda _: url, body, count=1)
+        if not count:
+            below.append(f"{link['name']}: {url}" if len(links) > 1 else url)
+    return body + "\n\n" + "\n".join(below) if below else body
+
+
+def share_links(links: list[dict[str, Any]], recipients: list[str], role: str) -> list[str]:
+    """
+    Give every recipient `role` access to each file Socio may share (before the email goes).
+    Google sends no email of its own; ours carries the link. Returns "name -> address" for
+    each grant; raises on the first failure (the grants made so far stay).
+    """
+
+    granted = []
+    for link in links:
+        if not link.get("can_share"):
+            continue
+        shareable_file(link["file_id"])  # still in the Socio folder and not trashed
+        for address in recipients:
+            share_file(link["file_id"], address, role, notify=False)
+            granted.append(f"{link['name']} -> {address}")
+    return granted
 
 
 def with_link(body: str, link: str) -> str:
@@ -52,6 +133,17 @@ def validate_role(role: str) -> str:
     if role not in ROLES:
         raise ValueError(f"Access must be one of: {', '.join(ROLES)}.")
     return role
+
+
+def normalize_role(role: str | None) -> str:
+    """The access the owner asked for, or "" when they didn't say (the card then asks)."""
+
+    role = (role or "").strip().lower()
+    if not role:
+        return ""
+    if role not in ROLE_WORDS:
+        raise ValueError(f"Access must be one of: {', '.join(ROLES)}.")
+    return ROLE_WORDS[role]
 
 
 def validate_recipient(email: str) -> str:

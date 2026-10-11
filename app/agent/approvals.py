@@ -51,6 +51,8 @@ EXECUTABLE_TYPES = (
     | DOCUMENT_TYPES
     | SHARE_TYPES
 )
+# What a recipient can do with each access level ("they can view it").
+ROLE_VERB = {"editor": "edit", "commenter": "comment on", "viewer": "view"}
 # Approvals that only ask the owner to look at something; approving closes them.
 REVIEW_TYPES = {"review_draft", "review_decision"}
 
@@ -158,13 +160,13 @@ def describe(approval: dict[str, Any]) -> str:
     elif kind == "create_and_share":
         what = "Google Sheet" if payload.get("kind") == "spreadsheet" else "Google Doc"
         text = (
-            f"Create {what} '{payload.get('title')}', give {payload.get('recipient')} {payload.get('role', 'editor')} access, "
+            f"Create {what} '{payload.get('title')}', give {payload.get('recipient')} {access_words(payload)}, "
             f"and email them the link\nSubject: {payload.get('subject') or '(none)'}\n\"{payload.get('body', '')}\""
         )
         if payload.get("headers"):
             text += "\nColumns: " + " | ".join(payload["headers"])
     elif kind == "share_file":
-        text = f"Give {payload.get('recipient')} {payload.get('role', 'editor')} access to '{payload.get('title')}'"
+        text = f"Give {payload.get('recipient')} {access_words(payload)} to '{payload.get('title')}'"
     elif kind == "create_task":
         due = f" (due {payload['due']})" if payload.get("due") else ""
         text = f"Add Google Task '{payload.get('title', '')}'{due}"
@@ -192,6 +194,9 @@ def describe(approval: dict[str, Any]) -> str:
     else:
         text = approval.get("target") or kind
 
+    if payload.get("links") and kind in EMAIL_TYPES:
+        text += "\n" + links_summary(payload)
+
     if payload.get("reason") and kind in EXECUTABLE_TYPES:
         text += f"\nWhy: {payload['reason']}"
 
@@ -200,6 +205,31 @@ def describe(approval: dict[str, Any]) -> str:
         text += f"\nThen reply to {reply.get('to')}:\n\"{reply.get('body')}\""
 
     return text
+
+
+def access_words(payload: dict[str, Any]) -> str:
+    return f"{payload.get('role') or 'editor'} access"
+
+
+def links_summary(payload: dict[str, Any]) -> str:
+    """What an email's Google file links come with: the live link, and who gets what access."""
+
+    lines = []
+    for link in payload.get("links") or []:
+        if link.get("can_share"):
+            access = f"recipients get {access_words(payload)}"
+        else:
+            access = "access unchanged (not a file Socio created; they may need to request access)"
+        lines.append(f"Live link (not a copy) to {link.get('type', 'Google file')} '{link.get('name')}': {access}")
+    return "\n".join(lines)
+
+
+def email_recipients(approval: dict[str, Any]) -> list[str]:
+    from email.utils import getaddresses
+
+    payload = approval.get("payload") or {}
+    to = payload.get("to") if approval.get("type") == "send_email" else (payload.get("reply") or {}).get("to", "")
+    return [address.lower() for _, address in getaddresses([to or ""]) if address]
 
 
 def _diff_lines(text: str, limit: int = 700) -> str:
@@ -230,19 +260,33 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
     if kind == "trash_email":
         return {"trash": trash_message(payload["message_id"], whole_thread=bool(payload.get("whole_thread")))}
 
-    if kind in REPLY_TYPES:
-        reply = payload["reply"]
-        attachments = [str(resolve_shareable_file(a["path"])) for a in payload.get("attachments", [])]
-        sent = send_reply(
-            thread_id=reply["thread_id"], message_id=reply["message_id"], to=reply["to"],
-            subject="", body=reply["body"], attachment_paths=attachments,
-        )
-        return {"reply": sent, "attachments": [a["name"] for a in payload.get("attachments", [])]}
+    if kind in EMAIL_TYPES:
+        from app.workspace.sharing import share_links, with_links
 
-    if kind == "send_email":
+        links = payload.get("links") or []
+        result: dict[str, Any] = {"attachments": [a["name"] for a in payload.get("attachments", [])]}
+        # Access first: an email whose link doesn't open for the recipient is not sent.
+        if any(link.get("can_share") for link in links):
+            result["shared"] = []
+            try:
+                result["shared"] = share_links(links, email_recipients(approval), payload.get("role") or "editor")
+            except Exception as exc:
+                report_failure(exc, "approval.share_links", approval_id=approval.get("id"))
+                result["share_error"] = safe_error_text(exc)
+                return result
         attachments = [str(resolve_shareable_file(a["path"])) for a in payload.get("attachments", [])]
-        sent = send_new_email(to=payload["to"], subject=payload.get("subject", ""), body=payload["body"], attachment_paths=attachments)
-        return {"email": sent, "attachments": [a["name"] for a in payload.get("attachments", [])]}
+        if kind in REPLY_TYPES:
+            reply = payload["reply"]
+            result["reply"] = send_reply(
+                thread_id=reply["thread_id"], message_id=reply["message_id"], to=reply["to"],
+                subject="", body=with_links(reply["body"], links), attachment_paths=attachments,
+            )
+        else:
+            result["email"] = send_new_email(
+                to=payload["to"], subject=payload.get("subject", ""), body=with_links(payload["body"], links),
+                attachment_paths=attachments,
+            )
+        return result
 
     if kind in DOCUMENT_TYPES:
         from app.workspace import docs, sheets
@@ -264,7 +308,7 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
         from app.workspace.sharing import share_file, shareable_file
 
         file = shareable_file(payload["file_id"])  # still Socio's and not trashed
-        return {"share": share_file(file["id"], payload["recipient"], payload.get("role", "editor"), notify=True)}
+        return {"share": share_file(file["id"], payload["recipient"], payload.get("role") or "editor", notify=True)}
 
     if kind == "create_task":
         from app.tasks import tasks
@@ -352,6 +396,8 @@ def _email_key(payload: dict[str, Any]) -> tuple:
         " ".join(str(payload.get("subject") or "").split()).lower(),
         " ".join(str(payload.get("body") or "").split()),
         tuple(sorted(str(a.get("path")) for a in payload.get("attachments") or [])),
+        tuple(sorted(str(link.get("file_id")) for link in payload.get("links") or [])),
+        payload.get("role") or "",
     )
 
 
@@ -397,8 +443,9 @@ def share_outcome(kind: str, payload: dict[str, Any], result: dict[str, Any]) ->
     """What happened after a sharing approval, step by step and truthfully."""
 
     title, recipient = payload.get("title", ""), payload.get("recipient", "")
+    verb = ROLE_VERB.get(payload.get("role") or "editor", "edit")
     if kind == "share_file":
-        return f"Shared \"{title}\" with {recipient}. Google emailed them the link."
+        return f"Shared \"{title}\" with {recipient} (they can {verb} it). Google emailed them the link."
 
     url = (result.get("file") or {}).get("url", "")
     if result.get("share_error"):
@@ -408,7 +455,26 @@ def share_outcome(kind: str, payload: dict[str, Any], result: dict[str, Any]) ->
             f"Created \"{title}\" and gave {recipient} access, but the email didn't go through. "
             f"{result['email_error']} You can send them this link: {url}"
         ).strip()
-    return f"Created \"{title}\" and sent edit link to {recipient}. {url}".strip()
+    return f"Created \"{title}\" and emailed {recipient} the link (they can {verb} it). {url}".strip()
+
+
+def email_link_outcome(approval: dict[str, Any], result: dict[str, Any]) -> str:
+    """After an email with Google file links: what was shared and sent, truthfully."""
+
+    payload = approval["payload"]
+    links = payload.get("links") or []
+    names = ", ".join(f"\"{link.get('name')}\"" for link in links)
+    who = ", ".join(email_recipients(approval)) or "them"
+    if result.get("share_error"):
+        given = " Some access was already given." if result.get("shared") else ""
+        return f"I couldn't give {who} access to {names}, so the email wasn't sent.{given} {result['share_error']}".strip()
+    sent = "Reply sent" if approval["type"] in REPLY_TYPES else "Email sent"
+    message = f"{sent} with the live link to {names}."
+    if any(link.get("can_share") for link in links):
+        message += f" {who} can now {ROLE_VERB.get(payload.get('role') or 'editor', 'open')} it."
+    if any(not link.get("can_share") for link in links):
+        message += " Access unchanged: if they can't open it, share it from Google Drive."
+    return message
 
 
 def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str, Any]:
@@ -457,6 +523,8 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
         store.close_tracked_task(approval["payload"]["task_id"], "closed_by_socio")
 
     message = DONE_TEXT.get(approval["type"], "Done.")
+    if approval["type"] in EMAIL_TYPES and approval["payload"].get("links"):
+        message = email_link_outcome(approval, result)
     if approval["type"] in SHARE_TYPES:
         message = share_outcome(approval["type"], approval["payload"], result)
     if approval["type"] == "close_old_reminders":
@@ -528,17 +596,23 @@ def to_draft(approval_id: int, store: AgentStateStore | None = None) -> dict[str
     if not store.claim_approval(approval_id):
         return {"ok": False, "message": _already(approval)}
 
+    from app.workspace.sharing import with_links
+
     payload = approval["payload"]
     attachments = payload.get("attachments", [])
+    links = payload.get("links") or []
 
     try:
         # A Gmail draft made here carries at most one file; with several, the owner attaches them.
         attachment = str(resolve_shareable_file(attachments[0]["path"])) if len(attachments) == 1 else None
         if approval["type"] == "send_email":
-            draft = create_draft(to=payload["to"], subject=payload.get("subject", ""), body=payload["body"], attachment_path=attachment)
+            draft = create_draft(
+                to=payload["to"], subject=payload.get("subject", ""), body=with_links(payload["body"], links),
+                attachment_path=attachment,
+            )
         else:
             reply = payload["reply"]
-            draft = create_reply_draft(message_id=reply["message_id"], body=reply["body"], attachment_path=attachment)
+            draft = create_reply_draft(message_id=reply["message_id"], body=with_links(reply["body"], links), attachment_path=attachment)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         report_failure(exc, "approval.to_draft", approval_id=approval_id, type=approval["type"])
@@ -549,6 +623,8 @@ def to_draft(approval_id: int, store: AgentStateStore | None = None) -> dict[str
     store.finish_approval(approval_id, "resolved", "Moved to Gmail Drafts by owner", {"draft_id": draft.get("id")})
 
     message = "Saved to Gmail Drafts. Nothing was sent; edit and send it from Gmail."
+    if any(link.get("can_share") for link in links):
+        message += " Nobody's access changed: share the file from Google Drive if they need it."
     if len(attachments) > 1:
         message += " Attach the files there yourself."
 

@@ -35,6 +35,13 @@ EXPORTS = {
         ".xlsx",
     ),
 }
+# Google-native files are sent as their live link, never as an exported copy
+# (developer decision 2026-10-11); EXPORTS is only used for older approvals.
+GOOGLE_TYPES = {
+    "application/vnd.google-apps.spreadsheet": "Google Sheet",
+    "application/vnd.google-apps.document": "Google Doc",
+    "application/vnd.google-apps.presentation": "Google Slides",
+}
 FILE_FIELDS = "id, name, mimeType, size, modifiedTime, parents, trashed"
 MAX_FILES = 300
 
@@ -102,9 +109,13 @@ def _is_document(file: dict, allowed_extensions: set[str]) -> bool:
 
 
 def _as_document(file: dict, folder: str = "") -> dict:
+    google_type = GOOGLE_TYPES.get(file["mimeType"])
     return {
         "path": f"{DRIVE_PREFIX}{file['id']}",
-        "name": _display_name(file),
+        # A Google Sheet is listed as "Budget" (type Google Sheet), not "Budget.xlsx":
+        # it is shared as a link, so an export extension would mislead the agent.
+        "name": file["name"] if google_type else _display_name(file),
+        **({"type": google_type} if google_type else {}),
         "folder": folder,
         "size_bytes": int(file.get("size", 0) or 0),
         "modified": (file.get("modifiedTime") or "")[:10],
@@ -245,6 +256,8 @@ def download_drive_document(path: str, allowed_extensions: set[str], max_bytes: 
         raise ValueError(f"Refusing to attach {match['name']}: larger than {max_bytes // (1024 * 1024)} MB.")
 
     safe_name = PureWindowsPath(match["name"]).name or "document"
+    if export and not safe_name.lower().endswith(export[1]):
+        safe_name += export[1]
     target = CACHE_DIR / file_id / safe_name
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
