@@ -189,8 +189,10 @@ everything runs offline on your CPU.
 Bot commands: `/run` (check inbox now), `/dryrun`, `/status`, `/approvals`,
 `/new` (or `/reset`, `/clear`: forget the conversation so far), `/remember TEXT`, `/memories`, `/forget ID`, `/save_skill NAME`,
 `/skills`, `/forget_skill NAME`, `/schedules` (your routines, with Cancel buttons), `/help`. `/start`, `/help`, or asking "what
-can you do?" shows an overview of what Socio does. The inbox is also checked
-every `AGENT_POLL_MINUTES`.
+can you do?" shows an overview of what Socio does. Typing `/` in the chat shows
+every command with a short description (set by the bot when it starts). A message
+that only closes the chat ("Okay", "Thanks", "Hmm") gets a 👍 reaction, not a
+reply. The inbox is also checked every `AGENT_POLL_MINUTES`.
 
 Each approval request arrives as one card (for example "🗑️ **Trash
 Conversation**" with the subject, sender, and reason) with its buttons. Messages

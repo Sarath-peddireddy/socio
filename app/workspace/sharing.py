@@ -9,6 +9,7 @@ only from app.agent.approvals, after the owner approves.
 from __future__ import annotations
 
 import logging
+import re
 from email.utils import getaddresses
 from typing import Any
 
@@ -24,6 +25,26 @@ logger = logging.getLogger(__name__)
 # What the owner says -> Drive permission role.
 ROLES = {"editor": "writer", "commenter": "commenter", "viewer": "reader"}
 FILE_KINDS = {"spreadsheet", "document"}
+
+# Where the model marked the link in the email body: [link], [LINK], [Link to the sheet],
+# {link}, {{url}}, <link>, [Google Sheet URL] ... (short, one line; not a Markdown "[text](url)").
+_WORD = r"\b(?:link|url|hyperlink)\b"
+LINK_PLACEHOLDER = re.compile(
+    rf"\[[^\[\]\n]{{0,40}}?{_WORD}[^\[\]\n]{{0,40}}?\](?!\()"
+    rf"|\{{\{{?[^{{}}\n]{{0,40}}?{_WORD}[^{{}}\n]{{0,40}}?\}}\}}?"
+    rf"|<[^<>\n]{{0,40}}?{_WORD}[^<>\n]{{0,40}}?>",
+    re.IGNORECASE,
+)
+
+
+def with_link(body: str, link: str) -> str:
+    """The email body with the link where the model marked it, or below the text if it didn't."""
+
+    body = (body or "").rstrip()
+    filled, count = LINK_PLACEHOLDER.subn(lambda _: link, body)
+    if count or not link or link in body:
+        return filled
+    return f"{body}\n\n{link}"
 
 
 def validate_role(role: str) -> str:
@@ -119,7 +140,7 @@ def create_and_share(payload: dict[str, Any]) -> dict[str, Any]:
         result["share_error"] = safe_error_text(exc)
         return result
 
-    body = f"{payload['body'].rstrip()}\n\n{created['url']}"
+    body = with_link(payload["body"], created["url"])
     try:
         result["email"] = send_new_email(to=payload["recipient"], subject=payload.get("subject", ""), body=body)
     except Exception as exc:

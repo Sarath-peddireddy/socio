@@ -44,6 +44,7 @@ import time
 
 import requests
 from dotenv import load_dotenv
+from langchain_core.messages import AIMessage
 from app.agent.approvals import approve, describe, reject, to_draft
 from app.agent.llm import LLMUnavailableError
 from app.agent.runner import BUSY_STATUS, DEFAULT_QUERY, handle_owner_command, process_inbox
@@ -75,8 +76,10 @@ from app.telegram_format import (
     card_text,
     clip_html,
     esc,
+    is_acknowledgement,
     is_capability_question,
     md_to_html,
+    menu_commands,
     reply_messages,
     routine_header,
     schedules_html,
@@ -389,8 +392,36 @@ class Bot:
             except skill_store.SkillError:
                 ok = False
             self.send(f"Archived skill <b>{esc(argument)}</b> (skills/.archive)." if ok else "Usage: <code>/forget_skill NAME</code> (see /skills).")
+        elif is_acknowledgement(text, self._last_reply()):
+            self._react(message)
         else:
             self._run_instruction(text)
+
+    def _last_reply(self) -> str:
+        replies = [m.content for m in self.history if isinstance(m, AIMessage)]
+        return str(replies[-1]) if replies else ""
+
+    def _react(self, message: dict) -> None:
+        """A 👍 on the owner's "Okay" / "Thanks": no reply, no model call, nothing saved."""
+
+        try:
+            self.api.call(
+                "setMessageReaction", chat_id=self.owner_chat_id, message_id=message["message_id"],
+                reaction=[{"type": "emoji", "emoji": "👍"}],
+            )
+        except Exception as exc:
+            logger.info("Could not react to the message: %s", exc)
+
+    def set_command_menu(self) -> None:
+        """The command suggestions Telegram shows when the owner types "/" (owner chat only)."""
+
+        try:
+            self.api.call(
+                "setMyCommands", commands=menu_commands(),
+                scope={"type": "chat", "chat_id": self.owner_chat_id},
+            )
+        except Exception as exc:
+            logger.warning("Could not set the command menu: %s", exc)
 
     def _run_instruction(self, text: str) -> None:
         self.api.call("sendChatAction", chat_id=self.owner_chat_id, action="typing")
@@ -633,6 +664,7 @@ class Bot:
 
     def run_forever(self) -> None:
         if self.owner_chat_id is not None:
+            self.set_command_menu()
             self.send("🤖 <b>Socio is online.</b> Send /help for commands.")
 
         # Load the local embedding model in the background so the first recall is fast.

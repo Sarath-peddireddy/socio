@@ -22,11 +22,53 @@ from typing import Any
 
 from app.agent.approvals import DOCUMENT_TYPES, EMAIL_TYPES, EXECUTABLE_TYPES, SHARE_TYPES, format_time, invitees
 from app.calendar.events import parse_ist
+from app.workspace.sharing import with_link
 
 
 MAX_MESSAGE_CHARS = 4000  # Telegram allows 4096 characters per message
 BODY_CHARS = 2500  # longest email body / diff shown on a card
 EXPANDABLE_AFTER = 600  # longer quotes start collapsed
+
+# Every command, in menu order: (command, argument shown on /help, short description).
+# The /help card and Telegram's "/" suggestion menu (setMyCommands) both come from this list.
+BOT_COMMANDS = [
+    ("run", "", "Trigger immediate inbox check"),
+    ("status", "", "Inspect active holds, pending approvals & system health"),
+    ("approvals", "", "Review pending decision cards"),
+    ("memories", "", "View your saved rules and standing preferences"),
+    ("schedules", "", "See or cancel your scheduled routines"),
+    ("remember", "TEXT", "Save a rule, e.g. no calls before 12:00"),
+    ("forget", "ID", "Delete a saved rule (numbers from /memories)"),
+    ("new", "", "Start a fresh conversation"),
+    ("reset", "", "Clear the conversation context (like /new)"),
+    ("dryrun", "", "Check the inbox without sending or changing anything"),
+    ("skills", "", "List your saved skills (reusable workflows)"),
+    ("save_skill", "NAME", "Save your last multi-step request as a skill"),
+    ("forget_skill", "NAME", "Archive a saved skill"),
+    ("help", "", "Show what I can do and these commands"),
+]
+# Other names for the same command: shown next to it on /help, and in the "/" menu.
+COMMAND_ALIASES = {"schedules": ["routines"], "reset": ["clear"], "help": ["start"]}
+
+
+def commands_html() -> str:
+    lines = []
+    for command, argument, description in BOT_COMMANDS:
+        names = " · ".join(f"<code>/{name}</code>" for name in COMMAND_ALIASES.get(command, []))
+        usage = f"<code>{html.escape(f'/{command} {argument}'.strip())}</code>" + (f" · {names}" if names else "")
+        lines.append(f"• {usage} — {html.escape(description, quote=False)}")
+    return "\n".join(lines)
+
+
+def menu_commands() -> list[dict[str, str]]:
+    """The "/" suggestion menu for setMyCommands (plain text, no arguments)."""
+
+    menu = []
+    for command, _, description in BOT_COMMANDS:
+        menu.append({"command": command, "description": description})
+        menu += [{"command": alias, "description": f"Same as /{command}"} for alias in COMMAND_ALIASES.get(command, [])]
+    return menu
+
 
 WELCOME_HTML = """👋 <b>Welcome to Socio</b>
 Your autonomous Workspace Chief of Staff.
@@ -62,14 +104,9 @@ I triage your inbox, coordinate your calendar, and manage your documents with st
 
 ━━━━━━━━━━━━━━━━━━━━
 💡 <b>Quick Commands:</b>
-• <code>/run</code> — Trigger immediate inbox check
-• <code>/status</code> — Inspect active holds, pending approvals &amp; system health
-• <code>/approvals</code> — Review pending decision cards
-• <code>/memories</code> — View your saved rules and standing preferences
-• <code>/schedules</code> — See or cancel your scheduled routines
-• <code>/dryrun</code> · <code>/new</code> · <code>/reset</code> · <code>/forget ID</code> · <code>/save_skill NAME</code> · <code>/skills</code> · <code>/forget_skill NAME</code>
+{commands}
 
-<i>You can also message me naturally (e.g., "What's on my calendar tomorrow?" or "Draft an email to Alex").</i>"""
+<i>You can also message me naturally (e.g., "What's on my calendar tomorrow?" or "Draft an email to Alex").</i>""".replace("{commands}", commands_html())
 
 # "what can you do?", "how can you help", "features" ... (the whole message, not a mention inside a request).
 CAPABILITY_QUESTION = re.compile(
@@ -86,6 +123,35 @@ CAPABILITY_QUESTION = re.compile(
 
 def is_capability_question(text: str) -> bool:
     return bool(CAPABILITY_QUESTION.match(text or ""))
+
+
+# A message that only closes the conversation ("Okay", "Thanks!", "hmm", "ok cool 👍"):
+# the bot reacts 👍 instead of replying (developer request 2026-10-11). "yes", "sure",
+# "done" are not here: they answer a question or say a task is finished.
+_THANKS = r"thanks?(?: (?:a lot|so much|very much))?|thank you(?: (?:so|very) much)?|thx|thnx|tq|ty|cheers|bye"
+_OK = (
+    r"ok(?:a+y|ey|ie|i)?|o?k+|h+m+|m+h*m+|cool|great|nice|good|got it|gotcha|alright|all right|fine|noted"
+    r"|perfect|awesome|understood|sounds good|no worries|np"
+)
+_EMOJI = "[\U0001F44C\U0001F44D\U0001F44F\U0001F64F\U0001F600-\U0001F64F\U0001F3FB-\U0001F3FF❤✅☺️]+"
+ACKNOWLEDGEMENT = re.compile(rf"^\s*(?:(?:(?:{_THANKS}|{_OK})\b|{_EMOJI})[\s,.!~]*){{1,4}}$", re.IGNORECASE)
+THANKS = re.compile(rf"\b(?:{_THANKS})\b", re.IGNORECASE)
+
+
+def is_acknowledgement(text: str, last_reply: str = "") -> bool:
+    """
+    True when the message needs no answer. "Okay" right after a question of ours is an
+    answer ("Shall I use 30 minutes?" "ok"), so it goes to the agent; thanks never does.
+    """
+
+    text = (text or "").strip()
+    if len(text) > 40 or not ACKNOWLEDGEMENT.match(text):
+        return False
+    if THANKS.search(text):
+        return True
+    # Only Socio's own words count, not the notes saved after it ("(Shown to the owner as ...").
+    asked = "?" in (last_reply or "").split("\n(")[0]
+    return not asked
 
 
 # ----- escaping and conversion ----------------------------------------------------------
@@ -403,10 +469,11 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
             lines.append(f"• {_field('Columns', ' | '.join(payload['headers']))}")
         if not sheet and payload.get("content"):
             lines.append(f"• <b>Content:</b>\n{quote(payload['content'])}")
+        link = "🔗 Sheet link" if sheet else "🔗 Doc link"
         lines += [
             f"• {_field('Subject', payload.get('subject') or '(no subject)')}",
-            f"• <b>Message:</b>\n{quote(payload.get('body'))}",
-            "<i>The link is added to the email once it's created.</i>",
+            f"• <b>Message:</b>\n{quote(with_link(payload.get('body') or '', link))}",
+            f"<i>{link} becomes the real link once it's created.</i>",
         ]
     elif kind == "share_file":
         lines = [

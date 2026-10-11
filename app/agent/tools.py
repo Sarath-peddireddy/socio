@@ -574,7 +574,8 @@ def create_and_share_file(
     create a sheet or doc AND send or share it with someone: it is one approval, never
     a separate create and email. title: a short descriptive name taken from the request
     (e.g. "Insuff Comments Feedback"), never "Untitled". message is the email body (plain
-    text); the link is added below it, so call it a link, not an attachment.
+    text): write [link] where the link should go and it is replaced by the real link
+    (without [link], the link is added below the text). Call it a link, not an attachment.
     """
 
     from app.workspace.sharing import create_and_share

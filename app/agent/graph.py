@@ -317,6 +317,23 @@ def _stored_held_reply(store: AgentStateStore, message_id: str) -> dict[str, Any
     return None
 
 
+# Free text the owner reads and that goes out (email bodies, document content).
+WRITTEN_TEXT_FIELDS = ("body", "message", "content", "text")
+
+
+def _real_line_breaks(args: dict[str, Any]) -> dict[str, Any]:
+    """
+    Some models write line breaks as the two characters backslash + n ("Hi,\\n\\nPlease ...");
+    turn them into real ones so neither the card nor the email shows "\\n".
+    """
+
+    fixed = dict(args)
+    for field in WRITTEN_TEXT_FIELDS:
+        if isinstance(fixed.get(field), str):
+            fixed[field] = fixed[field].replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    return fixed
+
+
 def _reply_proposal(args: dict[str, Any]) -> dict[str, Any]:
     """
     Validate a reply to an incoming email and describe it for the owner's approval.
@@ -665,6 +682,7 @@ def execute_tools(state: AgentState):
         # emails and Docs/Sheets writes do.
         gated = tool_name == "send_gmail_reply" if _is_email_mode(state) else tool_name in OWNER_GATED_TOOLS
         if gated:
+            args = _real_line_breaks(args)
             try:
                 proposal = _reply_proposal(args) if _is_email_mode(state) else _owner_write_proposal(tool_name, args)
             except Exception as exc:
