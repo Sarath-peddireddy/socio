@@ -20,7 +20,7 @@ import re
 from datetime import date
 from typing import Any
 
-from app.agent.approvals import DOCUMENT_TYPES, EMAIL_TYPES, EXECUTABLE_TYPES, SHARE_TYPES, format_time
+from app.agent.approvals import DOCUMENT_TYPES, EMAIL_TYPES, EXECUTABLE_TYPES, SHARE_TYPES, format_time, invitees
 from app.calendar.events import parse_ist
 
 
@@ -62,7 +62,7 @@ I triage your inbox, coordinate your calendar, and manage your documents with st
 • <code>/status</code> — Inspect active holds, pending approvals &amp; system health
 • <code>/approvals</code> — Review pending decision cards
 • <code>/memories</code> — View your saved rules and standing preferences
-• <code>/dryrun</code> · <code>/new</code> · <code>/forget ID</code> · <code>/save_skill NAME</code> · <code>/skills</code> · <code>/forget_skill NAME</code>
+• <code>/dryrun</code> · <code>/new</code> · <code>/reset</code> · <code>/forget ID</code> · <code>/save_skill NAME</code> · <code>/skills</code> · <code>/forget_skill NAME</code>
 
 <i>You can also message me naturally (e.g., "What's on my calendar tomorrow?" or "Draft an email to Alex").</i>"""
 
@@ -194,6 +194,48 @@ def _field(label: str, value: Any) -> str:
     return f"<b>{label}:</b> {esc(value)}"
 
 
+# ----- replies split by intent ---------------------------------------------------------------
+# One message per kind of content, so an answer, a problem, and a question never share one text
+# box. Kinds as in app.agent.supervisor (answer / done / problem / question).
+
+REPLY_HEADERS = {
+    "answer": "📋 <b>Here's what I found</b>",
+    "done": "✅ <b>Done</b>",
+    "problem": "⚠️ <b>Couldn't finish</b>",
+    "question": "❓ <b>I need your answer</b>",
+}
+REPLY_ORDER = ("answer", "done", "problem", "question")
+SINGLE_PREFIX = {"done": "✅ ", "problem": "⚠️ "}
+
+
+def reply_messages(parts: list) -> tuple[list[str], list[str]]:
+    """
+    The reply parts as Telegram HTML messages: (before the approval cards, after them).
+
+    A reply of one part is one plain message (no header: a simple answer reads like a
+    person). Several parts: one message per kind, with a short header and one bullet per
+    item. Questions come last, after the cards, so the last thing on screen is what needs
+    an answer.
+    """
+
+    parts = [part for part in parts if (part.text or "").strip()]
+    if not parts:
+        return [], []
+    if len(parts) == 1:
+        part = parts[0]
+        text = md_to_html(SINGLE_PREFIX.get(part.kind, "") + part.text.strip())
+        return ([], [text]) if part.kind == "question" else ([text], [])
+
+    before, after = [], []
+    for kind in REPLY_ORDER:
+        items = [part.text.strip() for part in parts if part.kind == kind]
+        if not items:
+            continue
+        body = md_to_html(items[0]) if len(items) == 1 else "\n".join(f"• {md_to_html(item)}" for item in items)
+        (after if kind == "question" else before).append(f"{REPLY_HEADERS[kind]}\n{body}")
+    return before, after
+
+
 # ----- approval cards -----------------------------------------------------------------------
 
 
@@ -269,7 +311,7 @@ def card_text(approval: dict[str, Any], hold_active: bool = False) -> str:
         lines = [
             "📅 <b>Meeting Proposal</b>", "",
             _field("Title", payload.get("title")),
-            _field("With", payload.get("attendee_email") or "nobody (no invite)"),
+            _field("With", ", ".join(invitees(payload)) or "nobody (no invite)"),
             _field("Proposed Slot", slot_text(payload.get("new_start"), payload.get("new_end"))),
         ]
         if payload.get("meeting_link"):

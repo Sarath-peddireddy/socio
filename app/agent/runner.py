@@ -388,7 +388,7 @@ def _process_inbox(store: AgentStateStore, query: str, max_messages: int, dry_ru
     return outcomes
 
 
-def handle_owner_command(text: str, *, dry_run: bool = False, history: list | None = None) -> OwnerCommandResult:
+def handle_owner_command(text: str, *, dry_run: bool = False, history: list | None = None, context: str = "") -> OwnerCommandResult:
     """
     Run a direct instruction from the owner (e.g. a Telegram message).
 
@@ -396,7 +396,8 @@ def handle_owner_command(text: str, *, dry_run: bool = False, history: list | No
     writes, calendar changes, and trashing still only create approval requests.
     Multi-part instructions are split across worker subagents by the supervisor
     (app.agent.supervisor); single tasks run the owner-mode agent directly.
-    history is optional earlier HumanMessage/AIMessage turns for context.
+    history is optional earlier HumanMessage/AIMessage turns for context; context is the
+    chat's <active_context> block (app.memory.context_anchor).
     """
 
-    return handle_owner_request(text, dry_run=dry_run, history=history)
+    return handle_owner_request(text, dry_run=dry_run, history=history, context=context)

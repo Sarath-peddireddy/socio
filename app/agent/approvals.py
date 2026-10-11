@@ -94,6 +94,12 @@ def format_time(value: str | None) -> str:
         return value
 
 
+def invitees(payload: dict[str, Any]) -> list[str]:
+    """Everyone a booking invites (older approvals only have attendee_email)."""
+
+    return list(payload.get("attendees") or ([payload["attendee_email"]] if payload.get("attendee_email") else []))
+
+
 def describe(approval: dict[str, Any]) -> str:
     """One human-readable description of what approving will do."""
 
@@ -107,7 +113,7 @@ def describe(approval: dict[str, Any]) -> str:
         text = (
             f"Book '{payload.get('title')}'\n"
             f"{format_time(payload.get('new_start'))} - {format_time(payload.get('new_end'))}\n"
-            f"Invite: {payload.get('attendee_email') or 'nobody'}"
+            f"Invite: {', '.join(invitees(payload)) or 'nobody'}"
         )
         if payload.get("meeting_link"):
             text += f"\nLink: {payload['meeting_link']}"
@@ -313,6 +319,7 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
             "end_time": payload["new_end"],
             "description": payload.get("description", ""),
             "attendee_email": payload.get("attendee_email", ""),
+            "attendee_emails": payload.get("attendees") or [],
             "meeting_link": payload.get("meeting_link", ""),
         })
         if not event.get("verified"):
@@ -336,6 +343,54 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
         result["reply_error_text"] = safe_error_text(exc)
 
     return result
+
+
+def _email_key(payload: dict[str, Any]) -> tuple:
+    """Two new emails are the same message when subject, text, and files match (recipients aside)."""
+
+    return (
+        " ".join(str(payload.get("subject") or "").split()).lower(),
+        " ".join(str(payload.get("body") or "").split()),
+        tuple(sorted(str(a.get("path")) for a in payload.get("attachments") or [])),
+    )
+
+
+def merge_same_emails(approval_ids: list[int], store: AgentStateStore) -> list[int]:
+    """
+    One instruction that produced the same new email for several people becomes ONE
+    email to all of them (the way a person writes it), before the owner sees any card.
+
+    Only open, not-yet-shown owner-mode `send_email` approvals from this instruction
+    are merged, and only when subject, text, and files are identical: a personalised
+    message ("Hi Sam" / "Hi Raj") stays separate. Recipients keep their order, each
+    once. The merged-away approvals are closed (never sent). Returns the ids still open.
+    """
+
+    kept: dict[tuple, dict[str, Any]] = {}
+    remaining: list[int] = []
+    for approval_id in approval_ids:
+        approval = store.get_approval(approval_id)
+        mergeable = (
+            approval is not None and approval["type"] == "send_email" and approval["status"] == "open"
+            and not approval.get("notified") and not approval.get("message_id")
+        )
+        if not mergeable:
+            remaining.append(approval_id)
+            continue
+        key = _email_key(approval["payload"])
+        first = kept.get(key)
+        if first is None:
+            kept[key] = approval
+            remaining.append(approval_id)
+            continue
+        recipients = [a.strip() for a in f"{first['payload']['to']}, {approval['payload']['to']}".split(",") if a.strip()]
+        merged = {**first, "payload": {**first["payload"], "to": ", ".join(dict.fromkeys(r.lower() for r in recipients))}}
+        if store.update_unshown_approval(first["id"], describe(merged), merged["payload"]):
+            kept[key] = merged
+            store.resolve_pending_approval(approval_id, f"Merged into #{first['id']}: the same email to several people")
+        else:  # the first card was shown meanwhile: leave both as they are
+            remaining.append(approval_id)
+    return remaining
 
 
 def share_outcome(kind: str, payload: dict[str, Any], result: dict[str, Any]) -> str:

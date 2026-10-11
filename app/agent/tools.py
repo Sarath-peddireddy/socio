@@ -331,6 +331,23 @@ def propose_move_calendar_event(
     }
 
 
+MAX_ATTENDEES = 50
+
+
+def attendee_list(attendee_email: str = "", attendee_emails: list[str] | None = None) -> list[str]:
+    """Every invitee once, lower-cased, in the order given; ValueError for anything that is not an address."""
+
+    raw = [attendee_email or ""] + [str(value) for value in attendee_emails or []]
+    addresses = [address.strip().lower() for _, address in getaddresses(raw) if address.strip()]
+    invalid = [address for address in addresses if "@" not in address.strip("@") or " " in address]
+    if invalid:
+        raise ValueError(f"Not a valid email address: {', '.join(invalid)}.")
+    attendees = list(dict.fromkeys(addresses))
+    if len(attendees) > MAX_ATTENDEES:
+        raise ValueError(f"That's {len(attendees)} people; I can invite at most {MAX_ATTENDEES} at once.")
+    return attendees
+
+
 @tool
 def propose_book_meeting(
     title: str,
@@ -341,22 +358,24 @@ def propose_book_meeting(
     description: str = "",
     meeting_link: str = "",
     reply_body: str = "",
+    attendee_emails: list[str] | None = None,
 ) -> dict:
     """
     Ask the owner to approve booking a new calendar event (meeting, interview, call).
 
     Nothing is booked until the owner approves; the slot is checked again
     then. start_time/end_time are ISO 8601 (naive times are IST) and must be
-    free. attendee_email (optional) is invited by Google. meeting_link is
-    added to the description. reply_body is the email reply to send in this
-    thread AFTER the booking is approved, stating the exact time; do not send
-    a separate reply yourself.
+    free. attendee_email / attendee_emails (optional, any number of people) are
+    invited by Google, which emails each of them the invite with Accept / Decline.
+    meeting_link is added to the description. reply_body is the email reply to
+    send in this thread AFTER the booking is approved, stating the exact time; do
+    not send a separate reply yourself.
     """
 
     start, end = parse_ist(start_time), parse_ist(end_time)
     validate_new_time(start, end)
 
-    attendee = attendee_email.strip().lower()
+    attendees = attendee_list(attendee_email, attendee_emails)
 
     return {
         "proposal": {
@@ -364,8 +383,9 @@ def propose_book_meeting(
             "title": title,
             "new_start": start.isoformat(),
             "new_end": end.isoformat(),
-            "attendee_email": attendee,
-            "other_attendees": [attendee] if attendee else [],
+            "attendee_email": attendees[0] if attendees else "",
+            "attendees": attendees,
+            "other_attendees": attendees,
             "description": description,
             "meeting_link": meeting_link,
             "reason": reason,
@@ -453,6 +473,10 @@ def send_new_email(to: str, subject: str, body: str, attachment_paths: list[str]
     """
     Send a NEW email (not a reply) on the owner's explicit instruction.
 
+    to takes one or more addresses separated by commas ("a@x.com, b@y.com"). One
+    message to several people is ONE call with all of them in to, the way a person
+    writes it; never one email per person unless the owner asks for separate emails
+    or each person gets a different message.
     attachment_paths are "path" values from find_documents.
     """
 
@@ -548,8 +572,9 @@ def create_and_share_file(
     (kind="document", with content), give recipient_email access (role: editor,
     commenter, or viewer), and email them the link. Use this whenever the owner asks to
     create a sheet or doc AND send or share it with someone: it is one approval, never
-    a separate create and email. message is the email body (plain text); the link is
-    added below it, so call it a link, not an attachment.
+    a separate create and email. title: a short descriptive name taken from the request
+    (e.g. "Insuff Comments Feedback"), never "Untitled". message is the email body (plain
+    text); the link is added below it, so call it a link, not an attachment.
     """
 
     from app.workspace.sharing import create_and_share

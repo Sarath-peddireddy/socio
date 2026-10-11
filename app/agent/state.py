@@ -297,6 +297,36 @@ class AgentStateStore:
             """
         )
 
+    @classmethod
+    def _migrate_v5_conversation_context(cls, conn: sqlite3.Connection) -> None:
+        """Telegram conversation context: the active entities and recent turns per chat (app.memory.context_*)."""
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conversation_anchors (
+                chat_id INTEGER PRIMARY KEY,
+                active_thread_id TEXT,
+                active_contact TEXT,
+                active_document TEXT,
+                metadata_json TEXT DEFAULT '{}',
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conversation_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                owner_text TEXT NOT NULL,
+                socio_text TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_conversation_turns_chat ON conversation_turns (chat_id, archived, id)")
+
     # ----- processed messages -------------------------------------------------
 
     def mark_processed(self, message_id: str, thread_id: str | None = None, status: str = "processed", summary: str | None = None, metadata: dict[str, Any] | None = None) -> None:
@@ -522,6 +552,16 @@ class AgentStateStore:
                 "SELECT id FROM pending_approvals WHERE status = 'open' AND notified = 0 ORDER BY id"
             ).fetchall()
         return [self.get_approval(row["id"]) for row in rows]
+
+    def update_unshown_approval(self, approval_id: int, target: str, payload: dict[str, Any]) -> bool:
+        """Change an open approval the owner has not been shown yet. False if it was shown or decided."""
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE pending_approvals SET target = ?, payload = ? WHERE id = ? AND status = 'open' AND notified = 0",
+                (target, json.dumps(payload, default=str), approval_id),
+            )
+            return cursor.rowcount > 0
 
     def mark_approval_notified(self, approval_id: int) -> None:
         with self._connect() as conn:
@@ -830,6 +870,77 @@ class AgentStateStore:
             ).fetchone()
             return int(row["approval_id"]) if row else None
 
+    # ----- Telegram conversation context (app.memory.context_anchor / context_assembler)
+
+    def upsert_conversation_anchor(self, chat_id: int, fields: dict[str, str], metadata: dict[str, Any] | None = None) -> None:
+        """Set the given anchor fields (others keep their value) and merge metadata; refreshes updated_at."""
+
+        allowed = {"active_thread_id", "active_contact", "active_document"}
+        fields = {name: value for name, value in fields.items() if name in allowed}
+        with self._connect() as conn:
+            row = conn.execute("SELECT metadata_json FROM conversation_anchors WHERE chat_id = ?", (chat_id,)).fetchone()
+            merged = {**json.loads((row["metadata_json"] if row else None) or "{}"), **(metadata or {})}
+            conn.execute("INSERT OR IGNORE INTO conversation_anchors (chat_id) VALUES (?)", (chat_id,))
+            assignments = "".join(f"{name} = ?, " for name in fields)
+            conn.execute(
+                f"UPDATE conversation_anchors SET {assignments}metadata_json = ?, updated_at = datetime('now') WHERE chat_id = ?",
+                (*fields.values(), json.dumps(merged, default=str), chat_id),
+            )
+
+    def conversation_anchor(self, chat_id: int, max_age_hours: int) -> dict[str, Any] | None:
+        """The anchor if it was updated within max_age_hours, else None."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT active_thread_id, active_contact, active_document, metadata_json, updated_at "
+                "FROM conversation_anchors WHERE chat_id = ? AND updated_at >= datetime('now', ?)",
+                (chat_id, f"-{int(max_age_hours)} hours"),
+            ).fetchone()
+        if not row:
+            return None
+        anchor = dict(row)
+        anchor["metadata"] = json.loads(anchor.pop("metadata_json") or "{}")
+        return anchor
+
+    def clear_conversation_anchor(self, chat_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM conversation_anchors WHERE chat_id = ?", (chat_id,))
+
+    def add_conversation_turn(self, chat_id: int, owner_text: str, socio_text: str) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO conversation_turns (chat_id, owner_text, socio_text) VALUES (?, ?, ?)",
+                (chat_id, owner_text, socio_text),
+            )
+            return int(cursor.lastrowid)
+
+    def recent_conversation_turns(self, chat_id: int, limit: int, max_age_hours: int) -> list[dict[str, Any]]:
+        """The newest unarchived turns within max_age_hours, oldest first."""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, owner_text, socio_text, created_at FROM conversation_turns "
+                "WHERE chat_id = ? AND archived = 0 AND created_at >= datetime('now', ?) ORDER BY id DESC LIMIT ?",
+                (chat_id, f"-{int(max_age_hours)} hours", limit),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def append_to_last_conversation_turn(self, chat_id: int, text: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE conversation_turns SET socio_text = socio_text || ? WHERE id = "
+                "(SELECT MAX(id) FROM conversation_turns WHERE chat_id = ? AND archived = 0)",
+                (text, chat_id),
+            )
+            return cursor.rowcount > 0
+
+    def archive_conversation_turns(self, chat_id: int) -> int:
+        """Stop loading this chat's earlier turns (/new, /clear, /reset). The rows are kept."""
+
+        with self._connect() as conn:
+            cursor = conn.execute("UPDATE conversation_turns SET archived = 1 WHERE chat_id = ? AND archived = 0", (chat_id,))
+            return cursor.rowcount
+
 
 # Ordered schema migrations; PRAGMA user_version records the last one applied.
 # Append new ones at the end; never edit or reorder a released migration.
@@ -838,5 +949,6 @@ MIGRATIONS = [
     (2, AgentStateStore._migrate_v2_memory_and_runs),
     (3, AgentStateStore._migrate_v3_notes_and_workflows),
     (4, AgentStateStore._migrate_v4_tracked_tasks),
+    (5, AgentStateStore._migrate_v5_conversation_context),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]

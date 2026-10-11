@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 from email.utils import getaddresses
 from typing import Annotated, Any
@@ -254,13 +255,14 @@ def _scope_violation(tool_name: str, args: dict[str, Any], state: AgentState) ->
         )
 
     participants = {address.lower() for address in state.get("participants", [])}
-    attendee = (args.get("attendee_email") or "").strip().lower()
-
-    if tool_name == "propose_book_meeting" and target_thread_id and participants and attendee and attendee not in participants:
-        return (
-            f"Refused: {attendee} is not part of this conversation, "
-            "so they cannot be invited."
-        )
+    if tool_name == "propose_book_meeting" and target_thread_id and participants:
+        invited = [args.get("attendee_email") or "", *(args.get("attendee_emails") or [])]
+        outsiders = sorted({a.strip().lower() for a in invited if a and a.strip()} - participants)
+        if outsiders:
+            return (
+                f"Refused: {', '.join(outsiders)} {'is' if len(outsiders) == 1 else 'are'} not part of this conversation, "
+                "so they cannot be invited."
+            )
 
     # The held reply always goes to the runner's recipient; still refuse (and log)
     # an attempt to address someone outside the conversation.
@@ -338,6 +340,39 @@ def _reply_proposal(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_PLACEHOLDER_TITLE = re.compile(
+    r"^\s*(?:untitled|new|my|a|the)?\s*(?:untitled\s*)?(?:google\s*)?(?:doc|docs|document|sheet|spreadsheet|file|title)?\s*\d*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _placeholder_title(title: str) -> bool:
+    """'Untitled Document', 'New Sheet', 'Document 1': a model filling a blank, not a name."""
+
+    return bool(_PLACEHOLDER_TITLE.match(title or ""))
+
+
+_SUBJECT_FILLER = re.compile(
+    r"^\s*(?:(?:re|fwd?)\s*:\s*)*(?:(?:shared|new|google)\s+)*(?:doc|document|sheet|spreadsheet|file)?\s*(?:for your review|to fill|shared with you)?\s*[:\-–]?\s*",
+    re.IGNORECASE,
+)
+
+
+def _title_from_subject(subject: str, kind: str, recipient: str) -> str:
+    """'Shared Sheet: Task Tracking' -> 'Task Tracking'; nothing usable -> 'Document for sam (12 Oct 2026)'."""
+
+    from datetime import datetime
+
+    from app.calendar.tools import INDIA_TZ
+
+    title = _SUBJECT_FILLER.sub("", subject or "").strip(" :-–")
+    if title and not _placeholder_title(title):
+        return title[:100]
+    who = (recipient.split("@")[0].split("<")[-1] or "").strip()
+    noun = "Sheet" if kind == "spreadsheet" else "Document"
+    return f"{noun} for {who} ({datetime.now(INDIA_TZ):%d %b %Y})" if who else f"{noun} ({datetime.now(INDIA_TZ):%d %b %Y})"
+
+
 def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """
     Validate an owner-mode email or Docs/Sheets write and describe it for approval.
@@ -379,11 +414,15 @@ def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any
     if tool_name == "create_document":
         if not (args.get("title") or "").strip():
             raise ValueError("The document needs a title.")
+        if _placeholder_title(args["title"]):
+            raise ValueError(f"'{args['title'].strip()}' is not a real title: choose a short descriptive one from the request.")
         return {"type": "create_document", "title": args["title"].strip(), "content": args.get("content") or ""}
 
     if tool_name == "create_spreadsheet":
         if not (args.get("title") or "").strip():
             raise ValueError("The spreadsheet needs a title.")
+        if _placeholder_title(args["title"]):
+            raise ValueError(f"'{args['title'].strip()}' is not a real title: choose a short descriptive one from the request.")
         return {"type": "create_spreadsheet", "title": args["title"].strip(), "headers": list(args.get("headers") or [])}
 
     if tool_name == "append_to_document":
@@ -431,19 +470,23 @@ def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any
         kind = (args.get("kind") or "").strip().lower()
         if kind not in FILE_KINDS:
             raise ValueError("kind must be spreadsheet or document.")
-        if not (args.get("title") or "").strip():
-            raise ValueError(f"The {kind} needs a title.")
         if not (args.get("message") or "").strip():
             raise ValueError("Write the email message that goes with the link.")
+        # A blank or "Untitled" title: name it after the email's subject instead of asking
+        # (the owner sees the title on the card and can reject it).
+        recipient = validate_recipient(args.get("recipient_email", ""))
+        title = (args.get("title") or "").strip()
+        if not title or _placeholder_title(title):
+            title = _title_from_subject(args.get("subject") or "", kind, recipient)
         return {
             "type": "create_and_share",
             "kind": kind,
-            "title": args["title"].strip(),
+            "title": title,
             "headers": [str(header) for header in args.get("headers") or []] if kind == "spreadsheet" else [],
             "content": (args.get("content") or "") if kind == "document" else "",
-            "recipient": validate_recipient(args.get("recipient_email", "")),
+            "recipient": recipient,
             "role": validate_role(args.get("role", "editor")),
-            "subject": (args.get("subject") or "").strip() or args["title"].strip(),
+            "subject": (args.get("subject") or "").strip() or title,
             "body": args["message"].strip(),
         }
 

@@ -44,6 +44,7 @@ app/agent/state.py       SQLite: message outcomes, attempts, actions, approvals,
 app/agent/untrusted.py   sanitize + wrap email content in <untrusted_email_body> tags
 app/memory/              semantic.py (long-term memory), embeddings.py (local fastembed),
                          learning.py (explicit owner rules), episodic.py (24 h notes),
+                         context_assembler.py / context_anchor.py (chat context),
                          skills.py (procedural memory)
         │
 app/gmail/               read, search, reply, send, draft, trash (never permanent delete)
@@ -109,6 +110,21 @@ bot's follow-up context (last 3 exchanges) stores what each card proposed and
 how the owner decided ("The owner rejected: ..."), so "create a task for this"
 refers to it.
 
+That context lives in SQLite (schema v5), so a restart does not lose it:
+`conversation_turns` holds each finished turn as plain text (the owner's
+instruction and Socio's final reply with its card descriptions; raw tool output
+never goes into history). `memory/context_assembler.py` loads the last 3 turns
+from the past 24 h, in whole turns only: a turn is an owner message plus
+everything that answered it, so an assistant tool call is never sent without its
+tool results. While the estimate (characters / 4) is over 2,000 tokens the oldest
+whole turn is dropped; a single oversized turn has its final reply shortened.
+`conversation_anchors` (`memory/context_anchor.py`) remembers the thread,
+contact (email addresses only), and document the chat was last about, taken from
+the agent's tool calls, its proposals, and approved cards. It is added to the
+owner instruction and the planner request as an `<active_context>` block
+(reference only) and ignored after 24 h. Workers never see either: they get only
+their task. `/new`, `/reset`, `/clear` archive the turns and clear the anchor.
+
 The owner sees each approval request as its own card, so the owner-mode prompt
 (not workers) tells the model not to narrate them and to answer exactly
 `CARDS_ONLY` when approval requests are the only outcome.
@@ -169,6 +185,23 @@ instruction ─► question / status check? (is_action_request, regex, no model 
   email too, so the ≥ 2-domain rule accepts it). It was once split into a
   create-only task (no email tool) whose worker promised to share the link
   "once approved", which nothing did.
+- Replies are split by intent (`ReplyPart`: answer / done / problem / question;
+  `OwnerCommandResult.parts`). The bot (`telegram_format.reply_messages`) sends one
+  message per kind with a short header (📋 Here's what I found / ✅ Done / ⚠️ Couldn't
+  finish / ❓ I need your answer), then the approval cards, then the question last; a
+  reply of one part is one plain message with no header. The single agent's text is
+  split by `split_reply` (✅ / ⚠️ lines; a closing question after a long answer).
+- Questions: workers choose sensible defaults (titles, subjects, messages: shown on
+  the card) and only report `NEEDS_INPUT` with one question when blocked; that blocks
+  their dependents (not logged as a failure). A worker that ends with a question is
+  treated as asking. The planner may return only `question` when nothing can start.
+  A placeholder title ("Untitled Document") is refused for create_document /
+  create_spreadsheet and replaced from the email subject for create_and_share.
+- One email to several people: prompts and the `send_new_email` description say one
+  email with everyone in To; `approvals.merge_same_emails` merges new-email approvals
+  from one instruction with the same subject, text, and files into one card before
+  anything is shown (personalised texts, different files, or a card already shown stay
+  separate). A "meeting invite" is one `propose_book_meeting` with `attendee_emails`.
 - The report (`build_report`) has no header, task list, or goals: a part that
   produced an approval card says nothing (the card is the answer), a step whose
   result fed a later step says nothing; failures always show (with the
@@ -297,7 +330,7 @@ executes, then sends the follow-up reply if one was attached.
 | `create_and_share` | create a Sheet/Doc, give the recipient access, email them the link |
 | `share_file` | give someone access to a file Socio created (Google emails them) |
 | `enable_skill_script` | trust `skills/<name>.py` at the SHA-256 shown (re-checked) |
-| `book_meeting` | create the event (conflict re-checked, attendee invited), then the reply |
+| `book_meeting` | create the event (conflict re-checked, every attendee invited), then the reply |
 | `move_event` / `cancel_event` | patch / delete the event (attendees notified), then the reply |
 | `trash_email` | move the message or thread to Trash |
 
@@ -313,6 +346,14 @@ learned (the "+ Add Permanent Rule" button was removed, developer decision
 keep our own validation reasons (e.g. "overlaps 'Dentist'"); anything else is
 a predefined message, while `pending_approvals.resolution`, `failures`, and
 `logs/agent.log` keep the full error.
+
+Availability (`find_calendar_availability`): weekdays 11:00-16:00 IST only. `date=YYYY-MM-DD`
+checks exactly one day; without it, `days_ahead` days from today (today = day 1). It once missed
+a free Monday because the worker asked for "tomorrow" as `days_ahead=1` (= only today, a Sunday).
+Returns `{"slots", "days": [{"date", "day", "free": ["11:00-16:00"]}], "note"}`; an empty result
+always has a note with the reason (weekend, today's window over, fully booked) and the next
+weekday to try. Refused with a plain reason: a past date, more than 60 days ahead, an unreadable
+date, a meeting shorter than 5 or longer than 300 minutes. Today starts at the next quarter hour.
 
 Soft holds: when a `book_meeting` or `move_event` approval is recorded, its new
 time goes into `slot_holds` for 24 hours (`SLOT_HOLD_HOURS`).

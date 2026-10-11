@@ -40,6 +40,11 @@ appears when something failed or there is an answer to read. Questions
 ("have you sent the sheet?") are answered directly, in one plain reply that
 knows the conversation.
 
+Replies are split by what they are: what Socio found, what couldn't be done,
+and a question it needs answered each come as their own message (the question
+last, after the approval cards). One email to several people is one email
+with everyone in To, and a "meeting invite" is one calendar invite for all.
+
 "Create a sheet (or doc) and send it to X" is one card: **Approve & Send**
 creates it, gives X edit access, and emails X the live link. Socio can only
 share files it created itself (your Socio folder).
@@ -165,7 +170,7 @@ everything runs offline on your CPU.
 3. Put it in `.env` as `TELEGRAM_OWNER_CHAT_ID` and restart the bot.
 
 Bot commands: `/run` (check inbox now), `/dryrun`, `/status`, `/approvals`,
-`/new`, `/remember TEXT`, `/memories`, `/forget ID`, `/save_skill NAME`,
+`/new` (or `/reset`, `/clear`: forget the conversation so far), `/remember TEXT`, `/memories`, `/forget ID`, `/save_skill NAME`,
 `/skills`, `/forget_skill NAME`, `/help`. `/start`, `/help`, or asking "what
 can you do?" shows an overview of what Socio does. The inbox is also checked
 every `AGENT_POLL_MINUTES`.

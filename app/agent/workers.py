@@ -8,7 +8,7 @@ approval gate still applies.
 
 Fan-in contract: a worker never returns its conversation, only
 
-    {"status": "SUCCESS" | "FAILED", "modified_entities": [...], "diff_summary": "..."}
+    {"status": "SUCCESS" | "FAILED" | "NEEDS_INPUT", "modified_entities": [...], "diff_summary": "..."}
 
 modified_entities come from what the tools actually recorded (never from the
 model's own claims), so a worker that crashes halfway still reports what changed.
@@ -33,7 +33,10 @@ logger = logging.getLogger(__name__)
 WORKER_RECURSION_LIMIT = 20
 MAX_DIFF_CHARS = 600
 MAX_UPSTREAM_CHARS = 1500
-STATUSES = ("SUCCESS", "FAILED")
+# NEEDS_INPUT: the worker could not go on without the person's answer; diff_summary is
+# the question. It blocks dependent tasks like a failure but is shown as a question.
+NEEDS_INPUT = "NEEDS_INPUT"
+STATUSES = ("SUCCESS", "FAILED", NEEDS_INPUT)
 # Statuses models write instead of SUCCESS when their change is waiting for approval:
 # proposing it was the job, so the task succeeded.
 WAITING_STATUSES = {"WAITING", "PENDING", "AWAITING_APPROVAL", "WAITING_FOR_APPROVAL", "PENDING_APPROVAL", "PROPOSED", "DONE", "COMPLETED"}
@@ -136,6 +139,7 @@ def _final_report(text: str) -> tuple[str | None, str]:
             continue
         status = str(data.get("status", "")).strip().upper().replace(" ", "_")
         status = "SUCCESS" if status in WAITING_STATUSES else status
+        status = NEEDS_INPUT if status in {"QUESTION", "NEEDS_CLARIFICATION", "NEED_INPUT", "NEEDS_ANSWER", "BLOCKED"} else status
         rest = (text[: match.start()] + text[match.end():]).strip()
         summary = str(data.get("diff_summary") or rest)
         return (status if status in STATUSES else None), summary
@@ -196,8 +200,9 @@ def run_worker(
         if not summary:
             summary = "It finished without saying what happened."
 
+    asking = error is None and not failed and reported == NEEDS_INPUT
     return {
-        "status": "FAILED" if failed else "SUCCESS",
+        "status": NEEDS_INPUT if asking else ("FAILED" if failed else "SUCCESS"),
         "modified_entities": entities,
         "diff_summary": _clip(summary, MAX_DIFF_CHARS),
     }

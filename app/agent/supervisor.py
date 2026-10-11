@@ -41,6 +41,7 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from app.agent.approvals import merge_same_emails
 from app.agent.graph import AGENT_TOOLS, create_agent_graph
 from app.calendar.tools import INDIA_TZ
 from app.agent.llm import get_llm, invoke_llm
@@ -48,7 +49,7 @@ from app.agent.prompts import CARDS_ONLY
 from app.agent.state import AgentStateStore
 from app.agent.plain_text import plain_reply, without_internal_ids  # noqa: F401  (re-exported for callers and tests)
 from app.agent.taskgraph import DOMAIN_TOOLS, MAX_TASKS, PlanError, covered_domains, normalize_plan, topological_order
-from app.agent.workers import run_worker
+from app.agent.workers import NEEDS_INPUT, run_worker
 from app.errors import plain_message, report_failure
 from app.memory.episodic import notes_block
 from app.memory.semantic import Memory, format_memories, recall
@@ -107,7 +108,7 @@ _ACTION_VERB = (
 ACTION_REQUEST = re.compile(rf"{_CLAUSE_START}\s*{_POLITE}{_ACTION_VERB}\b", re.IGNORECASE)
 # Reads like a question or a request for information ("Have you sent ...", "What's on ...",
 # "Check whether ...", "Tell me ...", or a trailing "?").
-QUESTION = re.compile(
+QUESTION_LIKE = re.compile(
     r"^\s*(?:(?:hey|hi|hello|ok|okay|so|socio)\b[\s,!.]*)*"
     r"(?:what|what's|whats|when|where|who|whom|whose|which|why|how|is|are|am|was|were|"
     r"(?:do|does|did|have|has|had)\s+(?:i|you|we|they|he|she|it|my|your|socio|anyone|there)|"
@@ -125,7 +126,29 @@ def is_action_request(text: str) -> bool:
     text = (text or "").strip()
     if ACTION_REQUEST.search(text):
         return True
-    return not (QUESTION.match(text) or text.endswith("?"))
+    return not (QUESTION_LIKE.match(text) or text.endswith("?"))
+
+
+# What a reply message is about. The bot shows each kind as its own message so an answer,
+# a problem, and a question never share one text box (developer request 2026-10-11).
+ANSWER, DONE, PROBLEM, QUESTION = "answer", "done", "problem", "question"
+KIND_PREFIX = {ANSWER: "", DONE: "✅ ", PROBLEM: "⚠️ ", QUESTION: "❓ "}
+
+
+@dataclass
+class ReplyPart:
+    kind: str   # ANSWER, DONE, PROBLEM, or QUESTION
+    text: str
+
+
+def reply_text(parts: list[ReplyPart]) -> str:
+    """All parts as one plain text (CLI, follow-up context), each line marked by its kind."""
+
+    lines = []
+    for part in parts:
+        prefix = KIND_PREFIX.get(part.kind, "")
+        lines.append(part.text if not prefix or part.text.startswith(prefix.strip()) else prefix + part.text)
+    return "\n".join(lines)
 
 
 @dataclass
@@ -134,6 +157,9 @@ class OwnerCommandResult:
     actions: list[dict[str, Any]] = field(default_factory=list)
     approval_ids: list[int] = field(default_factory=list)
     run_id: int | None = None
+    parts: list[ReplyPart] = field(default_factory=list)
+    # The single agent's tool calls ({"name", "args"}), for the conversation anchor; never shown.
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ----- planner output (one structured answer: the whole plan) ----------------------------
@@ -169,6 +195,11 @@ class PlannerOutput(BaseModel):
     tasks: list[SubTask] = Field(
         default_factory=list,
         description="Every atomic task, one per domain or step. Empty only when use_skill is set.",
+    )
+    question: str = Field(
+        default="",
+        description="Only when NOTHING in the instruction can start without an answer (e.g. who to send it to): one "
+        "short question for the person, and tasks empty. Never for details that have a sensible default.",
     )
     use_skill: str = Field(default="", description="The name of a saved skill that fits the whole instruction, or empty.")
     skill_params_json: str = Field(
@@ -218,8 +249,17 @@ Rules:
   independent tasks run at the same time.
 - Each worker sees ONLY its goal_contract and context_slice. Put every needed fact there, and
   resolve words like "him" or "that email" using the conversation so far.
-- Write every date as the exact date with its weekday (e.g. "Friday 16 Oct 2026", computed from
-  today's date), never "Friday", "tomorrow" or "next week": workers must not work dates out.
+- Write every date as the exact date with its weekday and ISO form (e.g. "Friday 16 Oct 2026
+  (2026-10-16)", computed from today's date), never "Friday", "tomorrow" or "next week": workers
+  must not work dates out. A calendar task checking one day says to call
+  find_calendar_availability with date=<that ISO date>.
+- One message to several people is ONE email task with all of them as recipients ("send one email
+  to a@x.com and b@y.com"), never one task or one email per person. A "meeting invite" or
+  "calendar invite" is a calendar task: propose_book_meeting with every person as an attendee.
+- Missing details with a sensible default (a document title, a subject, a short message) are
+  not questions: tell the worker to choose a clear one; the person sees it on the approval card
+  and can change or reject it. Only if NOTHING can start without an answer (e.g. who to send it
+  to), set question and leave tasks empty.
 - label: a few everyday words naming the part for the person ("the email to Priya").
 - At most {max_tasks} tasks.
 - Emails, Docs/Sheets writes, calendar changes, and new or completed Google Tasks become approval
@@ -232,7 +272,8 @@ Rules:
 Examples:
 1. "Check my calendar for Thursday afternoon and reply to John's email with the times I'm free."
    t1: target_domain=calendar, tools_allowed=[find_calendar_availability],
-       goal: find my free 30-minute slots on Thursday 15 Oct 2026, 14:00-18:00 IST.
+       goal: find my free 30-minute slots on Thursday 15 Oct 2026 (2026-10-15): call
+       find_calendar_availability with date=2026-10-15.
    t2: target_domain=email, tools_allowed=[search_gmail, get_thread, send_gmail_reply], depends_on=[t1],
        goal: reply to John's latest email offering the free slots found by t1.
 2. "Email my resume to hr@acme.com, add Acme to my Applications sheet, and remind me Friday to follow up."
@@ -288,6 +329,7 @@ def _history_text(history: list | None) -> str:
 class Plan:
     tasks: list[dict[str, Any]]
     skill: str = ""
+    question: str = ""   # the planner needs an answer before anything can start
 
 
 def plan_request(
@@ -295,11 +337,13 @@ def plan_request(
     history: list | None = None,
     memories: list[Memory] | None = None,
     skills: list[tuple[Skill, float]] | None = None,
+    context: str = "",
 ) -> Plan:
     """
     The planner call. A plan that fails validation (a monolithic task for a
     multi-domain request, an unknown tool or domain, a cycle) is sent back once
     with the reason. Raises PlanError (or SkillError) if it still cannot be run.
+    context is the chat's <active_context> block (app.memory.context_anchor), if any.
     """
 
     memory_block = "\n\n".join(block for block in (format_memories(memories or []), notes_block()) if block)
@@ -311,7 +355,8 @@ def plan_request(
         skills=_skill_catalog(skills or []),
     )
     planner = get_llm().with_structured_output(PlannerOutput)
-    messages = [SystemMessage(content=system), HumanMessage(content=f"{_history_text(history)}Instruction from the owner:\n{text}")]
+    request = f"{_history_text(history)}Instruction from the owner:\n{text}" + (f"\n\n{context}" if context else "")
+    messages = [SystemMessage(content=system), HumanMessage(content=request)]
 
     for attempt in range(PLAN_ATTEMPTS):
         try:
@@ -353,7 +398,7 @@ def _plan_from_output(output: Any, text: str, skills: list[tuple[Skill, float]] 
         return Plan(expand_skill(skill, params, WORKER_TOOLS), skill=skill.name)
 
     if not output.tasks:
-        return Plan([])
+        return Plan([], question=" ".join((output.question or "").split()))
     PlannedTasks(request_domains=request_domains(text), tasks=output.tasks)   # raises ValidationError if monolithic
     return Plan(normalize_plan([task.model_dump() for task in output.tasks], WORKER_TOOLS))
 
@@ -389,14 +434,17 @@ def run_plan(
 
         while waiting or running:
             for task_id, task in list(waiting.items()):
-                failed = [d for d in task["depends_on"] if results.get(d, {}).get("status") == "FAILED"]
+                # A step waiting for the person's answer blocks what depends on it, like a failure.
+                failed = [d for d in task["depends_on"] if results.get(d, {}).get("status") in {"FAILED", NEEDS_INPUT}]
                 if failed:
                     del waiting[task_id]
+                    asked = all(results[d]["status"] == NEEDS_INPUT for d in failed)
                     finish(task_id, {
                         "status": "FAILED",
                         "modified_entities": [],
-                        "diff_summary": f"Not started: it needs {', '.join(failed)}, which failed. Nothing was changed.",
-                        "not_started": True,
+                        "diff_summary": f"Not started: it needs {', '.join(failed)}, which "
+                                        f"{'is waiting for an answer' if asked else 'failed'}. Nothing was changed.",
+                        "not_started": "question" if asked else "failure",
                     })
                 elif all(d in results for d in task["depends_on"]) and len(running) < max_workers:
                     del waiting[task_id]
@@ -419,7 +467,7 @@ def run_plan(
                 except Exception as exc:  # a worker function that raised anyway
                     report_failure(exc, "worker.crash", run_id=run_id, task_id=task_id)
                     payload = {"status": "FAILED", "modified_entities": [], "diff_summary": f"It stopped because of an error. {plain_message(exc)}"}
-                if not dry_run and payload["status"] == "FAILED":
+                if not dry_run and payload["status"] == "FAILED":   # a question is not a failure
                     store.add_failure(f"worker:{task_id}", payload["diff_summary"])
                 finish(task_id, payload)
 
@@ -459,19 +507,25 @@ def resolve_overlaps(results: dict[str, dict[str, Any]], store: AgentStateStore,
     return notes
 
 
-def build_report(tasks: list[dict[str, Any]], results: dict[str, dict[str, Any]], notes: list[str], skill: str = "", dry_run: bool = False) -> str:
+def build_parts(tasks: list[dict[str, Any]], results: dict[str, dict[str, Any]], notes: list[str], dry_run: bool = False) -> list[ReplyPart]:
     """
-    The text the owner gets next to the approval cards: only what the cards do not say.
+    What the owner gets next to the approval cards, one part per item, each marked by
+    intent (answer / problem / question) so the bot can show them as separate messages.
 
     No header, no list of parts, no goals: the owner cares whether it got done. A part
     that produced an approval card says nothing (the card is the answer); a step whose
-    result fed a later step says nothing either. What is left: failures (always), and
-    what a final step found or did directly. Empty when the cards say it all.
+    result fed a later step says nothing either. What is left: failures (always),
+    questions a step needs answered, and what a final step found or did directly.
+    Empty when the cards say it all.
     """
 
     needed_later = {dependency for task in tasks for dependency in task["depends_on"]}
-    lines: list[str] = []
-    skipped_after_failure = False
+    parts: list[ReplyPart] = []
+    skipped = {"failure": False, "question": False}
+
+    def named(task: dict[str, Any], text: str) -> str:
+        label = task.get("label", "")
+        return f"{label[:1].upper() + label[1:]}: {text}" if label else text
 
     for task in tasks:
         payload = results.get(task["task_id"], {"status": "FAILED", "diff_summary": "It didn't run.", "modified_entities": []})
@@ -479,19 +533,29 @@ def build_report(tasks: list[dict[str, Any]], results: dict[str, dict[str, Any]]
         proposed = any(entity.get("kind") == "approval" for entity in payload.get("modified_entities", []))
 
         if payload.get("not_started"):
-            skipped_after_failure = True
+            skipped["question" if payload["not_started"] == "question" else "failure"] = True
+        elif payload["status"] == NEEDS_INPUT or (payload["status"] == "SUCCESS" and not proposed and "?" in summary):
+            # A worker that ended by asking something is asking, whatever status it wrote.
+            parts.append(ReplyPart(QUESTION, named(task, summary) if summary else named(task, "What should I do here?")))
         elif payload["status"] == "FAILED":
-            label = task.get("label", "")
-            lines.append(f"⚠️ {label[:1].upper() + label[1:]}: {summary}" if label else f"⚠️ {summary}")
+            parts.append(ReplyPart(PROBLEM, named(task, summary)))
         elif not proposed and task["task_id"] not in needed_later and summary:
-            lines.append(summary)
+            parts.append(ReplyPart(ANSWER, summary))
 
-    if skipped_after_failure:
-        lines.append("I didn't do the steps that depended on it, so nothing else was changed.")
-    lines += [f"⚠️ {note}" for note in notes]
+    if skipped["failure"]:
+        parts.append(ReplyPart(PROBLEM, "I didn't do the steps that depended on it, so nothing else was changed."))
+    if skipped["question"]:
+        parts.append(ReplyPart(QUESTION, "I haven't done the steps that need this answer yet; reply and I'll continue."))
+    parts += [ReplyPart(PROBLEM, note) for note in notes]
     if dry_run:
-        lines.insert(0, "🧪 Dry run: nothing was sent or changed.")
-    return "\n".join(lines)
+        parts.insert(0, ReplyPart(ANSWER, "🧪 Dry run: nothing was sent or changed."))
+    return parts
+
+
+def build_report(tasks: list[dict[str, Any]], results: dict[str, dict[str, Any]], notes: list[str], skill: str = "", dry_run: bool = False) -> str:
+    """build_parts() as one text (CLI, the run record, the follow-up context)."""
+
+    return reply_text(build_parts(tasks, results, notes, dry_run=dry_run))
 
 
 # ----- procedural memory: skills are saved only when the owner asks -------------------------
@@ -613,13 +677,20 @@ def save_last_plan(name: str, store: AgentStateStore | None = None) -> SavedSkil
 # ----- entry point -----------------------------------------------------------------------------
 
 
-def run_single_agent(text: str, *, history: list | None = None, dry_run: bool = False, memories: list[Memory] | None = None) -> OwnerCommandResult:
+def run_single_agent(
+    text: str,
+    *,
+    history: list | None = None,
+    dry_run: bool = False,
+    memories: list[Memory] | None = None,
+    context: str = "",
+) -> OwnerCommandResult:
     """The plain owner-mode agent (one context, full owner toolset)."""
 
     from app.tasks.tracker import open_tasks_block
 
     instruction = f"Instruction from the owner:\n{text}"
-    for block in (format_memories(memories or []), notes_block(), open_tasks_block()):
+    for block in (context, format_memories(memories or []), notes_block(), open_tasks_block()):
         if block:
             instruction += f"\n\n{block}"
 
@@ -636,12 +707,56 @@ def run_single_agent(text: str, *, history: list | None = None, dry_run: bool = 
     )
     messages = result.get("messages", [])
     approval_ids = [approval["id"] for approval in result.get("pending_approvals", []) if "id" in approval]
+    if not dry_run:
+        approval_ids = merge_same_emails(approval_ids, AgentStateStore())
     actions = result.get("actions", [])
-    return OwnerCommandResult(
-        reply=owner_reply(messages[-1].text if messages else "", approval_ids, dry_run=dry_run, actions=actions),
-        actions=actions,
-        approval_ids=approval_ids,
-    )
+    reply = owner_reply(messages[-1].text if messages else "", approval_ids, dry_run=dry_run, actions=actions)
+    tool_calls = [
+        {"name": call.get("name", ""), "args": call.get("args") or {}}
+        for message in messages[len(history or []):]
+        for call in (getattr(message, "tool_calls", None) or [])
+    ]
+    return OwnerCommandResult(reply=reply, actions=actions, approval_ids=approval_ids, parts=split_reply(reply), tool_calls=tool_calls)
+
+
+# A paragraph that ends by asking the person something ("Which one should I reply to?").
+_TRAILING_QUESTION = re.compile(r"(?s)^(?P<body>.*[.!:)\]])\s+(?P<question>[^.!?\n]*\?)\s*$")
+
+
+def split_reply(reply: str) -> list[ReplyPart]:
+    """
+    The single agent's text as parts by intent: ✅ / ⚠️ lines are done / problem, a
+    closing question becomes its own question part (so it is not buried under the
+    answer), the rest is the answer. A reply that is only one kind stays one part.
+    """
+
+    reply = (reply or "").strip()
+    if not reply:
+        return []
+    parts: list[ReplyPart] = []
+    answer: list[str] = []
+    for line in reply.splitlines():
+        if line.startswith("✅"):
+            parts.append(ReplyPart(DONE, line.removeprefix("✅").strip()))
+        elif line.startswith("⚠️"):
+            parts.append(ReplyPart(PROBLEM, line.removeprefix("⚠️").strip()))
+        else:
+            answer.append(line)
+    text = "\n".join(answer).strip()
+    paragraphs = re.split(r"\n\s*\n", text) if text else []
+    question = ""
+    if paragraphs:
+        last = paragraphs[-1].strip()
+        if len(paragraphs) > 1 and last.endswith("?"):
+            question, paragraphs = last, paragraphs[:-1]
+        else:
+            match = _TRAILING_QUESTION.match(last)
+            # Only a real answer followed by a question is split; "Not sure yet. Which one?" stays one message.
+            if match and len(match.group("body")) >= 120:
+                question, paragraphs[-1] = match.group("question").strip(), match.group("body").strip()
+    text = "\n\n".join(p.strip() for p in paragraphs).strip()
+    ordered = ([ReplyPart(ANSWER, text)] if text else []) + parts + ([ReplyPart(QUESTION, question)] if question else [])
+    return ordered
 
 
 _CARDS_ONLY = re.compile(rf"[\s`*\"'(\[]*{CARDS_ONLY}[\s`*\"'.)\]]*")
@@ -716,24 +831,41 @@ def should_plan(text: str, skills: list[tuple[Skill, float]]) -> bool:
     return bool(skills) or bool(MULTI_PART.search(text or "")) or len(request_domains(text)) >= 2
 
 
-def handle_owner_request(text: str, *, dry_run: bool = False, history: list | None = None, store: AgentStateStore | None = None) -> OwnerCommandResult:
-    """Plan, fan out, fan in, report. Questions and one-task requests run the single agent."""
+def handle_owner_request(
+    text: str,
+    *,
+    dry_run: bool = False,
+    history: list | None = None,
+    store: AgentStateStore | None = None,
+    context: str = "",
+) -> OwnerCommandResult:
+    """
+    Plan, fan out, fan in, report. Questions and one-task requests run the single agent.
+
+    context is the chat's <active_context> block (app.memory.context_anchor). It reaches the
+    single agent and the planner; workers never see it (or the history), only their task.
+    """
 
     store = store or AgentStateStore()
     memories = recall(text, store=store)
     skills = find_skills(text) if is_action_request(text) else []
 
     if not should_plan(text, skills):
-        return run_single_agent(text, history=history, dry_run=dry_run, memories=memories)
+        return run_single_agent(text, history=history, dry_run=dry_run, memories=memories, context=context)
 
     try:
-        plan = plan_request(text, history, memories, skills)
+        plan = plan_request(text, history, memories, skills, context=context)
     except (PlanError, SkillError) as exc:
         logger.warning("Plan rejected (%s); running the single agent instead.", exc)
         plan = Plan([])
 
+    if plan.question and not plan.tasks and not plan.skill:
+        # Nothing can start without an answer: ask first, do nothing.
+        question = plain_reply(plan.question)
+        return OwnerCommandResult(reply=question, parts=[ReplyPart(QUESTION, question)])
+
     if len(plan.tasks) <= 1 and not plan.skill:
-        return run_single_agent(text, history=history, dry_run=dry_run, memories=memories)
+        return run_single_agent(text, history=history, dry_run=dry_run, memories=memories, context=context)
 
     store.close_stale_supervisor_runs()
     run_id = store.start_supervisor_run(text)
@@ -741,27 +873,25 @@ def handle_owner_request(text: str, *, dry_run: bool = False, history: list | No
 
     results = run_plan(plan.tasks, run_id=run_id, store=store, dry_run=dry_run)
     notes = resolve_overlaps(results, store, dry_run=dry_run)
-    report = build_report(plan.tasks, results, notes, skill=plan.skill, dry_run=dry_run)
+    parts = build_parts(plan.tasks, results, notes, dry_run=dry_run)
 
     statuses = {payload["status"] for payload in results.values()}
     run_status = "done" if statuses == {"SUCCESS"} else ("failed" if statuses == {"FAILED"} else "partial")
 
     if run_status == "done" and not plan.skill and not dry_run:
-        report = (report + note_workflow_success(plan.tasks, text, run_id, store)).strip()
-    if not report and not any(
-        e.get("kind") == "approval" and not e.get("duplicate_of") for p in results.values() for e in p["modified_entities"]
-    ):
-        report = "Done."  # never silent: no card and nothing to report
-
-    store.finish_supervisor_run(run_id, "dry_run" if dry_run else run_status, report)
+        hint = note_workflow_success(plan.tasks, text, run_id, store).strip()
+        if hint:
+            parts.append(ReplyPart(ANSWER, hint))
 
     entities = [entity for payload in results.values() for entity in payload["modified_entities"]]
-    return OwnerCommandResult(
-        reply=report,
-        actions=entities,
-        approval_ids=[
-            e["approval_id"] for e in entities
-            if e.get("kind") == "approval" and e.get("approval_id") and not e.get("duplicate_of")
-        ],
-        run_id=run_id,
-    )
+    approval_ids = [
+        e["approval_id"] for e in entities
+        if e.get("kind") == "approval" and e.get("approval_id") and not e.get("duplicate_of")
+    ]
+    approval_ids = merge_same_emails(list(dict.fromkeys(approval_ids)), store) if not dry_run else approval_ids
+    if not parts and not approval_ids:
+        parts = [ReplyPart(ANSWER, "Done.")]  # never silent: no card and nothing to report
+
+    report = reply_text(parts)
+    store.finish_supervisor_run(run_id, "dry_run" if dry_run else run_status, report)
+    return OwnerCommandResult(reply=report, actions=entities, approval_ids=approval_ids, run_id=run_id, parts=parts)

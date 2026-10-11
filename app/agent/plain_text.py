@@ -40,6 +40,8 @@ _PERSON_OBJECT = re.compile(r"\b(for|to|with|by|from) the (?:owner|user)\b(?!'s)
 _PERSON_POSSESSIVE = re.compile(r"\b(t)he (?:owner|user)'s\b", re.IGNORECASE)
 
 _EMPTY_BRACKETS = re.compile(r"\s*\(\s*\)|\s*\[\s*\]")
+# "You have one open task: - **Pay rent**": a list dash glued into a sentence.
+_INLINE_DASH = re.compile(r"(?<=[:,;])[ \t]+[-*•][ \t]+(?=\S)")
 _SPACE_BEFORE_PUNCT = re.compile(r"[ \t]+([.,;:!?])")
 _MULTI_SPACE = re.compile(r"[ \t]{2,}")
 
@@ -92,6 +94,7 @@ def plain_reply(text: str) -> str:
     lines = []
     for line in text.splitlines():
         line = _EMPTY_BRACKETS.sub("", line)
+        line = _INLINE_DASH.sub(" ", line)
         line = _SPACE_BEFORE_PUNCT.sub(r"\1", line)
         line = _MULTI_SPACE.sub(" ", line).rstrip()
         lines.append(line)

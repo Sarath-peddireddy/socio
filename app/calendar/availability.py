@@ -36,7 +36,9 @@ def find_free_slots(
     extra_busy: list[tuple[datetime, datetime]] | None = None,
 ) -> list[dict]:
     """
-    Find available time slots between start_time and end_time.
+    Find available time slots between start_time and end_time: the earliest
+    slot of each free gap, with "window_end" = where that gap ends (so callers
+    can say "free 11:00-16:00").
 
     extra_busy adds (start, end) periods that are not in the calendar but
     must not be offered (local soft holds, see app.calendar.holds).
@@ -91,6 +93,7 @@ def find_free_slots(
                     "start": current_time,
                     "end": current_time
                     + timedelta(minutes=duration_minutes),
+                    "window_end": min(busy_start, end_time),
                 }
             )
 
@@ -106,6 +109,7 @@ def find_free_slots(
                 "start": current_time,
                 "end": current_time
                 + timedelta(minutes=duration_minutes),
+                "window_end": end_time,
             }
         )
 

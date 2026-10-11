@@ -19,7 +19,11 @@ Telegram front end for Socio.
   /remember.
 - Owner-facing text never shows internal numbers (approval, message, task ids).
 - The follow-up context (last few exchanges) includes what each card proposed
-  and how the owner decided, so "create a task for this" refers to it.
+  and how the owner decided, so "create a task for this" refers to it. It is
+  stored in SQLite (app.memory.context_assembler: whole turns, 2,000-token cap,
+  24 h), with the thread / contact / document the chat is about
+  (app.memory.context_anchor), so both survive a restart. /new, /clear, /reset
+  start over.
 - /save_skill NAME saves the last successful multi-step instruction as a skill.
 - The inbox is processed every AGENT_POLL_MINUTES (default 10, 0 = off).
 - Every handler runs behind the error gateway (app.errors): details go to
@@ -38,8 +42,6 @@ import time
 
 import requests
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage
-
 from app.agent.approvals import approve, describe, reject, to_draft
 from app.agent.llm import LLMUnavailableError
 from app.agent.runner import BUSY_STATUS, DEFAULT_QUERY, handle_owner_command, process_inbox
@@ -50,6 +52,15 @@ from app.google_api import GoogleApiUnavailableError
 from app.memory import skills as skill_store
 from app.memory.embeddings import get_embedder
 from app.memory.episodic import active_notes
+from app.memory.context_anchor import (
+    clear_context_anchor,
+    entities_from_approval,
+    entities_from_run,
+    format_anchor,
+    get_context_anchor,
+    update_context_anchor,
+)
+from app.memory.context_assembler import archive_history, load_history, note_on_last_turn, save_turn
 from app.memory.learning import learn_from_owner_note
 from app.memory.semantic import SemanticMemory, memory_enabled
 from app.tasks.tracker import check_tasks
@@ -62,6 +73,7 @@ from app.telegram_format import (
     esc,
     is_capability_question,
     md_to_html,
+    reply_messages,
     strip_html,
 )
 
@@ -69,13 +81,13 @@ from app.telegram_format import (
 load_dotenv()
 logger = logging.getLogger("telegram_bot")
 
-HISTORY_TURNS = 3  # owner <-> agent exchanges kept for follow-up questions
 HELP_TEXT = WELCOME_HTML
 
 REJECTED_TEXT = "❌ Proposal rejected. No changes were made."
 KEPT_OPEN_TEXT = "👍 Okay, I'll leave it open."
 KEPT_ALL_TEXT = "👍 Okay, I'll leave them as they are."
 DRAFTED_TEXT = "✏️ Saved to Gmail Drafts. Nothing was sent."
+RESET_TEXT = "🧹 <b>Context Reset</b>\nActive conversational memory cleared. Ready for a new task."
 OLD_RULE_BUTTON_TEXT = "That button is no longer used. To add a rule, just tell me, e.g. \"remember: never book calls before noon\"."
 DECISION_WORDS = {"approve": "approved", "reject": "rejected", "draft": "moved to Gmail Drafts (not sent)"}
 
@@ -118,12 +130,24 @@ class Bot:
         self.owner_chat_id = owner_chat_id
         self.poll_seconds = max(0.0, poll_minutes) * 60
         self.store = store or AgentStateStore()
-        self.history: list = []
         self.offset: int | None = None
         self.next_inbox_run = time.monotonic()
         self.next_task_check = time.monotonic()
         # Decisions taken on cards since the last instruction, for the follow-up context.
         self.decisions: list[str] = []
+
+    @property
+    def history(self) -> list:
+        """The follow-up context for the next instruction (stored turns, trimmed to the budget)."""
+
+        return load_history(self.owner_chat_id, self.store)
+
+    def reset_context(self) -> None:
+        """Forget the conversation: earlier turns are archived and the anchor is cleared."""
+
+        archive_history(self.owner_chat_id, self.store)
+        clear_context_anchor(self.owner_chat_id, self.store)
+        self.decisions = []
 
     # ----- sending -------------------------------------------------------------
 
@@ -277,6 +301,8 @@ class Bot:
         })
         if outcome["ok"] and approval:
             self.decisions.append(f"The owner {DECISION_WORDS[action]}: {describe(approval)}")
+            if action != "reject":
+                update_context_anchor(self.owner_chat_id, entities_from_approval(approval), self.store)
 
     def _handle_message(self, message: dict) -> None:
         chat_id = message.get("chat", {}).get("id")
@@ -321,8 +347,11 @@ class Bot:
             if not self.notify_approvals(resend_open=True):
                 self.send("No open approval requests.")
         elif command == "/new":
-            self.history, self.decisions = [], []
+            self.reset_context()
             self.send("Okay, starting fresh.")
+        elif command in {"/clear", "/reset"}:
+            self.reset_context()
+            self.send(RESET_TEXT)
         elif command == "/remember":
             if argument:
                 self._learn(argument, None)
@@ -349,13 +378,21 @@ class Bot:
     def _run_instruction(self, text: str) -> None:
         self.api.call("sendChatAction", chat_id=self.owner_chat_id, action="typing")
         self._note_decisions()
-        result = handle_owner_command(text, history=self.history)
+        context = format_anchor(get_context_anchor(self.owner_chat_id, self.store))
+        result = handle_owner_command(text, history=self.history, context=context)
 
-        # An empty reply means the approval cards say it all: no "I have sent an approval request" preamble.
-        if result.reply.strip():
-            self.send(md_to_html(result.reply))
+        # One message per intent (answer / done / problem), then the approval cards, then any
+        # question. Nothing at all when the cards say it all (no "I have sent an approval request").
+        if result.parts:
+            before, after = reply_messages(result.parts)
+        else:
+            before, after = ([md_to_html(result.reply)] if result.reply.strip() else []), []
+        for message in before:
+            self.send(message)
         if result.approval_ids:
             self.notify_approvals()
+        for message in after:
+            self.send(message)
 
         # The context for follow-ups says what each card proposed, not just that cards were sent.
         remembered = result.reply
@@ -364,15 +401,20 @@ class Bot:
             remembered += "\n(Shown to the owner as approval cards, waiting for their decision:\n" + "\n".join(
                 f"- {describe(card)}" for card in cards if card
             ) + ")"
-        self.history += [HumanMessage(content=f"Instruction from the owner:\n{text}"), AIMessage(content=remembered.strip() or "Done.")]
-        self.history = self.history[-2 * HISTORY_TURNS:]
+        save_turn(self.owner_chat_id, text, remembered, self.store)
+
+        # What the conversation is now about: what the agent read or proposed, and the cards.
+        entities = entities_from_run(getattr(result, "tool_calls", None) or [], result.actions or [])
+        for card in cards:
+            if card:
+                entities.update(entities_from_approval(card))
+        update_context_anchor(self.owner_chat_id, entities, self.store)
 
     def _note_decisions(self) -> None:
         """Add the owner's taps since the last instruction to the last reply in the context."""
 
-        if self.decisions and self.history and isinstance(self.history[-1], AIMessage):
-            note = "\n(Afterwards: " + " / ".join(self.decisions) + ")"
-            self.history[-1] = AIMessage(content=self.history[-1].content + note)
+        if self.decisions:
+            note_on_last_turn(self.owner_chat_id, "\n(Afterwards: " + " / ".join(self.decisions) + ")", self.store)
         self.decisions = []
 
     def _learn(self, text: str, approval: dict | None) -> None:

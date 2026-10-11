@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 
 from langchain_core.tools import tool
@@ -14,89 +14,113 @@ from app.google_api import execute_with_retry
 INDIA_TZ = timezone(timedelta(hours=5, minutes=30))
 
 
+# Socio only offers weekday slots inside this window (India time).
+WORK_START_HOUR, WORK_END_HOUR = 11, 16
+MAX_DAYS_AHEAD = 60
+
+
+def _day_label(day: date) -> str:
+    return f"{day:%A} {day.day} {day:%b %Y}"
+
+
+def _next_weekday(day: date) -> date:
+    day += timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return day
+
+
+def _parse_day(value: str, today: date) -> date:
+    """'2026-10-12' (or an ISO datetime) -> that date; ValueError with a plain reason otherwise."""
+
+    try:
+        day = date.fromisoformat(str(value).strip()[:10])
+    except ValueError as exc:
+        raise ValueError(f"'{value}' is not a date. Use YYYY-MM-DD, e.g. {_next_weekday(today).isoformat()}.") from exc
+    if day < today:
+        raise ValueError(f"{_day_label(day)} has already passed.")
+    if day > today + timedelta(days=MAX_DAYS_AHEAD):
+        raise ValueError(f"I can only check up to {MAX_DAYS_AHEAD} days ahead.")
+    return day
+
+
+def _check_day(day: date, now: datetime, duration_minutes: int, held: list) -> dict:
+    """Free slots on one day, or a note saying why there are none."""
+
+    entry: dict = {"date": day.isoformat(), "day": _day_label(day), "slots": [], "free": []}
+    if day.weekday() >= 5:
+        entry["note"] = f"{_day_label(day)} is a weekend day; I only offer weekdays."
+        return entry
+
+    window_start = datetime.combine(day, time(WORK_START_HOUR), tzinfo=INDIA_TZ)
+    window_end = datetime.combine(day, time(WORK_END_HOUR), tzinfo=INDIA_TZ)
+    # Today: never offer a time that has started; begin at the next quarter hour.
+    earliest = (now + timedelta(minutes=14)).replace(second=0, microsecond=0)
+    earliest -= timedelta(minutes=earliest.minute % 15)
+    search_start = max(window_start, earliest)
+    if search_start + timedelta(minutes=duration_minutes) > window_end:
+        entry["note"] = f"Today's {WORK_START_HOUR}:00-{WORK_END_HOUR}:00 window is over." if day == now.date() else "No time left."
+        return entry
+
+    for slot in find_free_slots(start_time=search_start, end_time=window_end, duration_minutes=duration_minutes, extra_busy=held):
+        start, end = slot["start"], slot["end"]
+        if start >= window_start and end <= window_end:
+            gap_end = min(slot.get("window_end") or end, window_end)
+            entry["slots"].append({"start": start.isoformat(), "end": end.isoformat()})
+            entry["free"].append(f"{start:%H:%M}-{gap_end:%H:%M}")
+    if not entry["slots"]:
+        entry["note"] = (f"Fully booked between {WORK_START_HOUR}:00 and {WORK_END_HOUR}:00 "
+                         f"(no free {duration_minutes}-minute gap).")
+    return entry
+
+
 @tool
 def find_calendar_availability(
     duration_minutes: int = 30,
+    date: str = "",
     days_ahead: int = 7,
-) -> list[dict]:
+) -> dict:
     """
-    Find available interview or meeting slots in the user's primary Google Calendar.
+    Find free meeting slots in the owner's primary Google Calendar.
 
-    Checks the next days_ahead days (default 7, max 21) and only returns
-    weekday slots between 11:00 AM and 4:00 PM India time (UTC+05:30).
-    Each free gap yields its earliest slot. Slots already proposed to
-    someone and waiting for the owner's approval count as busy.
+    Socio only offers weekdays, 11:00 AM-4:00 PM India time (UTC+05:30).
+    - For one specific day ("tomorrow", "Friday", "12 Oct"), pass date="YYYY-MM-DD":
+      exactly that day is checked.
+    - Otherwise the next days_ahead days are checked, starting today (max 21).
+
+    Returns {"slots": [{"start", "end"}, ...] (the earliest slot of each free gap, in
+    order), "days": [{"date", "day", "free": ["11:00-16:00", ...], "note"?}], "note"?}.
+    An empty "slots" always comes with a "note" saying why (weekend, day over, fully
+    booked) and the next weekday to try. Slots already proposed to someone and waiting
+    for the owner's approval count as busy.
     """
+
+    duration_minutes = int(duration_minutes)
+    longest = (WORK_END_HOUR - WORK_START_HOUR) * 60
+    if not 5 <= duration_minutes <= longest:
+        raise ValueError(f"A meeting must be 5 to {longest} minutes: I only offer {WORK_START_HOUR}:00-{WORK_END_HOUR}:00.")
 
     now = datetime.now(INDIA_TZ)
-    days_ahead = max(1, min(int(days_ahead), 21))
+    today = now.date()
     held = [(hold["start"], hold["end"]) for hold in held_periods()]
 
-    suitable_slots = []
+    if str(date or "").strip():
+        days = [_parse_day(date, today)]
+    else:
+        days = [today + timedelta(days=offset) for offset in range(max(1, min(int(days_ahead), 21)))]
 
-    for day_offset in range(days_ahead):
-        current_date = (
-            now + timedelta(days=day_offset)
-        ).date()
-
-        # Monday = 0 ... Sunday = 6
-        if current_date.weekday() >= 5:
-            continue
-
-        window_start = datetime.combine(
-            current_date,
-            datetime.min.time(),
-        ).replace(
-            hour=11,
-            minute=0,
-            second=0,
-            microsecond=0,
-            tzinfo=now.tzinfo,
-        )
-
-        window_end = datetime.combine(
-            current_date,
-            datetime.min.time(),
-        ).replace(
-            hour=16,
-            minute=0,
-            second=0,
-            microsecond=0,
-            tzinfo=now.tzinfo,
-        )
-
-        # If today's interview window has already passed,
-        # skip today.
-        if window_end <= now:
-            continue
-
-        # If we're currently inside today's interview window,
-        # don't offer a slot that has already started.
-        search_start = max(
-            window_start,
-            now,
-        )
-
-        raw_slots = find_free_slots(
-            start_time=search_start,
-            end_time=window_end,
-            duration_minutes=duration_minutes,
-            extra_busy=held,
-        )
-
-        for slot in raw_slots:
-            start = slot["start"]
-            end = slot["end"]
-
-            if start >= window_start and end <= window_end:
-                suitable_slots.append(
-                    {
-                        "start": start.isoformat(),
-                        "end": end.isoformat(),
-                    }
-                )
-
-    return suitable_slots
+    checked = [_check_day(day, now, duration_minutes, held) for day in days]
+    # Several days: list only the days with free time (weekends would just be noise), unless none has any.
+    shown = [entry for entry in checked if entry["slots"]] or checked
+    result: dict = {
+        "slots": [slot for entry in checked for slot in entry["slots"]],
+        "days": [{key: value for key, value in entry.items() if key != "slots"} for entry in shown],
+    }
+    if not result["slots"]:
+        reasons = "; ".join(entry["note"] for entry in checked if entry.get("note")) or "No free time."
+        nxt = _next_weekday(days[-1])
+        result["note"] = f"{reasons} The next weekday to try is {_day_label(nxt)} (date={nxt.isoformat()})."
+    return result
 
 @tool
 def create_calendar_event(
@@ -106,10 +130,14 @@ def create_calendar_event(
     description: str = "",
     attendee_email: str = "",
     meeting_link: str = "",
+    attendee_emails: list[str] | None = None,
 ) -> dict:
     """
     Create an interview or meeting event in the user's primary
     Google Calendar.
+
+    attendee_emails (optional) invites several people; attendee_email is
+    the single-person form and is merged with it.
 
     The requested time must be in the future and must not overlap
     with an existing calendar event.
@@ -251,12 +279,11 @@ def create_calendar_event(
     },
 }
 
-    if attendee_email:
-        event["attendees"] = [
-            {
-                "email": attendee_email,
-            }
-        ]
+    invitees = list(dict.fromkeys(
+        address.strip().lower() for address in [attendee_email, *(attendee_emails or [])] if address and address.strip()
+    ))
+    if invitees:
+        event["attendees"] = [{"email": address} for address in invitees]
 
     # Not retried: a timed-out insert may still have created the event.
     created_event = execute_with_retry(
@@ -264,7 +291,7 @@ def create_calendar_event(
         .insert(
             calendarId="primary",
             body=event,
-            sendUpdates="all" if attendee_email else "none",
+            sendUpdates="all" if invitees else "none",
         ),
         operation_name="calendar_create_event",
         retry=False,
@@ -275,7 +302,8 @@ def create_calendar_event(
         "title": created_event.get("summary"),
         "start": created_event.get("start", {}).get("dateTime"),
         "end": created_event.get("end", {}).get("dateTime"),
-        "attendee": attendee_email,
+        "attendee": attendee_email or (invitees[0] if invitees else ""),
+        "attendees": invitees,
         "html_link": created_event.get("htmlLink"),
         "status": created_event.get("status"),
         # The insert response is Google's confirmation of the stored event.
