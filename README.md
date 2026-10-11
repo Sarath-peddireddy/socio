@@ -128,7 +128,8 @@ to `logs/agent.log` on your computer.
 
 Requirements: Python 3.11+, a Google Cloud project with the Gmail, Google
 Calendar, Google Drive, Google Docs, Google Sheets, and Google Tasks APIs enabled, an OAuth client (`credentials.json`,
-type "Desktop app"), a Gemini API key, and a Telegram bot token.
+type "Desktop app"), a Gemini API key (optionally a second Gemini key, a Mistral
+key, and a Groq key for failover and parallel tasks), and a Telegram bot token.
 
 ```bash
 python -m venv .venv
@@ -176,7 +177,11 @@ See [`.env.example`](.env.example).
 
 | Variable | Purpose |
 |---|---|
-| `GEMINI_API_KEY` | LLM used for decisions and writing |
+| `GEMINI_API_KEY` | LLM used for decisions and writing (first choice) |
+| `GEMINI_FALLBACK_API_KEY` | Optional second Gemini key (another Google Cloud project), used when the first is rate-limited or out of quota |
+| `MISTRAL_API_KEY` | Optional Mistral key: first choice for parallel subtasks, last resort for everything else |
+| `GROQ_API_KEY` | Optional Groq key: second choice for parallel subtasks |
+| `AGENT_GEMINI_MODEL` / `AGENT_MISTRAL_MODEL` / `AGENT_GROQ_MODEL` | Model names (default `gemini-3.5-flash-lite` / `ministral-14b-latest` / `openai/gpt-oss-120b`) |
 | `AGENT_OWNER_NAME` | Name used to sign emails |
 | `AGENT_DRIVE_FOLDER` | Optional: limit Socio to one Drive folder (default: your whole Drive) |
 | `AGENT_AUTO_TASKS` | Add a Google Task automatically when an email needs you (default off; `1` = on) |
@@ -187,7 +192,9 @@ See [`.env.example`](.env.example).
 | `AGENT_INBOX_QUERY` | Which emails to process (default: inbox, last 7 days, not from you) |
 | `AGENT_MEMORY` | Remember the rules you add and recall them (default on; `0` = off) |
 | `AGENT_MAX_WORKERS` | Tasks of one instruction run in parallel (default 3) |
-| `AGENT_LLM_RPM` | Gemini requests per minute, shared by all tasks (default 14; free tier is 15) |
+| `AGENT_LLM_RPM` | Gemini requests per minute per key, shared by all tasks (default 14; free tier is 15) |
+| `AGENT_MISTRAL_RPM` | Mistral requests per minute, shared by all tasks (default 28; ministral-14b free tier is 30) |
+| `AGENT_GROQ_RPM` | Groq requests per minute, shared by all tasks (default 28; free tier is 30) |
 | `AGENT_SKILLS_DIR` | Where skills live (default `./skills`) |
 | `AGENT_MODEL_CACHE` | Where the embedding model is stored (default `./.cache/fastembed`) |
 | `AGENT_LOG_DIR` | Where `agent.log` goes (default `./logs`, gitignored) |
@@ -222,11 +229,16 @@ Schedule  ─┘                                         │
   action is needed, let the agent act, verify the result, record it.
 - **Decision**: Gmail metadata rules first (spam, promotions, mailing lists,
   auto-replies, no-reply senders) so obvious cases never reach the LLM.
-- **Agent**: a LangGraph tool-calling agent (Gemini) with per-intent
+- **Models**: Gemini first for email, owner work, and planning; Mistral, then
+  Groq, first for parallel subtasks; a rate-limited or unreachable provider
+  hands the same request to the next one (`app/agent/llm_router.py`). `python scripts/verify_keys.py`
+  checks every key with one tiny request.
+- **Agent**: a LangGraph tool-calling agent with per-intent
   playbooks for scheduling, information requests, documents, and follow-ups.
-- **Supervisor**: splits a multi-part instruction into a task graph, runs
-  independent tasks in parallel worker agents (each with a clean context and
-  only its tools), and merges their results into one report.
+- **Supervisor**: splits a multi-part instruction into a task graph (one task
+  per domain: email, calendar, Drive/Docs/Sheets, tasks), runs independent
+  tasks in parallel worker agents (each with a clean context and only its
+  domain's tools), and merges their results into one report.
 - **Memory**: SQLite for short-term state; your learned preferences with local
   embeddings (top 3 recalled per email or instruction); reusable skills in
   `skills/`.

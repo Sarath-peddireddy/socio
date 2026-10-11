@@ -35,8 +35,9 @@ app/agent/supervisor.py  owner instructions: planner -> task DAG -> parallel wor
 app/agent/workers.py     one worker subagent: clean context, restricted tools, strict JSON payload
 app/agent/taskgraph.py   plan validation (ids, tools, dependencies, cycles) and ordering
         │
-app/agent/decision.py    metadata rules → keyword pre-check → Gemini structured decision (+ intent)
+app/agent/decision.py    metadata rules → keyword pre-check → LLM structured decision (+ intent)
 app/agent/graph.py       LangGraph: agent node ⇄ tools node; mode-specific toolsets and guards
+app/agent/llm.py         get_llm(role) / invoke_llm; routing and failover in llm_router.py
 app/agent/prompts.py     system prompts and per-intent playbooks
 app/agent/approvals.py   execute / reject approval requests (re-validated at execution time)
 app/agent/state.py       SQLite: message outcomes, attempts, actions, approvals, slot holds, failures
@@ -125,19 +126,37 @@ model call.
 ```
 instruction ─► recall memories (top 3) + matching skills
             ─► one-task request? ─► single owner agent (as before)
-            └► planner (1 LLM call): spawn_subagent(task_id, goal_contract, context_slice,
-               tools_allowed, depends_on) calls = a DAG, or use_skill(name, params)
-            ─► validate (≤ 6 tasks, known tools, no cycles) ─► checkpoint (supervisor_runs, worker_tasks)
+            └► planner (1 LLM call, structured output PlannerOutput): tasks = [SubTask(task_id,
+               target_domain, goal_contract, context_slice, tools_allowed, depends_on)] = a DAG,
+               or use_skill + params
+            ─► validate (≥ 2 tasks if the request names ≥ 2 domains, ≤ 6 tasks, known tools and
+               domains, no cycles; a rejected plan goes back once with the reason)
+            ─► checkpoint (supervisor_runs, worker_tasks)
             ─► ThreadPoolExecutor (AGENT_MAX_WORKERS = 3): a task starts when its dependencies succeeded
             ─► fan-in payloads ─► close duplicate approvals ─► one report
             ─► count the workflow's success (3rd time: suggest /save_skill once)
 ```
 
-- Only instructions that look multi-part (or match a skill) pay for a planning
-  call; if the planner returns one task, the single agent runs instead.
+- Only instructions that look multi-part, name two or more domains (email,
+  calendar, workspace = Drive/Docs/Sheets, tasks), or match a skill pay for a
+  planning call; if the planner returns one task, the single agent runs instead.
+- Decomposition rule (§4c): the planner prompt forbids monolithic tasks, with
+  examples. The whole plan comes back as one structured answer (a list), not
+  one tool call per task: Gemini tended to emit only the first call and wait,
+  which collapsed multi-part plans into one task. If the request names ≥ 2
+  domains and the plan has < 2 tasks (pydantic `PlannedTasks`), or the answer
+  does not fit the schema, the planner is asked once more with the reason;
+  a second failure falls back to the single agent. The planner gets today's
+  date and writes exact dates into the tasks, so workers never work them out.
+- Least privilege: each task names one `target_domain`; `taskgraph.DOMAIN_TOOLS`
+  caps its `tools_allowed` to that domain's tools (others are dropped and
+  logged; a task with none left is refused). Email includes `find_documents`
+  for attachments. Older saved skills without a domain get the narrowest one
+  that covers their tools.
 - A worker is a fresh graph run (`worker=True`, `tools_allowed=[...]`): its
   only message is its goal, its context slice, and its dependencies' payloads.
-  Tools outside its list are neither bound nor executed.
+  Tools outside its list are neither bound nor executed. Worker summaries in
+  the report are stripped of approval numbers (`without_internal_ids`).
 - Fan-in contract: `{"status": "SUCCESS"|"FAILED", "modified_entities": [...],
   "diff_summary": "..."}`. Entities come from the actions the tools recorded
   (the graph is streamed, so a worker that crashes still reports what it
@@ -148,8 +167,12 @@ instruction ─► recall memories (top 3) + matching skills
   recipient + subject, slot) get one approval; the other is closed as a
   duplicate. The slot-hold check and insert share one lock, so parallel
   workers cannot hold the same time twice.
-- All workers share one Gemini rate limiter (`AGENT_LLM_RPM`, default 14/min)
-  and token refresh is serialized (`CREDENTIALS_LOCK`); Google clients are
+- Workers run on Mistral, then Groq (`get_llm(WORKER)`), so parallel subtasks
+  do not spend Gemini's daily quota; each provider key has one shared rate
+  limiter (`AGENT_LLM_RPM` per Gemini key, `AGENT_MISTRAL_RPM`, `AGENT_GROQ_RPM`).
+  Workers are threads (the stack is synchronous, so not `asyncio.gather`); each
+  call fails over on its own, and a failed worker never stops its siblings.
+  Google token refresh is serialized (`CREDENTIALS_LOCK`); Google clients are
   built per call.
 - Runs left `running` by a stopped process are marked `interrupted` after 30
   minutes and never re-run (they may already have created approvals).
@@ -300,13 +323,32 @@ Three tiers:
   HTTP 429/5xx; non-idempotent calls (send, insert, patch, delete, draft) are
   never retried. Persistent outages raise `GoogleApiUnavailableError`, which
   stops a batch without counting against an email's retry budget.
-- Gemini: 60 s timeout; per-minute rate limits are waited out using the
-  server's suggested delay; daily quota / unreachable API raises
-  `LLMUnavailableError`.
+- Models (`app/agent/llm_router.py`): two chains. Supervisor (email mode,
+  owner agent, planner, triage, rules, skills): Gemini primary key → Gemini
+  fallback key → Mistral. Worker: Mistral → Groq → Gemini fallback → Gemini
+  primary (the supervisor's key last).
+  Each client makes one attempt (no SDK retries); on 429, 5xx, a network
+  error, or a rejected key/model the same request goes to the next provider
+  at once and a warning is logged (`⚠️ [ModelRouter] Rate limit hit on Worker
+  priority 1 (Mistral). Seamlessly failing over to priority 2 (Groq).`, no
+  stack trace). The failed provider cools down (suggested delay for
+  per-minute limits, 1 h for daily quota or a rejected key, 10 s for outages)
+  so later calls skip it without a request; Groq's 413 (request over its
+  per-minute token budget) and `tool_use_failed` skip it for that request
+  only. If every provider is cooling down, the call waits for the first to
+  return (at most 70 s, 3 times), else raises `LLMUnavailableError`
+  ("daily quota" when quota is the cause). Model calls have no side effects,
+  so repeating one elsewhere is safe. langchain-google-genai adds the
+  documented skip-validator thought signature to tool calls that came from
+  another provider, so a mid-run failover to Gemini 3 is accepted;
+  langchain-mistralai rewrites other providers' tool-call ids into Mistral's
+  9-character format. Mistral's free tier gives `mistral-small`/`medium` 0
+  requests/minute, so the default is `ministral-14b-latest` (30/min).
 - Restart recovery: interrupted emails are retried from the database; actions
   already completed are shown to the agent and cannot be repeated.
-- Gemini rate limit: a process-wide sliding window (`AGENT_LLM_RPM`) attached to
-  the real model, so parallel workers queue instead of hitting 429s.
+- Rate limits: a process-wide sliding window per provider key (`AGENT_LLM_RPM`,
+  `AGENT_MISTRAL_RPM`, `AGENT_GROQ_RPM`) attached to the real model, so parallel workers queue
+  instead of hitting 429s.
 - Concurrency: the Telegram bot is one sequential loop (messages, button taps,
   and scheduled inbox checks never overlap). Across processes (bot + CLI),
   SQLite runs in WAL mode with a 30 s busy timeout, and a live inbox run takes
@@ -330,8 +372,8 @@ worker summaries, inbox reasons) or, with `html=True` (the bot), a status card
 |---|---|---|
 | Google `HttpError` 429/5xx, `GoogleApiUnavailableError`, OAuth/DNS transport errors | Google Service Busy | Google services are busy or unreachable right now. Please try again in a few minutes. |
 | `sqlite3.OperationalError` (locked / busy) | Workspace Busy | The system is completing another task. Please try again in a moment. |
-| Gemini timeout / unreachable / rate limit (`LLMUnavailableError`, `httpx.TimeoutException`) | AI Reasoning Timeout | The AI model took too long to respond. Tap /run or send the request again. |
-| Gemini daily quota exhausted | AI Daily Limit Reached | The AI model's daily limit is used up. Please try again later. |
+| No AI provider answered: timeout / unreachable / rate limit (`LLMUnavailableError`, `httpx.TimeoutException`) | AI Reasoning Timeout | The AI model took too long to respond. Tap /run or send the request again. |
+| Daily quota exhausted on every configured provider | AI Daily Limit Reached | The AI model's daily limit is used up. Please try again later. |
 | anything else | Task Paused | Unable to complete that action right now. The details have been logged for review. |
 
 The wording only promises what happens (developer decision): nothing is

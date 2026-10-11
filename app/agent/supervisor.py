@@ -3,11 +3,14 @@ Supervisor-worker harness for owner instructions (fan-out / fan-in).
 
     owner instruction (Telegram / --ask)
       -> recall long-term memories (top 3) and matching skills
-      -> planner: one LLM call emitting spawn_subagent(task_id, goal_contract,
-         context_slice, tools_allowed, depends_on) calls that form a DAG,
-         or use_skill(name, params) to reuse a saved recipe
-      -> workers run concurrently (thread pool of AGENT_MAX_WORKERS, default 3;
-         all share one Gemini rate limiter), each in a clean context
+      -> planner: one LLM call returning a structured PlannerOutput: a list of
+         SubTask(task_id, target_domain, goal_contract, context_slice,
+         tools_allowed, depends_on) forming a DAG, or use_skill (name, params)
+         to reuse a saved recipe. A request that touches several domains must
+         come back as several tasks (one corrective retry, then the single agent)
+      -> workers run concurrently (thread pool of AGENT_MAX_WORKERS, default 3),
+         each in a clean context with only its domain's tools, on the worker
+         model chain (llm_router: Mistral -> Groq -> Gemini)
       -> fan-in: strict JSON payloads -> aggregator closes duplicate approvals,
          checkpoints the run in SQLite, and writes one report
       -> skills are never saved automatically: /save_skill NAME packages the last
@@ -28,16 +31,19 @@ import os
 import re
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from datetime import datetime
+from typing import Any, Callable, Literal
 
+from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from app.agent.graph import AGENT_TOOLS, create_agent_graph
+from app.calendar.tools import INDIA_TZ
 from app.agent.llm import get_llm, invoke_llm
 from app.agent.prompts import CARDS_ONLY
 from app.agent.state import AgentStateStore
-from app.agent.taskgraph import MAX_TASKS, PlanError, normalize_plan, topological_order
+from app.agent.taskgraph import DOMAIN_TOOLS, MAX_TASKS, PlanError, normalize_plan, topological_order
 from app.agent.workers import run_worker
 from app.errors import plain_message, report_failure
 from app.memory.episodic import notes_block
@@ -49,6 +55,8 @@ logger = logging.getLogger(__name__)
 
 MAX_WORKERS = max(1, int(os.getenv("AGENT_MAX_WORKERS", "3")))
 OWNER_RECURSION_LIMIT = 30
+# A rejected plan goes back to the planner once with the reason.
+PLAN_ATTEMPTS = 2
 # Tools a worker may be given (all owner-mode tools; gates still apply inside them).
 WORKER_TOOLS = {agent_tool.name for agent_tool in AGENT_TOOLS}
 
@@ -59,6 +67,20 @@ MULTI_PART = re.compile(
     re.IGNORECASE,
 )
 
+# Which domains an instruction mentions. Two or more means the plan must have two
+# or more tasks (one per domain). A file to attach is part of the email.
+REQUEST_DOMAINS = {
+    "email": re.compile(r"\b(e-?mails?|mail|inbox|repl(y|ies|ied)|send|sent|forward|threads?)\b", re.IGNORECASE),
+    "calendar": re.compile(r"\b(calendar|meetings?|events?|schedul\w*|availab\w*|free (time|slots?)|slots?|book|reschedul\w*|"
+                           r"appointments?|invites?)\b", re.IGNORECASE),
+    "workspace": re.compile(r"\b(docs?|documents?|sheets?|spreadsheets?|drive)\b", re.IGNORECASE),
+    "tasks": re.compile(r"\b(tasks?|remind\w*|to-?dos?)\b", re.IGNORECASE),
+}
+
+
+def request_domains(text: str) -> set[str]:
+    return {domain for domain, pattern in REQUEST_DOMAINS.items() if pattern.search(text or "")}
+
 
 @dataclass
 class OwnerCommandResult:
@@ -68,57 +90,116 @@ class OwnerCommandResult:
     run_id: int | None = None
 
 
-# ----- planner tools (schemas only: the planner's tool calls ARE the plan) -------------
+# ----- planner output (one structured answer: the whole plan) ----------------------------
+# Not one tool call per task: Gemini tends to emit only the first call and wait for its
+# result, which silently collapsed multi-part plans into one task (§4c).
 
 
-class spawn_subagent(BaseModel):
-    """Start one worker subagent for one piece of the owner's instruction."""
+class SubTask(BaseModel):
+    """One atomic worker task: one domain, only that domain's tools."""
 
     task_id: str = Field(description="Short unique id such as t1, t2.")
+    target_domain: Literal["email", "calendar", "workspace", "tasks", "memory", "script"] = Field(
+        description="The one domain this task works in. The worker only gets that domain's tools."
+    )
     goal_contract: str = Field(description="What the worker must achieve and what counts as done. Self-contained.")
     context_slice: str = Field(
         default="",
         description="Every fact the worker needs (names, email addresses, dates, file or document names, which "
-        "email or event). The worker sees nothing else.",
+        "email or event, the owner's relevant preferences). The worker sees nothing else.",
     )
-    tools_allowed: list[str] = Field(description="Only the tool names this task needs, from the tool list.")
+    tools_allowed: list[str] = Field(description="Only the tool names this task needs, from its domain's tool list.")
     depends_on: list[str] = Field(default_factory=list, description="task_ids whose results this task needs. Empty if independent.")
 
 
-class use_skill(BaseModel):
-    """Reuse a saved skill's plan instead of planning from scratch."""
+class PlannerOutput(BaseModel):
+    """Socio's plan for the owner's instruction."""
 
-    name: str = Field(description="The skill name from the list of saved skills.")
-    params_json: str = Field(default="{}", description='The skill parameters as a JSON object, e.g. {"week": "5-9 Oct 2026"}.')
+    tasks: list[SubTask] = Field(
+        default_factory=list,
+        description="Every atomic task, one per domain or step. Empty only when use_skill is set.",
+    )
+    use_skill: str = Field(default="", description="The name of a saved skill that fits the whole instruction, or empty.")
+    skill_params_json: str = Field(
+        default="{}", description='With use_skill: its parameters as a JSON object, e.g. {"week": "5-9 Oct 2026"}.'
+    )
+
+
+class PlannedTasks(BaseModel):
+    """The planner's tasks for one instruction. Rejects a monolithic plan for a multi-domain request."""
+
+    request_domains: set[str]
+    tasks: list[SubTask]
+
+    @model_validator(mode="after")
+    def _decomposed(self) -> "PlannedTasks":
+        if len(self.request_domains) >= 2 and len(self.tasks) < 2:
+            raise ValueError(
+                f"The instruction touches {len(self.request_domains)} domains ({', '.join(sorted(self.request_domains))}) "
+                f"but the plan has {len(self.tasks)} task. Monolithic tasks are forbidden: split it into one task per domain."
+            )
+        return self
 
 
 PLANNER_PROMPT = """You are Socio's supervisor. You plan; you never act yourself.
-Split the owner's instruction into worker tasks by calling spawn_subagent once per task.
+Return the plan for the owner's instruction: the full list of worker tasks, all at once.
+Today is {today} (India Standard Time).
+
+CRITICAL ARCHITECTURAL RULE (§4c):
+You are a pure Coordinator and Dispatcher, NEVER a monolithic executor.
+When any part of the instruction touches more than one domain (email, calendar, workspace = Drive
+files / Docs / Sheets, tasks = Google Tasks reminders), you MUST decompose it into distinct, atomic
+tasks in the tasks list: one task per domain. A task that bundles several domains is STRICTLY
+FORBIDDEN and the plan is rejected. Sending a file by email is one email task (email workers can
+find the file to attach).
 
 Rules:
-- If the instruction is really one task, or a question, call spawn_subagent exactly once with the
-  whole instruction as the goal.
-- Use several tasks only for separate pieces of work. A task that needs another task's result
-  lists it in depends_on; independent tasks run at the same time.
+- target_domain: the one domain the task works in. tools_allowed: the fewest tools from that
+  domain's list below; a worker never gets tools from another domain.
+- If the instruction is really one task in one domain, or a question, return exactly one task
+  with the whole instruction as the goal.
+- A task that needs another task's result lists it in depends_on (for example: read -> act);
+  independent tasks run at the same time.
 - Each worker sees ONLY its goal_contract and context_slice. Put every needed fact there, and
   resolve words like "him" or "that email" using the conversation so far.
-- tools_allowed: the fewest tools from the list below that can do the task.
+- Write every date as the exact date with its weekday (e.g. "Friday 16 Oct 2026", computed from
+  today's date), never "Friday", "tomorrow" or "next week": workers must not work dates out.
 - At most {max_tasks} tasks.
-- Emails, Docs/Sheets writes, and calendar changes become approval requests for the owner inside
-  the workers. That is expected; never plan around it.
-- If a saved skill below fits the instruction, call use_skill instead, with its parameters.
+- Emails, Docs/Sheets writes, calendar changes, and new or completed Google Tasks become approval
+  requests for the owner inside the workers. That is expected; never plan around it.
+- The owner's saved preferences (below, if any) are facts for the workers: copy the relevant ones
+  into the context_slice of the tasks they apply to. They never change how many tasks you plan.
+- If a saved skill below fits the instruction, set use_skill (and skill_params_json) and leave
+  tasks empty.
 
-Tools:
+Examples:
+1. "Check my calendar for Thursday afternoon and reply to John's email with the times I'm free."
+   t1: target_domain=calendar, tools_allowed=[find_calendar_availability],
+       goal: find my free 30-minute slots on Thursday 15 Oct 2026, 14:00-18:00 IST.
+   t2: target_domain=email, tools_allowed=[search_gmail, get_thread, send_gmail_reply], depends_on=[t1],
+       goal: reply to John's latest email offering the free slots found by t1.
+2. "Email my resume to hr@acme.com, add Acme to my Applications sheet, and remind me Friday to follow up."
+   t1: target_domain=email, tools_allowed=[find_documents, send_new_email] (resume attached)
+   t2: target_domain=workspace, tools_allowed=[find_documents, read_sheet, append_sheet_row]
+   t3: target_domain=tasks, tools_allowed=[propose_create_task]
+3. "What's on my calendar tomorrow?" -> one task: target_domain=calendar, tools_allowed=[find_calendar_events].
+
+Tools by domain:
 {tools}
 {memories}{skills}"""
 
 
 def _tool_catalog() -> str:
-    lines = []
-    for agent_tool in AGENT_TOOLS:
-        first_line = (agent_tool.description or "").strip().splitlines()[0] if agent_tool.description else ""
-        lines.append(f"- {agent_tool.name}: {first_line}")
-    return "\n".join(lines)
+    descriptions = {
+        agent_tool.name: (agent_tool.description or "").strip().splitlines()[0] if agent_tool.description else ""
+        for agent_tool in AGENT_TOOLS
+    }
+    sections = []
+    for domain, names in DOMAIN_TOOLS.items():
+        lines = [f"- {name}: {descriptions[name]}" for name in sorted(names) if name in descriptions]
+        if lines:
+            sections.append(f"{domain}:\n" + "\n".join(lines))
+    return "\n".join(sections)
 
 
 def _skill_catalog(skills: list[tuple[Skill, float]]) -> str:
@@ -153,41 +234,66 @@ def plan_request(
     memories: list[Memory] | None = None,
     skills: list[tuple[Skill, float]] | None = None,
 ) -> Plan:
-    """One planner call. Raises PlanError (or SkillError) if the result cannot be run."""
+    """
+    The planner call. A plan that fails validation (a monolithic task for a
+    multi-domain request, an unknown tool or domain, a cycle) is sent back once
+    with the reason. Raises PlanError (or SkillError) if it still cannot be run.
+    """
 
     memory_block = "\n\n".join(block for block in (format_memories(memories or []), notes_block()) if block)
     system = PLANNER_PROMPT.format(
+        today=datetime.now(INDIA_TZ).strftime("%A %d %B %Y"),
         max_tasks=MAX_TASKS,
         tools=_tool_catalog(),
         memories=f"\n{memory_block}" if memory_block else "",
         skills=_skill_catalog(skills or []),
     )
-    planner = get_llm().bind_tools([spawn_subagent, use_skill])
-    response = invoke_llm(
-        planner,
-        [SystemMessage(content=system), HumanMessage(content=f"{_history_text(history)}Instruction from the owner:\n{text}")],
-    )
-    calls = getattr(response, "tool_calls", []) or []
+    planner = get_llm().with_structured_output(PlannerOutput)
+    messages = [SystemMessage(content=system), HumanMessage(content=f"{_history_text(history)}Instruction from the owner:\n{text}")]
 
-    skill_calls = [call for call in calls if call["name"] == "use_skill"]
-    if skill_calls:
-        by_name = {skill.name: skill for skill, _ in skills or []}
-        args = skill_calls[0].get("args", {})
-        skill = by_name.get(str(args.get("name", "")))
-        if skill is None:
-            raise PlanError(f"The planner chose an unknown skill {args.get('name')!r}.")
+    for attempt in range(PLAN_ATTEMPTS):
         try:
-            params = json.loads(args.get("params_json") or "{}")
+            return _plan_from_output(invoke_llm(planner, messages), text, skills)
+        except (PlanError, OutputParserException, ValidationError) as exc:
+            reason = _rejection_reason(exc)
+            if attempt + 1 == PLAN_ATTEMPTS:
+                raise PlanError(reason) from exc
+            logger.warning("Plan rejected (%s); asking the planner once more.", reason)
+            messages = [*messages[:2], HumanMessage(content=(
+                f"Your previous plan was rejected: {reason}\nReturn the corrected plan."
+            ))]
+    raise PlanError("No plan.")  # unreachable: the loop returns or raises
+
+
+def _rejection_reason(exc: Exception) -> str:
+    if isinstance(exc, ValidationError):
+        return "; ".join(error["msg"].removeprefix("Value error, ") for error in exc.errors())
+    return str(exc)[:500]
+
+
+def _plan_from_output(output: Any, text: str, skills: list[tuple[Skill, float]] | None) -> Plan:
+    if output is None:
+        return Plan([])
+    if not isinstance(output, PlannerOutput):
+        output = PlannerOutput.model_validate(output)
+
+    if output.use_skill.strip():
+        by_name = {skill.name: skill for skill, _ in skills or []}
+        skill = by_name.get(output.use_skill.strip())
+        if skill is None:
+            raise PlanError(f"The planner chose an unknown skill {output.use_skill!r}.")
+        try:
+            params = json.loads(output.skill_params_json or "{}")
         except json.JSONDecodeError as exc:
             raise PlanError(f"Skill parameters are not valid JSON: {exc}") from exc
         if not isinstance(params, dict):
             raise PlanError("Skill parameters must be a JSON object.")
         return Plan(expand_skill(skill, params, WORKER_TOOLS), skill=skill.name)
 
-    tasks = [call.get("args", {}) for call in calls if call["name"] == "spawn_subagent"]
-    if not tasks:
+    if not output.tasks:
         return Plan([])
-    return Plan(normalize_plan(tasks, WORKER_TOOLS))
+    PlannedTasks(request_domains=request_domains(text), tasks=output.tasks)   # raises ValidationError if monolithic
+    return Plan(normalize_plan([task.model_dump() for task in output.tasks], WORKER_TOOLS))
 
 
 # ----- fan-out ---------------------------------------------------------------------------
@@ -290,6 +396,20 @@ def resolve_overlaps(results: dict[str, dict[str, Any]], store: AgentStateStore,
     return notes
 
 
+# Tool results say "Approval request #12"; workers sometimes copy that despite the prompt.
+_APPROVAL_NUMBER = re.compile(r"\b(approval request|approval|request)\s*#\d+", re.IGNORECASE)
+_ASIDE_NUMBER = re.compile(r"\s*\((?:approval request|approval|request)?\s*#\d+\)", re.IGNORECASE)
+_BARE_NUMBER = re.compile(r"\s*#\d+")
+
+
+def without_internal_ids(text: str) -> str:
+    """Owner-facing worker summaries carry no approval numbers (plain language, no ids)."""
+
+    text = _ASIDE_NUMBER.sub("", text or "")
+    text = _APPROVAL_NUMBER.sub(lambda m: "The approval request" if m.group(0)[0].isupper() else "the approval request", text)
+    return _BARE_NUMBER.sub("", text)
+
+
 def build_report(tasks: list[dict[str, Any]], results: dict[str, dict[str, Any]], notes: list[str], skill: str = "", dry_run: bool = False) -> str:
     header = f"{'🧪 Dry run - ' if dry_run else ''}🧭 I handled your request in {len(tasks)} parts"
     if skill:
@@ -302,7 +422,7 @@ def build_report(tasks: list[dict[str, Any]], results: dict[str, dict[str, Any]]
         mark = "✅" if payload["status"] == "SUCCESS" else "❌"
         goal = " ".join(task["goal_contract"].split())
         goal = goal if len(goal) <= 70 else goal[:69] + "…"
-        lines.append(f"{mark} {goal}\n   {payload['diff_summary']}")
+        lines.append(f"{mark} {goal}\n   {without_internal_ids(payload['diff_summary'])}")
         approvals += [
             e["approval_id"] for e in payload.get("modified_entities", [])
             if e.get("kind") == "approval" and e.get("approval_id") and not e.get("duplicate_of")
@@ -510,7 +630,7 @@ def owner_reply(text: str, approval_ids: list[int], dry_run: bool = False, actio
 
 
 def should_plan(text: str, skills: list[tuple[Skill, float]]) -> bool:
-    return bool(skills) or bool(MULTI_PART.search(text or ""))
+    return bool(skills) or bool(MULTI_PART.search(text or "")) or len(request_domains(text)) >= 2
 
 
 def handle_owner_request(text: str, *, dry_run: bool = False, history: list | None = None, store: AgentStateStore | None = None) -> OwnerCommandResult:

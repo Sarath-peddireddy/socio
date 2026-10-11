@@ -8,7 +8,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
-from app.agent.llm import get_llm, invoke_llm
+from app.agent.llm import SUPERVISOR, WORKER, get_llm, invoke_llm
 from app.agent.prompts import build_system_prompt
 from app.agent.state import AgentStateStore
 from app.agent.approvals import describe
@@ -179,7 +179,8 @@ class AgentState(TypedDict, total=False):
 def call_model(state: AgentState):
     """Ask the LLM what to do next."""
 
-    llm = get_llm()
+    # Workers run on Mistral / Groq first so subtasks do not spend Gemini's daily quota.
+    llm = get_llm(WORKER if state.get("worker") else SUPERVISOR)
     llm_with_tools = llm.bind_tools(_allowed_tools(state))
 
     # The system prompt is not stored in state so it is always current.
