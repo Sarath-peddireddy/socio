@@ -28,6 +28,7 @@
 app/telegram_bot.py      owner-only Telegram front end, approval buttons, scheduled inbox checks
 app/telegram_format.py   Telegram HTML: esc(), agent Markdown -> HTML, HTML-safe clipping, cards
 app/errors.py            error gateway: logs/agent.log + predefined owner messages / status cards
+app/observability.py     optional Langfuse tracing: roots, spans, per-attempt LLM callback, scrubbing
 app/main.py              CLI front end
         │
 app/agent/runner.py      process_inbox / handle_message (email mode), handle_owner_command (owner mode)
@@ -409,6 +410,18 @@ bot answers it with a pop-up only, so the card keeps the first tap's result. A r
 `executing` 15 minutes after its `locked_at` was cut off by a crash: `/status` and `--status`
 list it ("may or may not have happened"); it is never retried automatically.
 
+A failure while Google is carrying the action out is reported by what it proves
+(`google_api.outcome_unknown`). A dropped or timed-out connection, or a 5xx, after the write
+was sent does not prove it failed (a timed-out send may have been delivered): the request
+becomes `unknown`, the email `needs_attention`, the action is recorded as `unknown`, and the
+owner is told "I can't tell whether the email went out ... Check your Gmail Sent folder before
+trying again", never "nothing was changed". 429 / 4xx / validation errors / a failure before
+`_execute` keep "That didn't go through, so nothing was changed." Writes that took effect
+before a later step failed (a created Doc or Sheet, access given) are collected with
+`google_api.recording_writes()` / `completed_write()` and listed ("Already done: created the
+Google Doc 'X' (link)"). The same applies to the reply after a booking / share and to the
+email inside Create & Share (`reply_unknown`, `email_unknown`).
+
 Hours can pass between card and tap, so `check_still_current()` runs right after the claim:
 - an email reply (also the reply after a booking): the thread must have no message newer than
   `reply.last_seen_message_id`, the newest message when the card was made (whoever wrote it:
@@ -502,6 +515,41 @@ Three tiers:
    (never/always/only/before/after → standing; today/already/tired → situational;
    unsure → standing, since the owner asked for a permanent rule). Request
    context comes from structured fields only, so email text never becomes memory.
+   **Conflicts (`memory/rule_engine.py`)**: before a standing rule is upserted, one
+   supervisor-chain call compares it with the active memories (structured
+   `ConflictCheck`: has_conflict, rule number, explanation, merged rule; the number
+   must be an active memory, an identical rule is an update). On a conflict nothing
+   is saved: a `rule_conflict` approval (from `/remember` directly, from chat via
+   `remember_rule` returning `{"proposal": ...}`, a conditional proposal tool).
+   `approvals.decide_rule_conflict`: replace (old memory → `replaced`, new saved),
+   merge (merged rule saved under the old rule's entity, old → `replaced`), both (new
+   saved with "Takes priority over: <old>" in its context); Cancel = `reject()`.
+   Model unavailable → saved unchecked (warning logged). Situational notes are not checked.
+4. **Learned corrections (`agent/eval_feedback.py`, `failure_cases`, schema v9)**:
+   failures are recorded locally — `rejected` (Reject on a proposal; not on
+   questions such as task "Is this done?", rule conflicts, script trust), `stale`
+   (approve found the thread/slot changed), `worker_timeout`, `plan_invalid` — with
+   the plan id, the owner's request and the plan steps, taken from
+   `pending_approvals.origin` (stamped by `remember_origin` when the request ends:
+   mode, request, run id, plan, trace id; first stamp wins). A Langfuse score
+   `owner_feedback` = 0 (metadata `eval_status: negative_feedback`) goes to the
+   card's original trace only if tracing is enabled. A failure alone teaches
+   nothing: a Telegram reply to a rejected/stale card goes through one model call
+   (`Correction`: feedback → a one-sentence "When ..." lesson; a new instruction →
+   handled as usual, nothing stored). The newest 2 lessons for the mode (owner /
+   email) whose domain matches the request (`request_domains`) are injected as
+   `<learned_corrections>` (≤ 250 tokens, sanitized) into the planner, the single
+   owner agent, and the email task prompt. `/memories` lists them; `/forget_lesson`.
+
+**Retention (`retention_manager.py`)**: `Bot.maintain_database` (startup, then
+every 24 h) runs `purge_expired_records` in one `BEGIN IMMEDIATE` transaction,
+then `wal_checkpoint(TRUNCATE)`. Operational (30 d): finished supervisor runs and
+their worker tasks, decided approvals (approved/rejected/resolved/stale/rechecked/
+failed), `actions`, `failures`, released holds, expired notes, uncorrected failure
+cases. Messages (90 d): `conversation_turns`. Anchors (1 d). Kept: open/executing/
+unknown approvals, `processed_messages` (stops old emails being handled again),
+memories, lessons, routines, tracked tasks. All compared timestamps are SQLite UTC
+text, so `datetime('now', '-N days')` is valid (unlike `scheduled_jobs.next_run_at`).
 3. **Procedural (`memory/skills.py`, `./skills/`)**: Markdown recipes (YAML
    front matter + JSON plan with `{{parameter}}` placeholders). Never saved
    automatically: `/save_skill NAME` / `--save-skill NAME`
@@ -576,6 +624,51 @@ Three tiers:
   (Monday) ... Asia/Kolkata</temporal_anchor>`, so a request sent at 23:59 and run after
   midnight, or on a UTC server, still means the same dates. Tool checks that need the real
   time (is a slot in the past or free now?) use the real clock.
+
+## Observability (`app/observability.py`, Langfuse)
+
+Optional and OFF by default: on only when `LANGFUSE_TRACING_ENABLED=true` AND
+`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` are set (developer decision 2026-10-12: no
+personal data leaves the machine by accident; keys alone do nothing). Langfuse Python SDK v4
+(OpenTelemetry).
+
+```
+telegram_interaction       root per owner message: session = chat id, user = Telegram user id,
+                           input = the message, output = every message sent back, metadata =
+                           ingress_utc, temporal_anchor, intent, route; tag telegram
+  supervisor_plan          (chain) planner call(s); output = the validated task DAG
+  owner_agent              (agent) the single agent, when the request is not planned
+  worker_<domain>_<task>   (agent) one per worker thread; input = goal contract + tools,
+                           output = the fan-in payload; ERROR if FAILED
+    worker_llm             (generation) one per provider attempt: model, tokens, messages;
+                           metadata provider / priority / attempt / failover_from
+    model_failover         (event, WARNING) after a 429 / outage / timeout, before the retry
+    <tool name>            (tool) every tool call: args, result, metadata outcome =
+                           read / completed / proposed / dry_run / refused / failed
+email_run                  root per email (session = gmail-thread-<id>, tag email)
+scheduled_routine          root per routine run (session = chat id, tag routine)
+owner_command              root for CLI --ask (tag cli); nothing inside the bot's trace
+```
+
+- Generations come only from Langfuse's LangChain `CallbackHandler`, attached per
+  attempt in `llm_router.route` (only for routed models; test fakes are untouched). No
+  `@observe` decorators, so no model call is recorded twice. A failed attempt is an ERROR
+  generation (the provider's status in its status message); the next provider's
+  generation follows under the same parent.
+- Worker spans nest under the request's root because `run_plan` already starts each
+  worker in `contextvars.copy_context()` (OpenTelemetry's current span is a contextvar).
+- Every observation's input/output/metadata goes through `scrub()` (also Langfuse's
+  `mask` hook): base64 runs >= 400 chars and `data:` URIs replaced, strings clipped at
+  20,000 chars. Prompts and email text are still recorded (that is what makes a trace
+  useful), which is why tracing is opt-in.
+- Never in the way: off / no keys -> every call a no-op; any SDK error ->
+  one warning, no-op; spans export in a background thread, so an unreachable Langfuse
+  does not delay replies (the CLI's final `flush()` waits up to the exporter's timeout,
+  ~5 s); the bot checks the keys at startup in the background and turns tracing off if
+  they are rejected (401/403). The bot does not flush per message; `shutdown()` on exit.
+- `scripts/verify_langfuse.py` sends a parent span + generation + tool span and reads it
+  back through the v2 observations API (new Langfuse organizations have no
+  `GET /api/public/traces`; it answers 410).
 
 ## Error gateway (`app/errors.py`)
 

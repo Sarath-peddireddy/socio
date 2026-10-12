@@ -8,7 +8,7 @@ Socio's own "Socio" folder. Owner mode only.
 """
 
 from app.files.drive import move_into_output_folder, resolve_drive_file
-from app.google_api import execute_with_retry
+from app.google_api import completed_write, execute_with_retry
 from app.workspace.client import get_workspace_service
 
 
@@ -116,6 +116,8 @@ def create_spreadsheet(title: str, headers: list[str] | None = None) -> dict:
         retry=False,
     )
     sheet_id = spreadsheet["spreadsheetId"]
+    # It exists from here on: a failure below must not be reported as "nothing changed".
+    completed_write(f"created the Google Sheet '{title.strip()}' ({_sheet_url(sheet_id)})")
 
     move_into_output_folder(sheet_id)
     return {"spreadsheet_id": sheet_id, "title": title.strip(), "url": _sheet_url(sheet_id), "verified": True}

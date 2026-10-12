@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -42,6 +43,7 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from app import observability
 from app.agent import clock
 from app.agent.approvals import merge_same_emails
 from app.agent.graph import AGENT_TOOLS, EMAIL_ONLY_TOOLS, create_agent_graph
@@ -50,7 +52,8 @@ from app.agent.prompts import CARDS_ONLY
 from app.agent.state import AgentStateStore
 from app.agent.plain_text import plain_reply, without_internal_ids, without_sent_repeat  # noqa: F401  (re-exported for callers and tests)
 from app.agent.taskgraph import DOMAIN_TOOLS, MAX_TASKS, PlanError, covered_domains, normalize_plan, topological_order
-from app.agent.workers import NEEDS_INPUT, run_worker
+from app.agent.workers import NEEDS_INPUT, TIMEOUT_TEXT, WORKER_TIMEOUT_SECONDS, run_worker
+from app.agent.eval_feedback import capture_run_failure, lessons_prompt, remember_origin
 from app.errors import plain_message, report_failure
 from app.memory.episodic import notes_block
 from app.memory.semantic import Memory, format_memories, recall
@@ -60,6 +63,10 @@ from app.memory.skills import Skill, SkillError, expand_skill, find_skills, get_
 logger = logging.getLogger(__name__)
 
 MAX_WORKERS = max(1, int(os.getenv("AGENT_MAX_WORKERS", "3")))
+# A worker still running this long after it started is given up on (run_plan): its own budget
+# plus one in-flight model call (60 s) and Google call (30 s).
+WORKER_HARD_STOP_SECONDS = WORKER_TIMEOUT_SECONDS + 90
+HARD_STOP_TEXT = "It took too long, so I stopped waiting for it. If a card for it still shows up, you can approve or reject it as usual."
 OWNER_RECURSION_LIMIT = 30
 # A rejected plan goes back to the planner once with the reason.
 PLAN_ATTEMPTS = 2
@@ -374,7 +381,9 @@ def plan_request(
     context is the chat's <active_context> block (app.memory.context_anchor), if any.
     """
 
-    memory_block = "\n\n".join(block for block in (format_memories(memories or []), notes_block()) if block)
+    # The owner's written corrections of earlier plans in this domain (<= 2, <= ~250 tokens).
+    lessons = lessons_prompt("owner", request_domains(text))
+    memory_block = "\n\n".join(block for block in (format_memories(memories or []), notes_block(), lessons) if block)
     system = PLANNER_PROMPT.format(
         today=clock.now().strftime("%A %d %B %Y"),
         temporal_anchor=clock.temporal_anchor(),
@@ -387,17 +396,24 @@ def plan_request(
     request = f"{_history_text(history)}Instruction from the owner:\n{text}" + (f"\n\n{context}" if context else "")
     messages = [SystemMessage(content=system), HumanMessage(content=request)]
 
-    for attempt in range(PLAN_ATTEMPTS):
-        try:
-            return _plan_from_output(invoke_llm(planner, messages), text, skills)
-        except (PlanError, OutputParserException, ValidationError) as exc:
-            reason = _rejection_reason(exc)
-            if attempt + 1 == PLAN_ATTEMPTS:
-                raise PlanError(reason) from exc
-            logger.warning("Plan rejected (%s); asking the planner once more.", reason)
-            messages = [*messages[:2], HumanMessage(content=(
-                f"Your previous plan was rejected: {reason}\nReturn the corrected plan."
-            ))]
+    # The planner's generation(s) nest in this span; its output is the validated task DAG.
+    with observability.observation("supervisor_plan", as_type="chain", input={"request": text}) as span:
+        for attempt in range(PLAN_ATTEMPTS):
+            try:
+                plan = _plan_from_output(invoke_llm(planner, messages), text, skills)
+                span.update(output={"tasks": plan.tasks, "skill": plan.skill, "question": plan.question},
+                            metadata={"attempts": attempt + 1, "task_count": len(plan.tasks)})
+                return plan
+            except (PlanError, OutputParserException, ValidationError) as exc:
+                reason = _rejection_reason(exc)
+                if attempt + 1 == PLAN_ATTEMPTS:
+                    span.update(level="ERROR", status_message=f"Plan rejected: {reason}"[:300])
+                    raise PlanError(reason) from exc
+                logger.warning("Plan rejected (%s); asking the planner once more.", reason)
+                span.event("plan_rejected", level="WARNING", status_message=reason[:300])
+                messages = [*messages[:2], HumanMessage(content=(
+                    f"Your previous plan was rejected: {reason}\nReturn the corrected plan."
+                ))]
     raise PlanError("No plan.")  # unreachable: the loop returns or raises
 
 
@@ -443,13 +459,20 @@ def run_plan(
     dry_run: bool = False,
     worker: Callable[..., dict[str, Any]] = run_worker,
     max_workers: int = MAX_WORKERS,
+    hard_stop: float | None = None,
 ) -> dict[str, dict[str, Any]]:
     """
     Run the DAG: every task whose dependencies succeeded starts as soon as a worker
     slot is free. A task whose dependency failed is not started (FAILED, nothing changed).
     Returns {task_id: payload}; never raises for a worker's failure.
+
+    A worker still running hard_stop seconds after it started (its own budget plus one
+    in-flight model and Google call) is given up on: FAILED, and the run moves on instead of
+    holding the bot (audit H3). Its thread cannot be killed; it stops at its next model call
+    (the router's deadline), and anything it proposed before then is still a normal card.
     """
 
+    hard_stop = WORKER_HARD_STOP_SECONDS if hard_stop is None else hard_stop
     by_id = {task["task_id"]: task for task in tasks}
     waiting = dict(by_id)
     results: dict[str, dict[str, Any]] = {}
@@ -458,8 +481,10 @@ def run_plan(
         results[task_id] = payload
         store.update_worker_task(run_id, task_id, payload["status"], payload)
 
-    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="socio-worker") as pool:
+    pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="socio-worker")
+    try:
         running: dict[Any, str] = {}
+        started: dict[Any, float] = {}
 
         while waiting or running:
             for task_id, task in list(waiting.items()):
@@ -480,7 +505,8 @@ def run_plan(
                     upstream = {d: results[d] for d in task["depends_on"]}
                     store.update_worker_task(run_id, task_id, "running")
                     # The request's frozen "now" (app.agent.clock) goes with it into the thread.
-                    running[pool.submit(contextvars.copy_context().run, worker, task, upstream, dry_run=dry_run)] = task_id
+                    future = pool.submit(contextvars.copy_context().run, worker, task, upstream, dry_run=dry_run)
+                    running[future], started[future] = task_id, time.monotonic()
 
             if not running:
                 if waiting:  # cannot happen for a validated DAG; never spin
@@ -489,8 +515,18 @@ def run_plan(
                     waiting.clear()
                 break
 
-            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            next_stop = min(started[future] + hard_stop for future in running)
+            done, _ = wait(running, timeout=max(0.0, next_stop - time.monotonic()), return_when=FIRST_COMPLETED)
+            for future in [f for f in running if f not in done and time.monotonic() >= started[f] + hard_stop]:
+                task_id = running.pop(future)
+                started.pop(future, None)
+                logger.warning("Worker %s still running after %.0f s; giving up on it.", task_id, hard_stop)
+                payload = {"status": "FAILED", "modified_entities": [], "diff_summary": HARD_STOP_TEXT}
+                if not dry_run:
+                    store.add_failure(f"worker:{task_id}", payload["diff_summary"])
+                finish(task_id, payload)
             for future in done:
+                started.pop(future, None)
                 task_id = running.pop(future)
                 try:
                     payload = future.result()
@@ -500,6 +536,9 @@ def run_plan(
                 if not dry_run and payload["status"] == "FAILED":   # a question is not a failure
                     store.add_failure(f"worker:{task_id}", payload["diff_summary"])
                 finish(task_id, payload)
+    finally:
+        # Never wait for a worker that was given up on (the old `with` block did, forever).
+        pool.shutdown(wait=False, cancel_futures=True)
 
     return results
 
@@ -562,9 +601,11 @@ def build_parts(tasks: list[dict[str, Any]], results: dict[str, dict[str, Any]],
         summary = plain_reply(payload.get("diff_summary", ""))
         proposed = any(entity.get("kind") == "approval" for entity in payload.get("modified_entities", []))
 
+        # A "?" inside a link (".../edit?usp=sharing") is not a question (audit M4).
+        asks = "?" in re.sub(r"https?://\S+", "", summary)
         if payload.get("not_started"):
             skipped["question" if payload["not_started"] == "question" else "failure"] = True
-        elif payload["status"] == NEEDS_INPUT or (payload["status"] == "SUCCESS" and not proposed and "?" in summary):
+        elif payload["status"] == NEEDS_INPUT or (payload["status"] == "SUCCESS" and not proposed and asks):
             # A worker that ended by asking something is asking, whatever status it wrote.
             parts.append(ReplyPart(QUESTION, named(task, summary) if summary else named(task, "What should I do here?")))
         elif payload["status"] == "FAILED":
@@ -720,21 +761,28 @@ def run_single_agent(
     from app.tasks.tracker import open_tasks_block
 
     instruction = f"Instruction from the owner:\n{text}"
-    for block in (context, format_memories(memories or []), notes_block(), open_tasks_block()):
+    lessons = lessons_prompt("owner", request_domains(text))
+    for block in (context, format_memories(memories or []), notes_block(), lessons, open_tasks_block()):
         if block:
             instruction += f"\n\n{block}"
 
-    result = create_agent_graph().invoke(
-        {
-            "messages": list(history or []) + [HumanMessage(content=instruction)],
-            "processed_message_ids": [],
-            "actions": [],
-            "pending_approvals": [],
-            "failures": [],
-            "dry_run": dry_run,
-        },
-        config={"recursion_limit": OWNER_RECURSION_LIMIT},
-    )
+    with observability.observation("owner_agent", as_type="agent", input={"instruction": text}) as span:
+        result = create_agent_graph().invoke(
+            {
+                "messages": list(history or []) + [HumanMessage(content=instruction)],
+                "processed_message_ids": [],
+                "actions": [],
+                "pending_approvals": [],
+                "failures": [],
+                "dry_run": dry_run,
+                # The owner's own words: whether they asked for a rule / routine (graph._steered_write).
+                "owner_text": text,
+            },
+            config={"recursion_limit": OWNER_RECURSION_LIMIT},
+        )
+        final = result.get("messages", [])
+        span.update(output=final[-1].text if final else "",
+                    metadata={"approvals": len(result.get("pending_approvals", [])), "actions": len(result.get("actions", []))})
     messages = result.get("messages", [])
     approval_ids = [approval["id"] for approval in result.get("pending_approvals", []) if "id" in approval]
     if not dry_run:
@@ -897,7 +945,12 @@ def handle_owner_request(
     """
 
     with clock.frozen(received_at):
-        return _handle_owner_request(text, dry_run=dry_run, history=history, store=store, context=context)
+        result = _handle_owner_request(text, dry_run=dry_run, history=history, store=store, context=context)
+    if not dry_run:
+        # Which instruction produced each card, so a Reject can be traced back to it (planned runs
+        # were stamped with their plan already; the first stamp wins).
+        remember_origin(result.approval_ids, mode="owner", request=text, run_id=result.run_id, store=store)
+    return result
 
 
 def _handle_owner_request(
@@ -908,22 +961,28 @@ def _handle_owner_request(
     skills = find_skills(text) if is_action_request(text) else []
 
     if not should_plan(text, skills):
+        observability.annotate_root(route="single_agent")
         return run_single_agent(text, history=history, dry_run=dry_run, memories=memories, context=context)
 
     try:
         plan = plan_request(text, history, memories, skills, context=context)
     except (PlanError, SkillError) as exc:
         logger.warning("Plan rejected (%s); running the single agent instead.", exc)
+        if not dry_run:
+            capture_run_failure("plan_invalid", request=text, detail=str(exc), store=store)
         plan = Plan([])
 
     if plan.question and not plan.tasks and not plan.skill:
+        observability.annotate_root(route="planner_question")
         # Nothing can start without an answer: ask first, do nothing.
         question = plain_reply(plan.question)
         return OwnerCommandResult(reply=question, parts=[ReplyPart(QUESTION, question)])
 
     if len(plan.tasks) <= 1 and not plan.skill:
+        observability.annotate_root(route="single_agent_after_plan")
         return run_single_agent(text, history=history, dry_run=dry_run, memories=memories, context=context)
 
+    observability.annotate_root(route="supervisor_workers", task_count=len(plan.tasks), skill=plan.skill or None)
     store.close_stale_supervisor_runs()
     run_id = store.start_supervisor_run(text)
     store.save_supervisor_plan(run_id, plan.tasks, skill=plan.skill)
@@ -948,6 +1007,15 @@ def _handle_owner_request(
     approval_ids = merge_same_emails(list(dict.fromkeys(approval_ids)), store) if not dry_run else approval_ids
     if not parts and not approval_ids:
         parts = [ReplyPart(ANSWER, "Done.")]  # never silent: no card and nothing to report
+
+    if not dry_run:
+        remember_origin(approval_ids, mode="owner", request=text, run_id=run_id, plan=plan.tasks, store=store)
+        by_id = {task["task_id"]: task for task in plan.tasks}
+        for task_id, payload in results.items():
+            summary = payload.get("diff_summary") or ""
+            if payload["status"] == "FAILED" and summary.startswith((TIMEOUT_TEXT, HARD_STOP_TEXT)):
+                capture_run_failure("worker_timeout", request=text, plan=[by_id.get(task_id, {"task_id": task_id})],
+                                    run_id=run_id, detail=summary, store=store)
 
     report = reply_text(parts)
     store.finish_supervisor_run(run_id, "dry_run" if dry_run else run_status, report)

@@ -10,6 +10,10 @@ single decision is not a rule). Memories come from the owner's own words:
    long-term memory; a SITUATIONAL note ("already talked to him", "I'm tired
    today") is kept for 24 hours only (app.memory.episodic).
 
+A standing rule is first checked against the active rules (app.memory.rule_engine). If it
+contradicts one, nothing is saved: the owner gets a rule_conflict card (Replace / Merge /
+Keep Both / Cancel).
+
 Gemini only restructures and classifies the owner's text; if it is unavailable,
 the note is stored as written (and classified by keywords). Context about the
 request comes from structured fields only (type, counterpart address, time, file
@@ -29,7 +33,8 @@ from pydantic import BaseModel, Field
 
 from app.agent.state import AgentStateStore
 from app.agent.untrusted import inline_untrusted
-from app.memory.semantic import SemanticMemory, memory_enabled
+from app.memory.rule_engine import check_conflict, conflict_proposal, describe_conflict, save_candidates
+from app.memory.semantic import memory_enabled
 
 
 logger = logging.getLogger(__name__)
@@ -170,13 +175,16 @@ def learn_from_owner_note(note: str, approval: dict[str, Any] | None = None, sto
         context = f"about approval #{approval['id']}" if approval else "told by the owner"
         tuples = [(counterpart(approval) if approval else "owner", note, context)]
 
-    memory = SemanticMemory(store)
     source = "owner_correction" if approval else "owner_note"
-    saved = []
-    for entity, preference, context in tuples:
-        memory_id, created = memory.upsert(entity, preference, context, source=source)
-        saved.append({"id": memory_id, "entity": entity, "preference": preference, "created": created})
-    return saved
+    conflict = check_conflict(tuples, store)
+    if conflict:
+        # Nothing is saved until the owner picks Replace / Merge / Keep Both / Cancel on the card.
+        proposal = conflict_proposal(note, tuples, conflict, source)
+        proposal.pop("type")
+        approval_id = (store or AgentStateStore()).add_pending_approval("rule_conflict", describe_conflict(proposal), proposal)
+        return [{"conflict_approval_id": approval_id, "preference": proposal["new_text"], "created": False,
+                 "existing": conflict["existing_text"]}]
+    return save_candidates(tuples, source, store)
 
 
 # ----- owner rules from chat (remember_rule): standing policy or situational note --------
@@ -278,11 +286,12 @@ def promote_owner_rule(note: str, approval: dict[str, Any] | None = None, store:
         context = f"about approval #{approval['id']}" if approval else "told by the owner"
         tuples = [(entity, note, context)]
 
-    memory = SemanticMemory(store)
-    saved = []
-    for item_entity, preference, context in tuples:
-        memory_id, created = memory.upsert(item_entity, preference, context, source="owner_rule")
-        saved.append({"id": memory_id, "entity": item_entity, "preference": preference, "created": created})
+    conflict = check_conflict(tuples, store)
+    if conflict:
+        # Not saved: the caller turns this into a rule_conflict card for the owner.
+        return {"kind": STANDING_POLICY, "summary": summary, "conflict": conflict_proposal(note, tuples, conflict, "owner_rule")}
+
+    saved = save_candidates(tuples, "owner_rule", store)
     summary = "; ".join(
         item["preference"] + ("" if item["entity"].lower() == "owner" else f" ({item['entity']})") for item in saved
     )

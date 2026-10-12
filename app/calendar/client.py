@@ -1,11 +1,10 @@
 from pathlib import Path
-import os
 
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-from app.google_api import build_authorized_http, credentials_locked, refresh_credentials
+from app.google_api import LOGIN_COMMAND, browser_login_allowed, build_authorized_http
+from app.google_auth import load_credentials
 
 
 SCOPES = [
@@ -20,43 +19,25 @@ TOKEN_PATH = PROJECT_ROOT / "calendar_token.json"
 CREDENTIALS_PATH = PROJECT_ROOT / "credentials.json"
 
 
-@credentials_locked
+def get_calendar_credentials(allow_browser_login: bool | None = None) -> Credentials:
+    """
+    Calendar credentials from calendar_token.json (refreshed when expired). A browser
+    sign-in only opens from an interactive command, never in the Telegram bot: there a
+    missing or refused sign-in raises GoogleSignInRequired (audit H4).
+    """
+
+    allowed = browser_login_allowed() if allow_browser_login is None else allow_browser_login
+    return load_credentials(TOKEN_PATH, SCOPES, allow_browser_login=allowed, login_command=LOGIN_COMMAND)
+
+
 def get_calendar_service():
     """
     Authenticate with Google Calendar and return the API service.
     """
 
-    credentials = None
-
-    if TOKEN_PATH.exists():
-        credentials = Credentials.from_authorized_user_file(
-            TOKEN_PATH,
-            SCOPES,
-        )
-
-    if not credentials or not credentials.valid:
-
-        if credentials and credentials.expired and credentials.refresh_token:
-            refresh_credentials(credentials)
-
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                CREDENTIALS_PATH,
-                SCOPES,
-            )
-
-            credentials = flow.run_local_server(
-                port=0
-            )
-
-        TOKEN_PATH.write_text(
-            credentials.to_json(),
-            encoding="utf-8",
-        )
-
     return build(
         "calendar",
         "v3",
-        http=build_authorized_http(credentials),
+        http=build_authorized_http(get_calendar_credentials()),
         cache_discovery=False,
     )

@@ -24,6 +24,7 @@ Warnings and full error details are also written to logs/agent.log.
 import argparse
 import sys
 
+from app import observability
 from app.agent.approvals import approve, describe, reject, to_draft
 from app.agent.followups import complete_followup_task
 from app.agent.runner import DEFAULT_QUERY, handle_owner_command, process_inbox
@@ -126,6 +127,11 @@ def _memory_command(args) -> int:
     memory = SemanticMemory()
     if args.remember:
         for item in learn_from_owner_note(args.remember):
+            if item.get("conflict_approval_id"):
+                number = item["conflict_approval_id"]
+                print(f"Not saved: it conflicts with your rule \"{item['existing']}\".\n"
+                      f"Decide on the Telegram card, or --approve {number} (replace the old rule) / --reject {number} (keep things as they are).")
+                continue
             print(f"{'Noted' if item['created'] else 'Updated'} [{item['id']}]: {item['entity']}: {item['preference']}")
         return 0
     if args.forget is not None:
@@ -141,6 +147,13 @@ def _memory_command(args) -> int:
 
 
 def main(argv=None) -> int:
+    try:
+        return _main(argv)
+    finally:
+        observability.flush()  # a CLI run is short: send its traces before the process exits
+
+
+def _main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Socio - autonomous email and calendar agent")
     parser.add_argument("--query", default=DEFAULT_QUERY, help=f"Gmail search query (default: {DEFAULT_QUERY!r})")
     parser.add_argument("--max", type=int, default=10, help="Maximum number of messages to list")
@@ -184,6 +197,14 @@ def main(argv=None) -> int:
         from app.drive.client import get_drive_service
         from app.files.drive import folder_limited, list_drive_documents
         from app.files.local import ALLOWED_EXTENSIONS
+        from app.calendar.client import get_calendar_credentials
+        from app.gmail.auth import get_gmail_credentials
+
+        # The bot's "Google Sign-In Needed" card points here: one command renews every token.
+        # A saved sign-in that still works is reused; an expired or missing one opens the browser.
+        get_gmail_credentials(allow_browser_login=True)
+        get_calendar_credentials(allow_browser_login=True)
+        print("Gmail and Google Calendar connected.")
 
         service = get_drive_service(allow_browser_login=True)
         user = service.about().get(fields="user(displayName, emailAddress)").execute()["user"]

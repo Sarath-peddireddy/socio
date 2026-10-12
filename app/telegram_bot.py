@@ -14,9 +14,14 @@ Telegram front end for Socio.
   also get Edit in Gmail, which saves them as a Gmail draft instead). When an
   instruction only produced approval requests, the cards are all that is sent.
 - Reject / Edit in Gmail end quietly: the card is updated in place and nothing
-  else is sent. Nothing is learned from a tap; rules come only from the owner
+  else is sent (a rejected proposal's card ends with an optional "reply to this
+  card" line). Nothing is learned from a tap; rules come only from the owner
   asking ("remember: never book calls before noon", the remember_rule tool) or
-  /remember.
+  /remember. A rule that contradicts an existing one becomes a Rule Conflict card
+  (Replace / Merge / Keep Both / Cancel). A Telegram reply to a rejected card that says what
+  was wrong is kept as a lesson for next time (app.agent.eval_feedback; /forget_lesson).
+- Once a day (and at startup) records past their retention period are deleted
+  (app.retention_manager), then the WAL is checkpointed.
 - Owner-facing text never shows internal numbers (approval, message, task ids).
 - The follow-up context (last few exchanges) includes what each card proposed
   and how the owner decided, so "create a task for this" refers to it. It is
@@ -46,7 +51,10 @@ from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
-from app.agent.approvals import STATUS_WORDS, approve, describe, fill_reply, reject, reply_gaps, to_draft
+from app import observability
+from app.agent import clock
+from app.agent.approvals import STATUS_WORDS, approve, decide_rule_conflict, describe, fill_reply, reject, reply_gaps, to_draft
+from app.agent.eval_feedback import correctable_case, forget_lesson, is_proposal, list_lessons, read_correction, record_correction
 from app.agent.gap_fill import fill_gaps
 from app.agent.llm import LLMUnavailableError
 from app.agent.runner import (
@@ -76,6 +84,7 @@ from app.memory.context_anchor import (
 from app.memory.context_assembler import archive_history, load_history, note_on_last_turn, save_turn
 from app.memory.learning import learn_from_owner_note
 from app.memory.semantic import SemanticMemory, memory_enabled
+from app.retention_manager import purge_expired_records
 from app.scheduler.jobs import describe_schedule, next_run_text
 from app.scheduler.service import TICK_SECONDS, RoutineRun, run_due_jobs
 from app.tasks.tracker import check_tasks
@@ -105,6 +114,11 @@ logger = logging.getLogger("telegram_bot")
 HELP_TEXT = WELCOME_HTML
 
 REJECTED_TEXT = "❌ Proposal rejected. No changes were made."
+# A reply to a rejected proposal card that says what was wrong (app.agent.eval_feedback).
+CORRECTION_HINT = "<i>If you like, reply to this card to tell me what to do differently next time.</i>"
+CORRECTION_SAVED = "📝 Got it. Next time I'll keep this in mind:\n<i>{lesson}</i>"
+# Rule conflict card buttons -> app.agent.approvals.decide_rule_conflict choice.
+RULE_CHOICES = {"rule_replace": "replace", "rule_merge": "merge", "rule_both": "both"}
 KEPT_OPEN_TEXT = "👍 Okay, I'll leave it open."
 KEPT_ALL_TEXT = "👍 Okay, I'll leave them as they are."
 DRAFTED_TEXT = "✏️ Saved to Gmail Drafts. Nothing was sent."
@@ -143,6 +157,10 @@ def already_text(approval: dict) -> str:
     return f"This was already {STATUS_WORDS.get(approval['status'], 'handled')}."
 
 
+# A message read this long after it was sent is anchored to the real time (sent_at).
+BACKLOG_MINUTES = 10
+# A card Telegram refused is sent again cut to this many characters (emoji count double there).
+SHORT_CARD_CHARS = 1500
 # A card update lost to a network drop is retried on this many polls before giving up.
 MAX_EDIT_TRIES = 5
 # Database maintenance (WAL checkpoint): at startup, then once a day.
@@ -182,12 +200,32 @@ def _clip(text: str) -> str:
 
 
 def sent_at(message: dict) -> datetime | None:
-    """When the owner sent a Telegram message (its own Unix timestamp), in IST."""
+    """
+    When the owner sent a Telegram message (its own Unix timestamp), in IST; None (= the real
+    time) for a message read long after it was sent, e.g. queued while the bot was off: "in 2
+    hours" or "today" must not resolve to a time that has already passed (audit M10).
+    """
+
+    from datetime import timedelta
 
     try:
-        return datetime.fromtimestamp(int(message["date"]), tz=timezone.utc).astimezone(INDIA_TZ)
+        moment = datetime.fromtimestamp(int(message["date"]), tz=timezone.utc).astimezone(INDIA_TZ)
     except (KeyError, TypeError, ValueError, OverflowError, OSError):
         return None
+    if _now() - moment > timedelta(minutes=BACKLOG_MINUTES):
+        return None
+    return moment
+
+
+def _now() -> datetime:
+    return datetime.now(INDIA_TZ)
+
+
+def _trace_metadata(message: dict) -> dict:
+    """The frozen ingress time and the dates every prompt of this request will use (app.agent.clock)."""
+
+    at = sent_at(message) or datetime.now(INDIA_TZ)
+    return {"ingress_utc": at.astimezone(timezone.utc).isoformat(), "temporal_anchor": clock.temporal_context(at)}
 
 
 class Bot:
@@ -209,6 +247,9 @@ class Bot:
         self.last_gap_card: int | None = None
         # Question messages opened by 💬 Answer -> the card they belong to.
         self.answer_prompts: dict[int, int] = {}
+        # The "Google Sign-In Needed" card was sent for the current outage: scheduled checks then
+        # stay quiet until a check succeeds again (audit H4: it was resent every 10 minutes).
+        self.signin_notice_sent = False
 
     @property
     def history(self) -> list:
@@ -230,14 +271,17 @@ class Bot:
 
         params = {**params, "text": clip_html(scrub(params["text"])), "parse_mode": "HTML"}
         try:
-            return self.api.call(method, **params)
+            sent = self.api.call(method, **params)
         except TelegramError as exc:
             if "parse entities" not in str(exc).lower():
                 raise
             logger.warning("Telegram rejected the HTML of a %s (%s); sending it as plain text.", method, exc)
             params.pop("parse_mode")
             params["text"] = _clip(strip_html(params["text"]))
-            return self.api.call(method, **params)
+            sent = self.api.call(method, **params)
+        if method == "sendMessage":
+            observability.record_reply(params["text"])  # the trace's output: what the owner got
+        return sent
 
     def send(self, text: str, buttons: list | None = None):
         """Send HTML text (callers escape dynamic values with esc / md_to_html)."""
@@ -257,13 +301,37 @@ class Bot:
         )
         for approval in approvals:
             text, buttons = approval_card(approval)
-            sent = self.send(text, buttons)
+            sent = self._send_card(approval, text, buttons)
             card_message = sent.get("message_id") if isinstance(sent, dict) else None
             self.store.mark_approval_notified(approval["id"], card_message)
             # The newest card decides what a plain next message may answer (see _gap_card_for).
-            self.last_gap_card = approval["id"] if reply_gaps(approval) else None
+            self.last_gap_card = approval["id"] if reply_gaps(approval) and card_message else None
 
         return len(approvals)
+
+    def _send_card(self, approval: dict, text: str, buttons: list) -> dict | None:
+        """
+        One card, never blocking the others (audit M8): if Telegram refuses it (too long, a
+        character it can't take...), it goes again shortened, then as its title with the
+        buttons. If even that is refused, the owner is told once and the card is not retried
+        every poll. A network error still propagates: nothing is marked, the next poll retries.
+        """
+
+        attempts = [text, clip_html(text, SHORT_CARD_CHARS) + "\n<i>(Shortened to fit Telegram.)</i>",
+                    text.split("\n", 1)[0] + "\n<i>(The details couldn't be shown here.)</i>"]
+        last_error: Exception | None = None
+        for attempt in attempts:
+            try:
+                return self.send(attempt, buttons)
+            except TelegramError as exc:
+                last_error = exc
+                logger.warning("Telegram refused an approval card (%s); trying a shorter version.", exc)
+        report_failure(last_error, "telegram.card", approval_id=approval["id"], type=approval.get("type"))
+        self._report_error(
+            "⚠️ <b>A request couldn't be shown here</b>\nNothing was done with it. "
+            "See it with <code>python -m app.main --status</code> on the computer running Socio."
+        )
+        return None
 
     # ----- inbox -----------------------------------------------------------------
 
@@ -330,13 +398,15 @@ class Bot:
                 self._answer(query, strip_html(text))
                 self._report_error(text)
             return
-        if action not in {"approve", "draft", "reject", "rule", "recheck", "answer"} or not raw_id.isdigit():
+        if action not in {"approve", "draft", "reject", "rule", "recheck", "answer", *RULE_CHOICES} or not raw_id.isdigit():
             self._answer(query, "Unknown button.")
             return
 
         try:
             if action == "rule":  # cards sent before the button was removed
                 self._answer(query, OLD_RULE_BUTTON_TEXT)
+            elif action in RULE_CHOICES:
+                self._decide_rule(RULE_CHOICES[action], int(raw_id), query)
             elif action == "answer":
                 self._ask_for_answer(int(raw_id), query)
             elif action == "recheck":
@@ -451,8 +521,12 @@ class Bot:
             status_line = KEPT_OPEN_TEXT
         elif action == "reject" and outcome["ok"] and decided and decided["type"] == "close_old_reminders":
             status_line = KEPT_ALL_TEXT
+        elif action == "reject" and outcome["ok"] and decided and decided["type"] == "rule_conflict":
+            status_line = f"❌ {esc(outcome['message'])}"
         elif action == "reject" and outcome["ok"]:
-            status_line = REJECTED_TEXT
+            # Still no follow-up message; a proposal's card invites an optional correction
+            # (developer approved the hint line 2026-10-12), read by _answer_correction.
+            status_line = REJECTED_TEXT + (f"\n{CORRECTION_HINT}" if decided and is_proposal(decided) else "")
         elif action == "draft" and outcome["ok"]:
             extra = " Attach the files there yourself." if "Attach the files" in outcome["message"] else ""
             status_line = DRAFTED_TEXT + extra
@@ -468,6 +542,22 @@ class Bot:
             self.decisions.append(f"The owner {DECISION_WORDS[action]}: {describe(approval)}")
             if action != "reject":
                 update_context_anchor(self.owner_chat_id, entities_from_approval(approval), self.store)
+
+    def _decide_rule(self, choice: str, approval_id: int, query: dict) -> None:
+        """Replace / Merge / Keep Both on a rule conflict card (Cancel is the usual reject)."""
+
+        current = self.store.get_approval(approval_id)
+        if current and current["status"] != "open":
+            self._answer(query, already_text(current))
+            return
+        self._answer(query, "Saving your rules…")
+        outcome = decide_rule_conflict(approval_id, choice, self.store)
+        if outcome.get("duplicate"):
+            return
+        approval = self.store.get_approval(approval_id)
+        original = card_text(approval) if approval else esc(query.get("message", {}).get("text", ""))
+        mark = "✅" if outcome["ok"] else "⚠️"
+        self._edit_card(query, f"{original}\n\n{mark} {esc(outcome['message'])}")
 
     @staticmethod
     def _stale_card(approval: dict, message: str | None = None) -> tuple[str, list | None]:
@@ -497,7 +587,10 @@ class Bot:
         """Re-check on a stale card: read the conversation again and propose afresh."""
 
         approval = self.store.get_approval(approval_id)
-        if not approval or approval["status"] != "stale":
+        if not approval:  # removed by the retention purge (decided more than 30 days ago)
+            self._answer(query, "This is too old to re-check. Ask me again if you still need it.")
+            return
+        if approval["status"] != "stale":
             self._answer(query, "This was already re-checked.")
             return
 
@@ -546,8 +639,23 @@ class Bot:
             self.send("Please send a text message.")
             return
 
+        # One Langfuse trace per owner message, from receipt to the last message sent
+        # (session = this chat, so a conversation's turns are grouped).
+        with observability.interaction(
+            "telegram_interaction",
+            session_id=str(chat_id),
+            user_id=str((message.get("from") or {}).get("id") or chat_id),
+            tags=["telegram"],
+            input={"text": text},
+            metadata=_trace_metadata(message),
+        ):
+            self._dispatch(message, text)
+
+    def _dispatch(self, message: dict, text: str) -> None:
         command = text.split()[0].split("@")[0].lower()
         argument = text[len(text.split()[0]):].strip()
+        if text.startswith("/"):
+            observability.annotate_root(intent=f"command {command}")
 
         if command in {"/start", "/help"} or is_capability_question(text):
             self.send(HELP_TEXT)
@@ -578,6 +686,9 @@ class Bot:
         elif command == "/forget":
             ok = argument.isdigit() and SemanticMemory(self.store).forget(int(argument))
             self.send(f"Forgot memory {esc(argument)}." if ok else "Usage: <code>/forget ID</code> (see /memories).")
+        elif command == "/forget_lesson":
+            ok = argument.isdigit() and forget_lesson(int(argument), self.store)
+            self.send(f"Forgot lesson {esc(argument)}." if ok else "Usage: <code>/forget_lesson ID</code> (see /memories).")
         elif command == "/skills":
             self.send(self._skills_text())
         elif command in {"/schedules", "/routines"}:
@@ -591,10 +702,15 @@ class Bot:
                 ok = False
             self.send(f"Archived skill <b>{esc(argument)}</b> (skills/.archive)." if ok else "Usage: <code>/forget_skill NAME</code> (see /skills).")
         elif not text.startswith("/") and self._answer_gap(message, text):
+            observability.annotate_root(intent="gap_answer")
             pass  # it answered a reply card's question: the filled-in card was sent
+        elif not text.startswith("/") and self._answer_correction(message, text):
+            observability.annotate_root(intent="correction")
         elif is_acknowledgement(text, self._last_reply()):
+            observability.annotate_root(intent="acknowledgement")
             self._react(message)
         else:
+            observability.annotate_root(intent="instruction")
             self._run_instruction(text, sent_at(message))
 
     def _ask_for_answer(self, approval_id: int, query: dict) -> None:
@@ -663,6 +779,34 @@ class Bot:
                 f"{card_text(old)}\n\n✏️ <i>Filled in with your answer. The updated reply is below.</i>",
             )
         self.notify_approvals()
+        return True
+
+    def _answer_correction(self, message: dict, text: str) -> bool:
+        """
+        A Telegram reply to a rejected (or stale) proposal card: if it says what was wrong, keep
+        it as a lesson (app.agent.eval_feedback). False when it isn't a correction (a new
+        instruction such as "send it to Bob instead"): it is then handled as usual.
+        """
+
+        replied_to = (message.get("reply_to_message") or {}).get("message_id")
+        approval = self.store.approval_for_card(replied_to) if replied_to else None
+        if not approval or approval["status"] not in {"rejected", "stale"}:
+            return False
+        case = correctable_case(approval["id"], self.store)
+        if not case:
+            return False
+        try:
+            correction = read_correction(case, text)
+        except Exception as exc:
+            # Unread, so not stored; the message goes on as an instruction (which reports any outage).
+            report_failure(exc, "telegram.correction", approval_id=approval["id"])
+            return False
+        if not correction.is_correction:
+            return False
+        if record_correction(case["case_id"], text, correction.lesson, self.store):
+            self.send(CORRECTION_SAVED.format(lesson=esc(correction.lesson)))
+        else:
+            self.send("I already have your correction for that one.")
         return True
 
     def _last_reply(self) -> str:
@@ -757,7 +901,16 @@ class Bot:
             self.api.call("sendChatAction", chat_id=self.owner_chat_id, action="typing")
         except Exception as exc:  # only the "typing…" hint; the routine still runs
             logger.warning("Could not show typing for a routine: %s", exc)
-        return handle_owner_command(job["prompt_query"])
+        with observability.interaction(
+            "scheduled_routine",
+            session_id=str(self.owner_chat_id),
+            tags=["routine"],
+            input={"routine": job.get("title"), "prompt": job["prompt_query"]},
+            metadata={"temporal_anchor": clock.temporal_context()},
+        ) as trace:
+            result = handle_owner_command(job["prompt_query"])
+            trace.update(output={"reply": result.reply, "approval_cards": len(result.approval_ids)})
+            return result
 
     def _deliver_routine(self, outcome: RoutineRun) -> None:
         job, header = outcome.job, routine_header(outcome.job["title"])
@@ -802,6 +955,9 @@ class Bot:
             self.send("Memory is turned off (AGENT_MEMORY=0).")
             return
         saved = learn_from_owner_note(text, approval, store=self.store)
+        if any(item.get("conflict_approval_id") for item in saved):
+            self.notify_approvals()  # the rule conflict card: nothing was saved yet
+            return
         lines = [f"🧠 {'Noted' if item['created'] else 'Updated'}: {esc(item['preference'])}" for item in saved]
         self.send("\n".join(lines) or "Nothing to remember.")
 
@@ -825,7 +981,8 @@ class Bot:
     def _memories_text(self) -> str:
         memories = SemanticMemory(self.store).all(limit=20)
         notes = active_notes(self.store)
-        if not memories and not notes:
+        lessons = list_lessons(self.store, limit=10)
+        if not memories and not notes and not lessons:
             return "I haven't learned any rules yet. Just tell me one, e.g. \"remember: never book calls before noon\"."
         lines = []
         if memories:
@@ -838,6 +995,10 @@ class Bot:
         if notes:
             lines.append("🕒 <b>For today only:</b>")
             lines += [f"• {esc(n['note'])}" for n in notes]
+        if lessons:
+            lines.append("📝 <b>Lessons from your corrections:</b>")
+            lines += [f"{lesson['case_id']}. {esc(lesson['lesson'])}" for lesson in lessons]
+            lines.append("<i>To remove one, send /forget_lesson and its number.</i>")
         return "\n".join(lines)
 
     def _skills_text(self) -> str:
@@ -908,13 +1069,22 @@ class Bot:
 
             if self.poll_seconds and time.monotonic() >= self.next_inbox_run:
                 self.next_inbox_run = time.monotonic() + self.poll_seconds
+                from app.errors import classify
+
                 try:
                     self.run_inbox()
+                    self.signin_notice_sent = False  # signed in again: a later expiry is reported anew
                 except (LLMUnavailableError, GoogleApiUnavailableError) as exc:
                     # An outage during a scheduled check stays quiet; the next check retries.
                     report_failure(exc, "telegram.scheduled_inbox")
                 except Exception as exc:
-                    self._report_error(report_failure(exc, "telegram.scheduled_inbox", html=True))
+                    card = report_failure(exc, "telegram.scheduled_inbox", html=True)
+                    if classify(exc) != "google_signin":
+                        self._report_error(card)
+                    elif not self.signin_notice_sent:
+                        # Once per outage: retrying cannot fix it, only signing in again does.
+                        self.signin_notice_sent = True
+                        self._report_error(card)
 
             if self.poll_seconds and time.monotonic() >= self.next_task_check:
                 self.next_task_check = time.monotonic() + self.poll_seconds
@@ -934,8 +1104,16 @@ class Bot:
             self.maintain_database()
 
     def maintain_database(self) -> None:
-        """Fold the SQLite WAL file back into the database (quiet; failures only logged)."""
+        """
+        Delete records past their retention period (app.retention_manager), then fold the SQLite
+        WAL file back into the database. Quiet; failures are only logged.
+        """
 
+        try:
+            result = purge_expired_records(self.store, checkpoint=False)
+            logger.info("Retention purge: %s", {k: v for k, v in result["deleted"].items() if v} or "nothing old")
+        except Exception as exc:
+            report_failure(exc, "telegram.db_maintenance")
         try:
             result = self.store.checkpoint()
             logger.info("Database checkpoint: %s", result)
@@ -957,6 +1135,9 @@ class Bot:
             self.set_command_menu()
             self.send("🤖 <b>Socio is online.</b> Send /help for commands.")
 
+        # Langfuse keys: rejected -> tracing off with one warning; unreachable -> carry on.
+        observability.check_connection_in_background()
+
         # Load the local embedding model in the background so the first recall is fast.
         if memory_enabled():
             threading.Thread(target=lambda: getattr(get_embedder(), "warm_up", lambda: None)(), daemon=True).start()
@@ -973,10 +1154,15 @@ class Bot:
 
 
 def main() -> int:
+    from app.google_api import disable_browser_login
+
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     setup_logging()
+    # Background process: a missing / expired Google sign-in raises (and the owner is told to
+    # run --google-login) instead of opening a browser nobody watches (audit H4).
+    disable_browser_login()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -995,6 +1181,8 @@ def main() -> int:
         Bot(TelegramAPI(token), owner_chat_id, poll_minutes).run_forever()
     except KeyboardInterrupt:
         print("Stopped.")
+    finally:
+        observability.shutdown()  # send the last traces (bounded by the exporter's timeout)
     return 0
 
 

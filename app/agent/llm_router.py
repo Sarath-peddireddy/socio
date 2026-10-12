@@ -22,12 +22,16 @@ import socket
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import httpx
 from dotenv import load_dotenv
 from langchain_core.rate_limiters import BaseRateLimiter
+
+from app import observability
 
 
 load_dotenv()
@@ -59,6 +63,7 @@ COOLDOWN_SECONDS = {
     "network": 10,
     "too_large": 0,
     "bad_tool_call": 0,
+    "bad_output": 0,
 }
 
 FAILOVER_REASONS = {
@@ -69,11 +74,43 @@ FAILOVER_REASONS = {
     "rejected": "Key or model rejected",
     "too_large": "Request too large",
     "bad_tool_call": "Malformed tool call",
+    "bad_output": "Unreadable answer",
 }
 
 
 class LLMUnavailableError(RuntimeError):
     """Raised when no model can be used right now (quota exhausted or unreachable)."""
+
+
+class UnreadableAnswer(ValueError):
+    """A provider answered, but not in the structured form asked for (None from the parser)."""
+
+
+class DeadlineExceeded(LLMUnavailableError):
+    """The caller's time budget (deadline()) ran out before a model could answer."""
+
+
+# The caller's wall-clock budget as a time.monotonic() value (a supervisor worker's 180 s).
+# route() starts no attempt and no wait past it, so a network outage cannot hold a worker
+# for many minutes of failovers and cool-down sleeps (audit H3). A call already sent keeps
+# its own 60 s timeout.
+_DEADLINE: ContextVar[float | None] = ContextVar("socio_llm_deadline", default=None)
+
+
+@contextmanager
+def deadline(at: float | None) -> Iterator[None]:
+    """Model calls inside the block give up at `at` (time.monotonic()); None = no budget."""
+
+    token = _DEADLINE.set(at)
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)
+
+
+def _time_left() -> float | None:
+    at = _DEADLINE.get()
+    return None if at is None else at - time.monotonic()
 
 
 class SlidingWindowRateLimiter(BaseRateLimiter):
@@ -257,7 +294,7 @@ def failure_kind(exc: BaseException) -> str | None:
     """Why a provider failed in a way another provider can fix, or None (a real error)."""
 
     from google.api_core import exceptions as api_core
-    from langchain_core.exceptions import ModelConnectionError, ModelRateLimitError, ModelTimeoutError
+    from langchain_core.exceptions import ModelConnectionError, ModelRateLimitError, ModelTimeoutError, OutputParserException
 
     try:
         import groq
@@ -285,6 +322,10 @@ def failure_kind(exc: BaseException) -> str | None:
         return "rejected"
     if 400 in statuses and "tool_use_failed" in text:
         return "bad_tool_call"
+    # An answer the structured parser could not read: another provider may well answer it
+    # (audit M7). A 422 / 400 is not: it means our request is wrong and must surface (test A8).
+    if any(isinstance(error, (OutputParserException, UnreadableAnswer)) for error in errors):
+        return "bad_output"
     if any(isinstance(error, (httpx.TransportError, TimeoutError, ConnectionError, socket.gaierror, ModelConnectionError, ModelTimeoutError, *groq_network)) for error in errors):
         return "network"
     return None
@@ -346,6 +387,8 @@ class RoutedModel:
     role: str
     chain: list[Provider]
     transforms: list[Callable[[Any], Any]] = field(default_factory=list)
+    # with_structured_output: an empty (None) answer is unreadable, so the next provider is tried.
+    structured: bool = False
     _runnables: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
@@ -357,19 +400,21 @@ class RoutedModel:
             self._runnables[provider.name] = runnable
 
     def _with(self, transform: Callable[[Any], Any]) -> "RoutedModel":
-        return RoutedModel(self.role, self.chain, [*self.transforms, transform])
+        return RoutedModel(self.role, self.chain, [*self.transforms, transform], self.structured)
 
     def bind_tools(self, tools, **kwargs) -> "RoutedModel":
         return self._with(lambda model: model.bind_tools(tools, **kwargs))
 
     def with_structured_output(self, schema, **kwargs) -> "RoutedModel":
-        return self._with(lambda model: model.with_structured_output(schema, **kwargs))
+        routed = self._with(lambda model: model.with_structured_output(schema, **kwargs))
+        return RoutedModel(routed.role, routed.chain, routed.transforms, True)
 
     def runnable_for(self, provider: Provider):
         return self._runnables[provider.name]
 
     def invoke(self, model_input, config=None, **kwargs):
-        return route(self.chain, self.runnable_for, model_input, role=self.role, config=config, **kwargs)
+        return route(self.chain, self.runnable_for, model_input, role=self.role, config=config,
+                     reject_none=self.structured, **kwargs)
 
 
 def _next_available(chain: list[Provider], after: int, skipped: set[str], now: float) -> Provider | None:
@@ -388,7 +433,8 @@ def _label(role: str, provider: Provider, *, lead: bool) -> str:
     return f"{role.capitalize()} {priority}" if lead else priority
 
 
-def route(chain: list[Provider], runnable_for: Callable[[Provider], Any], model_input, *, role: str = "", **kwargs):
+def route(chain: list[Provider], runnable_for: Callable[[Provider], Any], model_input, *, role: str = "",
+          reject_none: bool = False, **kwargs):
     """
     Invoke the first provider that answers.
 
@@ -399,22 +445,54 @@ def route(chain: list[Provider], runnable_for: Callable[[Provider], Any], model_
 
     skipped: set[str] = set()     # failed for this request only
     last_kind = ""
+    # Each attempt is its own Langfuse generation (a failed one is ERROR); the metadata
+    # links a failover attempt to the provider it replaced.
+    traced = role in CHAINS
+    config = kwargs.pop("config", None)
+    attempt = 0
+    failed_over_from: tuple[str, str] | None = None
 
     for _round in range(RATE_LIMIT_MAX_WAITS + 1):
         for index, provider in enumerate(chain):
             if provider.name in skipped or _cooling(provider, time.monotonic()):
                 continue
+            left = _time_left()
+            if left is not None and left <= 0:
+                raise DeadlineExceeded("The time budget ran out before an AI model answered.")
+            attempt += 1
+            call_kwargs = dict(kwargs)
+            if traced:
+                call_kwargs["config"] = observability.llm_config(config, run_name=f"{role}_llm", metadata={
+                    "router_role": role,
+                    "provider": provider.name,
+                    "priority": CHAINS[role].index(provider) + 1 if provider in CHAINS[role] else None,
+                    "attempt": attempt,
+                    **({"failover_from": failed_over_from[0], "failover_reason": failed_over_from[1]} if failed_over_from else {}),
+                })
+            elif config is not None:
+                call_kwargs["config"] = config
             try:
-                return runnable_for(provider).invoke(model_input, **kwargs)
+                answer = runnable_for(provider).invoke(model_input, **call_kwargs)
+                if reject_none and answer is None:
+                    raise UnreadableAnswer(f"{provider.name} returned no structured answer.")
+                return answer
             except Exception as exc:
                 kind = failure_kind(exc)
                 if kind is None:
                     raise
                 last_kind = kind
+                failed_over_from = (provider.name, FAILOVER_REASONS[kind])
                 _cool_down(provider, kind, exc)
                 if COOLDOWN_SECONDS.get(kind) == 0:
                     skipped.add(provider.name)
                 successor = _next_available(chain, index, skipped, time.monotonic())
+                if traced:
+                    observability.current_event(
+                        "model_failover", level="WARNING",
+                        status_message=f"{FAILOVER_REASONS[kind]} on {provider.name}",
+                        metadata={"router_role": role, "from": provider.name, "to": successor.name if successor else None,
+                                  "reason": kind, "status": observability.error_text(exc)},
+                    )
                 # Message only: no stack trace, no provider error text (agent.log stays readable).
                 if successor is not None:
                     logger.warning("⚠️ [ModelRouter] %s on %s. Seamlessly failing over to %s.",
@@ -444,10 +522,19 @@ def route(chain: list[Provider], runnable_for: Callable[[Provider], Any], model_
             if "daily" in kinds and set(kinds) <= {"daily", "rejected"}:
                 raise LLMUnavailableError("AI daily quota exhausted on every configured provider.")
             break
+        left = _time_left()
+        if _round < RATE_LIMIT_MAX_WAITS and wait > 0 and left is not None and wait >= left:
+            raise DeadlineExceeded("The time budget ran out while every AI provider was busy.")
         if _round < RATE_LIMIT_MAX_WAITS and wait > 0:
             logger.warning("[ModelRouter] Every provider is busy; waiting %.0fs.", wait)
             time.sleep(wait)
 
+    if traced:
+        observability.current_event("model_router_exhausted", level="ERROR",
+                                    status_message=f"No provider could answer (last: {last_kind or 'all cooling down'})",
+                                    metadata={"router_role": role, "attempts": attempt})
+    if reject_none and last_kind == "bad_output":
+        return None  # nobody gave a readable answer: callers handle None as they always did
     if last_kind == "network":
         raise LLMUnavailableError("Could not reach any AI provider.")
     raise LLMUnavailableError("No AI provider could answer (rate limits or outages persisted).")

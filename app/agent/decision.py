@@ -178,7 +178,8 @@ def decide_reply_needed(thread: list[dict]) -> ReplyDecision:
 
     for index, email in enumerate(thread, start=1):
         sent_by_owner = " [sent by the owner]" if "SENT" in email.get("label_ids", []) else ""
-        conversation.append(f"--- Message {index}{sent_by_owner}\n{wrap_untrusted_email(email)}")
+        # Same body cap as the agent's own prompt (runner.MAX_BODY_CHARS; audit M6).
+        conversation.append(f"--- Message {index}{sent_by_owner}\n{wrap_untrusted_email(email, max_chars=4000)}")
 
     conversation_text = "\n".join(conversation)
 

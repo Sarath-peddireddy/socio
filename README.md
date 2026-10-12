@@ -93,7 +93,8 @@ eye on your open tasks and offers to close them, so you don't have to:
 
 - **Only when you say so.** Approving, rejecting, or editing a request
   teaches Socio nothing by itself; a rejection just ends quietly ("❌ Proposal
-  rejected. No changes were made."). To add a rule, tell Socio in chat
+  rejected. No changes were made.", with a note that you may reply to the card
+  to say what to do differently). To add a rule, tell Socio in chat
   ("remember: I never take calls before noon", "make it a rule to ask me
   before ..."): a lasting rule is saved and recalled whenever it's relevant; a
   one-off note ("I'm busy today") is kept for 24 hours only. Rules are never
@@ -101,6 +102,20 @@ eye on your open tasks and offers to close them, so you don't have to:
   Teach it directly with `/remember`, see what it knows with `/memories`, and
   remove something with `/forget`. Memories are stored on your machine and
   embedded with a small local model, so they never leave it.
+- **Contradicting rules.** Before a new rule is saved it's compared with your
+  existing ones. If they clash ("no meetings on Friday afternoons" vs "book the
+  team sync every Friday at 3 PM"), nothing is saved and you get a **Rule
+  Conflict** card: Replace Old Rule, Merge into One, Keep Both with Priority, or
+  Cancel.
+- **Corrections.** If you reject a card, you can *reply* to it in Telegram with
+  what was wrong ("it should have been one email to both"). Socio keeps that as
+  a lesson and uses the two newest relevant lessons when planning similar
+  requests. A plain Reject still teaches nothing. Lessons are listed in
+  `/memories`; remove one with `/forget_lesson`.
+- **Old records are cleaned up.** Once a day the bot deletes finished runs,
+  decided cards and logs older than 30 days, chat history older than 90 days,
+  and day-old conversation context (`RETENTION_DAYS_*` in `.env`, 0 = keep).
+  Your rules and lessons are never deleted this way.
 - **Skills.** After a multi-step instruction works, `/save_skill NAME` saves
   its plan as a recipe in `skills/` (Gemini turns the names and dates into
   parameters), and a matching request reuses it. Socio never saves one on its
@@ -248,6 +263,8 @@ See [`.env.example`](.env.example).
 | `AGENT_LOG_DIR` | Where `agent.log` goes (default `./logs`, gitignored) |
 | `AGENT_SCHEDULE_GRACE_HOURS` | A routine missed while the bot was off still runs if it is at most this late (default 6) |
 | `AGENT_NEWS_FEEDS` | Optional: your own news feeds instead of the default five (comma-separated RSS/Atom URLs, each optionally `Name\|URL`) |
+| `LANGFUSE_TRACING_ENABLED` | Optional [Langfuse](https://langfuse.com) tracing, **off by default**: only `true` (plus the keys below) turns it on. Traces send prompts and email text to Langfuse |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL` / `LANGFUSE_TRACING_ENVIRONMENT` | Langfuse keys, server, and environment name (default `production`). Check with `python scripts/verify_langfuse.py` |
 
 ## Command line
 
@@ -295,6 +312,11 @@ Schedule  ─┘                                         │
 - **Memory**: SQLite for short-term state; your learned preferences with local
   embeddings (top 3 recalled per email or instruction); reusable skills in
   `skills/`.
+- **Observability** (optional, off by default): with `LANGFUSE_TRACING_ENABLED=true` and Langfuse keys, every owner message, email,
+  and routine is one trace: the plan, each parallel worker, every model call
+  (model, tokens, which provider answered, failovers in red), and every tool call,
+  grouped by Telegram chat (`app/observability.py`). Off or unreachable Langfuse
+  never stops Socio.
 - **Reliability**: timeouts and bounded retries on every Google API call,
   rate-limit handling for the LLM, and restart recovery from local state.
   An error gateway logs full details to `logs/agent.log` and shows the owner
@@ -311,6 +333,7 @@ app/
   telegram_format.py  Telegram HTML: escaping, approval cards, welcome card
   google_api.py     Shared Google API timeouts, retries, token refresh
   errors.py         Error gateway: logs/agent.log + short owner-facing messages
+  observability.py  Optional Langfuse tracing (no-op without keys)
   agent/            Runner, LangGraph agent, supervisor + workers, decisions, prompts, approvals, state
   memory/           Long-term memory (local embeddings), 24 h notes, owner rules, skills
   gmail/            Gmail auth, messages, threads, drafts, parsing

@@ -26,6 +26,7 @@ depend on a stopped one are not started (supervisor.run_plan).
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
@@ -35,7 +36,9 @@ from typing import Any, Callable
 
 from langchain_core.messages import AIMessage, HumanMessage
 
+from app import observability
 from app.agent.graph import SIDE_EFFECT_TOOLS, create_agent_graph
+from app.agent.llm_router import DeadlineExceeded, deadline as llm_deadline
 from app.errors import plain_message, report_failure
 
 
@@ -144,20 +147,65 @@ def _final_report(text: str) -> tuple[str | None, str]:
     is read by the owner and must never carry raw JSON.
     """
 
-    for match in reversed(list(re.finditer(r"\{[^{}]*\}", text or ""))):
+    text = text or ""
+    # Audit M4: the old flat-only pattern missed nested objects ("modified_entities": [{...}]),
+    # braces inside the summary, and Python-style dicts: the status was lost and raw JSON
+    # reached the owner.
+    reports = [(data, start, end) for data, start, end in _objects_in(text) if {"status", "diff_summary"} & set(data)]
+    if not reports:
+        return None, text.strip()
+    data = reports[-1][0]
+    rest = text
+    for _, start, end in reversed(reports):   # every status object goes, whatever it says
+        rest = rest[:start] + rest[end:]
+    rest = re.sub(r"```(?:json|python)?\s*```", "", rest).strip()
+    status = str(data.get("status", "")).strip().upper().replace(" ", "_")
+    status = "SUCCESS" if status in WAITING_STATUSES else status
+    status = NEEDS_INPUT if status in {"QUESTION", "NEEDS_CLARIFICATION", "NEED_INPUT", "NEEDS_ANSWER", "BLOCKED"} else status
+    summary = str(data.get("diff_summary") or rest)
+    return (status if status in STATUSES else None), summary
+
+
+def _objects_in(text: str) -> list[tuple[dict, int, int]]:
+    """Every top-level {...} in text that reads as a JSON object or a Python dict, with its span."""
+
+    decoder = json.JSONDecoder()
+    found, index = [], 0
+    while (start := text.find("{", index)) != -1:
         try:
-            data = json.loads(match.group(0))
+            data, end = decoder.raw_decode(text, start)
         except json.JSONDecodeError:
-            continue
-        if not isinstance(data, dict) or not ({"status", "diff_summary"} & set(data)):
-            continue
-        status = str(data.get("status", "")).strip().upper().replace(" ", "_")
-        status = "SUCCESS" if status in WAITING_STATUSES else status
-        status = NEEDS_INPUT if status in {"QUESTION", "NEEDS_CLARIFICATION", "NEED_INPUT", "NEEDS_ANSWER", "BLOCKED"} else status
-        rest = (text[: match.start()] + text[match.end():]).strip()
-        summary = str(data.get("diff_summary") or rest)
-        return (status if status in STATUSES else None), summary
-    return None, (text or "").strip()
+            data, end = _python_dict(text, start)
+        if isinstance(data, dict):
+            found.append((data, start, end))
+            index = end
+        else:
+            index = start + 1
+    return found
+
+
+def _python_dict(text: str, start: int) -> tuple[dict | None, int]:
+    """A Python-style dict literal ({'status': 'SUCCESS', ...}) starting at text[start], or (None, start)."""
+
+    depth, quote = 0, ""
+    for position in range(start, len(text)):
+        char = text[position]
+        if quote:
+            if char == quote and text[position - 1] != "\\":
+                quote = ""
+        elif char in "'\"":
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    value = ast.literal_eval(text[start: position + 1])
+                except (ValueError, SyntaxError, MemoryError, RecursionError):
+                    return None, start
+                return (value, position + 1) if isinstance(value, dict) else (None, start)
+    return None, start
 
 
 def _message_text(message: Any) -> str:
@@ -176,11 +224,34 @@ def run_worker(
 ) -> dict[str, Any]:
     """Run one task in a clean context and return its fan-in payload. Never raises."""
 
+    # One Langfuse agent span per worker. run_plan starts this thread in a copy of the
+    # request's context, so the span nests under the request's trace, not a new one.
+    prompt = worker_prompt(task, upstream or {})
+    with observability.observation(
+        f"worker_{task.get('target_domain') or 'general'}_{task['task_id']}",
+        as_type="agent",
+        input={"task": prompt, "tools_allowed": list(task["tools_allowed"])},
+        metadata={"task_id": task["task_id"], "target_domain": task.get("target_domain"),
+                  "depends_on": list(task.get("depends_on") or []), "dry_run": dry_run},
+    ) as span:
+        payload = _run_worker(task, prompt, dry_run=dry_run, graph_factory=graph_factory, timeout=timeout)
+        span.update(
+            output=payload,
+            **({"level": "ERROR", "status_message": payload["diff_summary"][:300]} if payload["status"] == "FAILED"
+               else {"level": "WARNING", "status_message": "Needs the owner's answer"} if payload["status"] == NEEDS_INPUT
+               else {}),
+        )
+    return payload
+
+
+def _run_worker(
+    task: dict[str, Any], prompt: str, *, dry_run: bool, graph_factory: Callable, timeout: float | None,
+) -> dict[str, Any]:
     budget = WORKER_TIMEOUT_SECONDS if timeout is None else timeout
     deadline = time.monotonic() + budget
 
     state: dict[str, Any] = {
-        "messages": [HumanMessage(content=worker_prompt(task, upstream or {}))],
+        "messages": [HumanMessage(content=prompt)],
         "processed_message_ids": [],
         "actions": [],
         "pending_approvals": [],
@@ -194,18 +265,23 @@ def run_worker(
     error: BaseException | None = None
     timed_out = False
     try:
-        # Stream the graph so the state after the last finished step survives a crash.
-        steps = graph_factory().stream(state, config={"recursion_limit": WORKER_RECURSION_LIMIT}, stream_mode="values")
-        for snapshot in steps:
-            last = snapshot
-            if time.monotonic() > deadline:
-                timed_out = True
-                break
+        # Model calls share the budget: no failover or rate-limit wait starts past it (audit H3).
+        with llm_deadline(deadline):
+            # Stream the graph so the state after the last finished step survives a crash.
+            steps = graph_factory().stream(state, config={"recursion_limit": WORKER_RECURSION_LIMIT}, stream_mode="values")
+            for snapshot in steps:
+                last = snapshot
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    break
         if timed_out:
             close = getattr(steps, "close", None)
             if close:
                 close()  # no further model call or tool round
             logger.warning("Worker %s stopped after its %.0f s budget.", task["task_id"], budget)
+    except DeadlineExceeded:
+        timed_out = True  # the router gave up at the deadline: the same "took too long" as above
+        logger.warning("Worker %s ran out of its %.0f s budget waiting for a model.", task["task_id"], budget)
     except Exception as exc:
         error = exc
         report_failure(exc, "worker", task_id=task["task_id"], tools=",".join(task["tools_allowed"]))

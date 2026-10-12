@@ -33,16 +33,19 @@ def auto_tasks_enabled() -> bool:
 
 
 def create_followup_task(store: AgentStateStore, message_id: str, thread_id: str, status: str, subject: str, sender: str, details: str) -> dict[str, Any] | None:
-    """Create one follow-up task per email (idempotent). Returns the task or None."""
+    """
+    Offer one follow-up task per email (idempotent): a "New Task" approval card, never a task
+    created behind the owner's back (audit M9; every task creation needs a tap). Returns
+    {"approval_id"} or None.
+    """
 
     label = AUTO_TASK_LABELS.get(status)
     if not label or not auto_tasks_enabled():
         return None
 
-    if any(action["type"] == AUTO_TASK_TYPE for action in store.actions_for_message(message_id, status="completed")):
+    asked = {action["type"] for action in store.actions_for_message(message_id)}
+    if AUTO_TASK_TYPE in asked:   # offered (or, before this change, created) once already
         return None
-
-    from app.tasks.tasks import create_task
 
     title = f"Socio: {label} - {subject or '(no subject)'}"[:200]
     notes = "\n".join(
@@ -52,31 +55,27 @@ def create_followup_task(store: AgentStateStore, message_id: str, thread_id: str
             f"Gmail: https://mail.google.com/mail/u/0/#all/{thread_id}" if thread_id else "",
         ] if part
     )
+    payload = {"title": title, "notes": notes, "due": "", "reason": "A reminder for an email that needs you.", "followup": True}
 
-    try:
-        task = create_task(title, notes)
-    except Exception as exc:
-        logger.warning("Could not create follow-up task for %s: %s", message_id, exc)
-        return None
+    from app.agent.approvals import describe
 
-    store.add_action(AUTO_TASK_TYPE, title, {"status": status}, "completed", message_id=message_id, result=task)
-    return task
+    approval_id = store.add_pending_approval(
+        "create_task", describe({"type": "create_task", "payload": payload}), payload, message_id=message_id, thread_id=thread_id,
+    )
+    store.add_action(AUTO_TASK_TYPE, title, {"status": status}, "proposed", message_id=message_id, result={"approval_id": approval_id})
+    return {"approval_id": approval_id}
 
 
 def complete_followup_task(store: AgentStateStore, message_id: str | None) -> None:
-    """Complete the follow-up task for an email, if Socio created one."""
+    """
+    The email was dealt with: a follow-up card still waiting for the owner is closed quietly.
+    A task the owner already added stays (closing it is the owner's call, through the task
+    tracker's "Is this done?" card): nothing in Google Tasks changes without a tap.
+    """
 
     if not message_id or not auto_tasks_enabled():
         return
 
-    from app.tasks.tasks import complete_task
-
-    for action in store.actions_for_message(message_id, status="completed"):
-        task_id = (action.get("result") or {}).get("task_id")
-        if action["type"] != AUTO_TASK_TYPE or not task_id:
-            continue
-        try:
-            complete_task(task_id)
-            store.add_action("auto_task_completed", task_id, {}, "completed", message_id=message_id)
-        except Exception as exc:
-            logger.warning("Could not complete follow-up task %s: %s", task_id, exc)
+    for approval in store.open_approvals_of_type("create_task"):
+        if approval.get("message_id") == message_id and (approval.get("payload") or {}).get("followup"):
+            store.resolve_pending_approval(approval["id"], "The email was dealt with")

@@ -1,4 +1,5 @@
 import os
+import re
 
 from app.agent import clock
 
@@ -277,6 +278,39 @@ only that task (goal and context), not the owner's conversation, and only the to
 
 def _worker_prompt() -> str:
     return _owner_mode_prompt(worker=True) + "\n" + WORKER_RULES
+
+
+_TOOL_WORD = re.compile(r"\b[a-z]+(?:_[a-z]+)+\b")
+
+
+def only_tools(prompt: str, allowed: set[str], known: set[str]) -> str:
+    """
+    The prompt without the "- ..." bullets (and their indented continuation lines) that name
+    only tools outside `allowed` (audit M5: a calendar worker was told about search_gmail,
+    remember_rule, schedule_task... and spent steps calling tools it doesn't have). A bullet
+    naming no tool, or at least one allowed tool, stays.
+    """
+
+    kept: list[str] = []
+    bullet: list[str] = []
+
+    def flush() -> None:
+        named = {word for line in bullet for word in _TOOL_WORD.findall(line)} & known
+        if not named or named & allowed:
+            kept.extend(bullet)
+        bullet.clear()
+
+    for line in prompt.splitlines():
+        if line.startswith("- "):
+            flush()
+            bullet.append(line)
+        elif bullet and line.startswith("  ") and line.strip():
+            bullet.append(line)
+        else:
+            flush()
+            kept.append(line)
+    flush()
+    return "\n".join(kept)
 
 
 def build_system_prompt(mode: str = "email") -> str:

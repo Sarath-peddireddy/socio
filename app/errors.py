@@ -40,10 +40,13 @@ CARDS = {
     "ai_timeout": ("AI Reasoning Timeout", "The AI model took too long to respond. Tap /run or send the request again."),
     "ai_quota": ("AI Daily Limit Reached", "The AI model's daily limit is used up. Please try again later."),
     "generic": ("Task Paused", "Unable to complete that action right now. The details have been logged for review."),
+    # Retrying never fixes an expired / revoked Google sign-in: say what does (audit H4).
+    "google_signin": ("Google Sign-In Needed", "Socio's access to your Google account has expired. On the computer "
+                      "running Socio, run python -m app.main --google-login, then try again."),
 }
 
-GOOGLE_BUSY, SYSTEM_BUSY, AI_SLOW, AI_QUOTA, GENERIC = (
-    f"⚠️ {CARDS[key][1]}" for key in ("google_busy", "system_busy", "ai_timeout", "ai_quota", "generic")
+GOOGLE_BUSY, SYSTEM_BUSY, AI_SLOW, AI_QUOTA, GENERIC, GOOGLE_SIGNIN = (
+    f"⚠️ {CARDS[key][1]}" for key in ("google_busy", "system_busy", "ai_timeout", "ai_quota", "generic", "google_signin")
 )
 
 # Google HTTP statuses that mean "busy / try later" (not "you asked for something wrong").
@@ -112,10 +115,15 @@ def _http_status(exc: BaseException) -> int | None:
 
 
 def classify(exc: BaseException) -> str:
-    """'google_busy', 'system_busy', 'ai_timeout', 'ai_quota', or 'generic'."""
+    """'google_busy', 'system_busy', 'ai_timeout', 'ai_quota', 'google_signin', or 'generic'."""
+
+    from google.auth.exceptions import RefreshError
 
     from app.agent.llm import LLMUnavailableError
-    from app.google_api import GoogleApiUnavailableError
+    from app.google_api import GoogleApiUnavailableError, GoogleSignInRequired
+
+    if any(isinstance(error, (GoogleSignInRequired, RefreshError)) for error in _chain(exc)):
+        return "google_signin"
 
     try:
         import httpx
@@ -157,6 +165,7 @@ MESSAGES = {
     "ai_timeout": AI_SLOW,
     "ai_quota": AI_QUOTA,
     "generic": GENERIC,
+    "google_signin": GOOGLE_SIGNIN,
 }
 
 
@@ -170,6 +179,7 @@ def user_html(exc: BaseException) -> str:
     """The same message as a Telegram HTML status card (the texts contain no HTML specials)."""
 
     title, sentence = CARDS[classify(exc)]
+    sentence = sentence.replace("python -m app.main --google-login", "<code>python -m app.main --google-login</code>")
     return f"⚠️ <b>{title}</b>\n{sentence.replace('/run', '<code>/run</code>')}"
 
 
@@ -218,7 +228,28 @@ def is_validation_error(exc: BaseException) -> bool:
         isinstance(exc, ValueError)
         and not isinstance(exc, (UnicodeError, json.JSONDecodeError))
         and classify(exc) == "generic"
+        and _raised_by_us(exc)
     )
+
+
+def _raised_by_us(exc: BaseException) -> bool:
+    """
+    Whether the error was raised in Socio's own code (app/), not inside a library: pydantic's
+    ValidationError and datetime's "Invalid isoformat string" are ValueErrors too, and their
+    text is for developers (audit M11). An error created without a traceback counts as ours.
+    """
+
+    frames = []
+    tb = exc.__traceback__
+    while tb is not None:
+        frames.append(Path(tb.tb_frame.f_code.co_filename).resolve())
+        tb = tb.tb_next
+    # A test double (unittest.mock) stands in for our own function: look past its frames.
+    frames = [path for path in frames if not (path.name == "mock.py" and path.parent.name == "unittest")]
+    if not frames:
+        return True
+    app_dir = (PROJECT_ROOT / "app").resolve()
+    return app_dir in frames[-1].parents and "site-packages" not in frames[-1].parts
 
 
 def safe_error_text(exc: BaseException) -> str:

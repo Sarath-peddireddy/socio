@@ -21,7 +21,7 @@ from googleapiclient.errors import HttpError
 
 from app.drive.client import get_drive_service
 from app.files.drive import GOOGLE_TYPES, _file_id_from_reference, output_folder_id
-from app.google_api import execute_with_retry
+from app.google_api import completed_write, execute_with_retry, outcome_unknown
 
 
 logger = logging.getLogger(__name__)
@@ -116,6 +116,7 @@ def share_links(links: list[dict[str, Any]], recipients: list[str], role: str) -
         for address in recipients:
             share_file(link["file_id"], address, role, notify=False)
             granted.append(f"{link['name']} -> {address}")
+            completed_write(f"gave {address} {role} access to '{link['name']}'")
     return granted
 
 
@@ -244,9 +245,10 @@ def create_and_share(payload: dict[str, Any]) -> dict[str, Any]:
     The approved "Create & Share" pipeline: create the file, give the recipient access,
     then email them the live link. Each step runs only if the one before succeeded.
 
-    A failed creation raises (nothing changed). A failure after that is returned in
-    the result (share_error / email_error) so the owner is told exactly what happened.
-    The email is never retried: a timed-out send may still have been delivered.
+    A failed creation raises. A failure after that is returned in the result
+    (share_error / email_error) so the owner is told exactly what happened.
+    The email is never retried: a timed-out send may still have been delivered
+    (email_unknown: the owner is told to check Sent instead of "it didn't go through").
     """
 
     from app.errors import report_failure, safe_error_text
@@ -274,4 +276,5 @@ def create_and_share(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         report_failure(exc, "sharing.email", file=file_id)
         result["email_error"] = safe_error_text(exc)
+        result["email_unknown"] = outcome_unknown(exc)
     return result

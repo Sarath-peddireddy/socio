@@ -390,6 +390,34 @@ class AgentStateStore:
 
         cls._ensure_column(conn, "pending_approvals", "card_message_id", "INTEGER")
 
+    @classmethod
+    def _migrate_v9_failure_cases(cls, conn: sqlite3.Connection) -> None:
+        """Rejected / stale cards and failed runs, with the owner's written corrections (app.agent.eval_feedback)."""
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS failure_cases (
+                case_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id INTEGER,
+                approval_id INTEGER,
+                mode TEXT NOT NULL DEFAULT 'owner',
+                domains TEXT NOT NULL DEFAULT '[]',
+                user_prompt TEXT NOT NULL DEFAULT '',
+                failed_plan_json TEXT NOT NULL DEFAULT '{}',
+                failure_type TEXT NOT NULL,
+                user_correction_text TEXT,
+                lesson TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                trace_id TEXT,
+                timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                corrected_at TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_failure_cases_approval ON failure_cases (approval_id)")
+        # Where a card came from: {"mode", "request", "run_id", "plan", "trace_id"} (JSON).
+        cls._ensure_column(conn, "pending_approvals", "origin", "TEXT")
+
     # ----- processed messages -------------------------------------------------
 
     def mark_processed(self, message_id: str, thread_id: str | None = None, status: str = "processed", summary: str | None = None, metadata: dict[str, Any] | None = None) -> None:
@@ -598,6 +626,16 @@ class AgentStateStore:
             )
             return cursor.rowcount > 0
 
+    def release_claim(self, approval_id: int) -> bool:
+        """Put a claimed approval back to 'open' when nothing was done (its pre-check failed)."""
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE pending_approvals SET status = 'open', locked_at = NULL WHERE id = ? AND status = 'executing'",
+                (approval_id,),
+            )
+            return cursor.rowcount > 0
+
     def stuck_approvals(self, minutes: int = 15) -> list[dict[str, Any]]:
         """
         Approvals still 'executing' long after the tap: the process stopped while carrying one
@@ -663,6 +701,15 @@ class AgentStateStore:
                 (target, json.dumps(payload, default=str), approval_id),
             )
             return cursor.rowcount > 0
+
+    def set_approval_origin(self, approval_ids: list[int], origin: dict[str, Any]) -> None:
+        """Record which request (and supervisor run / trace) produced these approvals; the first stamp wins."""
+
+        with self._connect() as conn:
+            conn.executemany(
+                "UPDATE pending_approvals SET origin = ? WHERE id = ? AND origin IS NULL",
+                [(json.dumps(origin, default=str), int(approval_id)) for approval_id in approval_ids],
+            )
 
     def mark_approval_notified(self, approval_id: int, card_message_id: int | None = None) -> None:
         """The card was shown (card_message_id: the Telegram message that shows it)."""
@@ -1138,5 +1185,6 @@ MIGRATIONS = [
     (6, AgentStateStore._migrate_v6_scheduled_jobs),
     (7, AgentStateStore._migrate_v7_approval_locks),
     (8, AgentStateStore._migrate_v8_card_messages),
+    (9, AgentStateStore._migrate_v9_failure_cases),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]

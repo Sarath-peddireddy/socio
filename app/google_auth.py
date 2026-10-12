@@ -11,7 +11,7 @@ from pathlib import Path
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from app.google_api import credentials_locked, refresh_credentials
+from app.google_api import GoogleSignInRequired, credentials_locked, refresh_credentials
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -41,14 +41,22 @@ def load_credentials(token_path: Path, scopes: list[str], *, allow_browser_login
         return credentials
 
     if credentials and credentials.expired and credentials.refresh_token:
-        refresh_credentials(credentials)
+        try:
+            refresh_credentials(credentials)
+        except GoogleSignInRequired:
+            # The saved sign-in was revoked or expired (invalid_grant): only a new sign-in helps.
+            if not allow_browser_login:
+                raise
+            credentials = None
+    if credentials and credentials.valid:
+        pass
     elif allow_browser_login:
         if not CREDENTIALS_PATH.exists():
             raise FileNotFoundError(f"Google OAuth client file not found: {CREDENTIALS_PATH}")
         flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, scopes)
         credentials = flow.run_local_server(port=0)
     else:
-        raise RuntimeError(f"Google sign-in needed. Run: {login_command}")
+        raise GoogleSignInRequired(f"Google sign-in needed. Run: {login_command}")
 
     token_path.write_text(credentials.to_json(), encoding="utf-8")
     return credentials

@@ -49,6 +49,7 @@ BOT_COMMANDS = [
     ("schedules", "", "See or cancel your scheduled routines"),
     ("remember", "TEXT", "Save a rule, e.g. no calls before 12:00"),
     ("forget", "ID", "Delete a saved rule (numbers from /memories)"),
+    ("forget_lesson", "ID", "Delete a lesson from your corrections (see /memories)"),
     ("new", "", "Start a fresh conversation"),
     ("reset", "", "Clear the conversation context (like /new)"),
     ("dryrun", "", "Check the inbox without sending or changing anything"),
@@ -361,6 +362,11 @@ def _buttons(approval: dict[str, Any]) -> list:
         return [[button("💬 Answer", "answer")], [button("✏️ Edit in Gmail", "draft"), button("❌ Reject", "reject")]]
     if kind in EMAIL_TYPES:
         return [[button("✅ Approve & Send", "approve"), button("✏️ Edit in Gmail", "draft")], [button("❌ Reject", "reject")]]
+    if kind == "rule_conflict":
+        first = [button("🔁 Replace Old Rule", "rule_replace")]
+        if (approval.get("payload") or {}).get("merged"):
+            first.append(button("🔀 Merge into One", "rule_merge"))
+        return [first, [button("➕ Keep Both with Priority", "rule_both")], [button("❌ Cancel", "reject")]]
     if kind not in EXECUTABLE_TYPES:
         return [[button("✔️ Done", "approve")]]
     approve_label = {
@@ -569,6 +575,17 @@ def card_text(approval: dict[str, Any]) -> str:
         if payload.get("body"):
             lines += ["", "<b>Draft:</b>", quote(payload["body"])]
         lines.append("<i>Finish it in Gmail Drafts and send it from there, then tap Done.</i>")
+    elif kind == "rule_conflict":
+        # No <br> (Telegram HTML has none): the spec's line breaks are plain newlines.
+        lines = [
+            "⚠️ <b>Rule Conflict Detected</b>",
+            f"<b>Existing:</b> \"{esc(payload.get('existing_text'))}\"",
+            f"<b>New:</b> \"{esc(payload.get('new_text'))}\"",
+            "",
+            f"<i>{esc(payload.get('explanation') or 'These two rules point in different directions.')}</i>",
+        ]
+        if payload.get("merged"):
+            lines += ["", f"<b>Merged version:</b> \"{esc(payload['merged'])}\""]
     elif kind == "review_decision":
         lines = [
             "🤔 <b>Needs Your Decision</b>", "",

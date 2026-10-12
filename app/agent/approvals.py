@@ -17,8 +17,16 @@ tap: before acting, check_still_current() re-reads the world. If the email
 thread got a new message, or the proposed slot is no longer free, nothing is
 done and the request becomes 'stale' (the owner can re-check the email).
 
+If the connection drops while Google is carrying it out (a timed-out send), nobody knows
+whether it happened: the request becomes 'unknown' (never retried), and the owner is told
+to check Sent / Calendar / Drive, never "nothing was changed". Writes already done before a
+later step failed (a created doc, access given) are listed (app.google_api.completed_write).
+
 A decision teaches Socio nothing by itself; the owner can turn a rejection or an
 edit into a rule explicitly (by asking Socio to remember it, see app.memory.learning).
+A rejected or stale proposal is logged as a failure case (app.agent.eval_feedback); only a
+correction the owner writes in reply to that card becomes a lesson for the planner.
+A rule_conflict card (app.memory.rule_engine) is decided with decide_rule_conflict().
 Failures are logged in full (app.errors) and reported with a short fixed message.
 """
 
@@ -30,15 +38,17 @@ from datetime import datetime
 from email.utils import parseaddr
 from typing import Any
 
+from app.agent.eval_feedback import capture_approval_failure
 from app.agent.followups import complete_followup_task
 from app.agent.state import AgentStateStore
-from app.calendar.events import cancel_event, find_conflicts, move_event, parse_ist
+from app.calendar.events import cancel_event, find_conflicts, get_event, move_event, parse_ist, summarize_event
 from app.calendar.tools import INDIA_TZ, create_calendar_event
 from app.files.local import resolve_shareable_file
 from app.gmail.drafts import create_draft, create_reply_draft
 from app.gmail.messages import send_new_email, send_reply, trash_message
 from app.gmail.tools import get_thread_details
 from app.errors import report_failure, safe_error_text
+from app.google_api import outcome_unknown, recording_writes
 
 
 logger = logging.getLogger(__name__)
@@ -70,7 +80,29 @@ STATUS_WORDS = {
     "approved": "approved", "rejected": "rejected", "resolved": "handled",
     "failed": "tried and it failed", "executing": "being handled",
     "stale": "stopped because things changed", "rechecked": "re-checked",
+    "unknown": "tried, but I couldn't tell whether it went through",
 }
+# When the connection drops mid-action (outcome unknown): what may have happened, and where
+# the owner can see whether it did. Never "nothing was changed": it may have been.
+UNKNOWN_WHAT = {
+    "send_reply": ("the reply went out", "your Gmail Sent folder"),
+    "send_reply_with_attachment": ("the reply went out", "your Gmail Sent folder"),
+    "send_email": ("the email went out", "your Gmail Sent folder"),
+    "book_meeting": ("the meeting was booked", "Google Calendar"),
+    "move_event": ("the meeting was moved", "Google Calendar"),
+    "cancel_event": ("the meeting was cancelled", "Google Calendar"),
+    "trash_email": ("it was moved to Trash", "Gmail Trash"),
+    "create_document": ("the document was created", "your Socio folder in Google Drive"),
+    "create_spreadsheet": ("the spreadsheet was created", "your Socio folder in Google Drive"),
+    "create_and_share": ("the file was created", "your Socio folder in Google Drive"),
+    "append_document": ("the text was added", "the document"),
+    "append_sheet_row": ("the row was added", "the sheet"),
+    "share_file": ("access was given", "the file's sharing settings in Google Drive"),
+    "create_task": ("the task was added", "Google Tasks"),
+    "complete_task": ("the task was closed", "Google Tasks"),
+    "close_old_reminders": ("the reminders were closed", "Google Tasks"),
+}
+UNKNOWN_REPLY = "I can't tell whether the reply went out (the connection to Google dropped). Check your Gmail Sent folder before sending it again."
 # Approvals that change a calendar slot; the slot must still be free when the owner taps.
 SLOT_TYPES = {"book_meeting", "move_event"}
 # Something only the owner knows, left in a reply by the agent: "[OWNER: your notice period]".
@@ -179,6 +211,23 @@ def check_still_current(approval: dict[str, Any]) -> str | None:
                 return "You wrote in this conversation yourself after I prepared this."
             return f"{_who(latest)} wrote again in this conversation after I prepared this."
 
+    # Moving or cancelling: the meeting must still be the one on the card (audit M1). Only its
+    # status and times are compared: Google's "updated" also changes when someone RSVPs.
+    if kind in {"move_event", "cancel_event"} and payload.get("event_id"):
+        event = summarize_event(get_event(payload["event_id"]))
+        if event.get("status") == "cancelled":
+            return "That meeting has already been cancelled."
+        if payload.get("old_start") and not _same_time(event.get("start"), payload["old_start"]):
+            return f"The meeting was moved meanwhile (it is now {format_time(event.get('start'))})."
+        if payload.get("old_end") and not _same_time(event.get("end"), payload["old_end"]):
+            return "The meeting's length was changed meanwhile."
+
+    # Trashing a whole conversation: nothing may have arrived since (it would go to Trash unseen).
+    if kind == "trash_email" and payload.get("whole_thread") and payload.get("thread_id") and payload.get("last_seen_message_id"):
+        ids = [email.get("id") for email in get_thread_details(payload["thread_id"])]
+        if payload["last_seen_message_id"] in ids and ids[-1] != payload["last_seen_message_id"]:
+            return "A new message arrived in this conversation after I prepared this."
+
     if kind in SLOT_TYPES:
         start, end = parse_ist(payload["new_start"]), parse_ist(payload["new_end"])
         if start <= datetime.now(INDIA_TZ):
@@ -189,6 +238,15 @@ def check_still_current(approval: dict[str, Any]) -> str | None:
             return f"That time is no longer free: it overlaps with '{first['title']}' ({format_time(first.get('start'))})."
 
     return None
+
+
+def _same_time(a: str | None, b: str | None) -> bool:
+    """Two event times as Google / the card wrote them ('...T15:00:00+05:30' or an all-day date)."""
+
+    try:
+        return parse_ist(a or "") == parse_ist(b or "")
+    except ValueError:
+        return (a or "") == (b or "")
 
 
 def clock_12(moment: datetime) -> str:
@@ -306,6 +364,10 @@ def describe(approval: dict[str, Any]) -> str:
             text += f"\nDraft:\n\"{payload['body']}\""
     elif kind == "review_decision":
         text = f"Unsure whether to reply to '{payload.get('subject', '')}'.\n{payload.get('reason', '')}"
+    elif kind == "rule_conflict":
+        from app.memory.rule_engine import describe_conflict
+
+        text = describe_conflict(payload)
     else:
         text = approval.get("target") or kind
 
@@ -435,6 +497,7 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
                 report_failure(exc, "approval.follow_up_reply", approval_id=approval.get("id"), type=kind)
                 result["reply_error"] = f"{type(exc).__name__}: {exc}"
                 result["reply_error_text"] = safe_error_text(exc)
+                result["reply_unknown"] = outcome_unknown(exc)
         return result
 
     if kind == "create_task":
@@ -512,6 +575,7 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
         report_failure(exc, "approval.follow_up_reply", approval_id=approval.get("id"), type=kind)
         result["reply_error"] = f"{type(exc).__name__}: {exc}"
         result["reply_error_text"] = safe_error_text(exc)
+        result["reply_unknown"] = outcome_unknown(exc)
 
     return result
 
@@ -578,6 +642,11 @@ def share_outcome(kind: str, payload: dict[str, Any], result: dict[str, Any]) ->
     url = (result.get("file") or {}).get("url", "")
     if result.get("share_error"):
         return f"Created \"{title}\", but I couldn't share it with {recipient}, so no email was sent. {result['share_error']} {url}".strip()
+    if result.get("email_unknown"):
+        return (
+            f"Created \"{title}\" and gave {recipient} access, but I can't tell whether the email went out "
+            f"(the connection to Google dropped). Check your Gmail Sent folder before sending it again. {url}"
+        ).strip()
     if result.get("email_error"):
         return (
             f"Created \"{title}\" and gave {recipient} access, but the email didn't go through. "
@@ -619,6 +688,9 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
     if approval["status"] != "open":
         return {"ok": False, "duplicate": True, "message": _already(approval)}
 
+    if approval["type"] == "rule_conflict":  # the CLI's --approve: replace the old rule
+        return decide_rule_conflict(approval_id, "replace", store)
+
     if approval["type"] in REVIEW_TYPES:
         if not store.resolve_pending_approval(approval_id, "Marked done by owner"):
             return {"ok": False, "duplicate": True, "message": "This request was already handled."}
@@ -635,23 +707,26 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
         return {"ok": False, "duplicate": True, "message": "This request is already being handled."}
 
     message_id, thread_id = approval.get("message_id"), approval.get("thread_id")
+    acting = False  # True once _execute starts: from then on Google may have changed something
 
-    try:
-        stale = check_still_current(approval)
-        if stale:
-            store.finish_approval(approval_id, "stale", stale)
-            if message_id:
-                store.mark_processed(message_id, thread_id, status="needs_review", summary=f"Not carried out: {stale}")
-            return {"ok": False, "stale": True, "message": f"{stale} Nothing was sent or changed."}
-        result = _execute(approval)
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        report_failure(exc, "approval.execute", approval_id=approval_id, type=approval["type"])
-        store.finish_approval(approval_id, "failed", error)
-        store.add_failure(f"approval:{approval['type']}", error, message_id=message_id)
-        if message_id:
-            store.mark_processed(message_id, thread_id, status="needs_attention", summary=f"Approved change failed: {error}")
-        return {"ok": False, "message": f"That didn't go through, so nothing was changed. {safe_error_text(exc)}", "error": error}
+    with recording_writes() as written:
+        try:
+            stale = check_still_current(approval)
+            if stale:
+                store.finish_approval(approval_id, "stale", stale)
+                if message_id:
+                    store.mark_processed(message_id, thread_id, status="needs_review", summary=f"Not carried out: {stale}")
+                capture_approval_failure(approval, "stale", store)
+                return {"ok": False, "stale": True, "message": f"{stale} Nothing was sent or changed."}
+            acting = True
+            result = _execute(approval)
+        except Exception as exc:
+            if not acting:
+                return _precheck_failed(approval, exc, store)
+            return _execution_failed(approval, exc, unknown=acting and outcome_unknown(exc), done=list(written), store=store)
+
+    if approval["type"] in EMAIL_TYPES and result.get("share_error"):
+        return _share_failed(approval, result, store)
 
     store.finish_approval(approval_id, "approved", "Approved and executed", result)
     complete_followup_task(store, message_id)
@@ -680,7 +755,10 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
             message += f" {result[key]['url']}"
     if result.get("reply_error"):
         done = "Access was given" if approval["type"] == "share_file" else "The calendar was updated"
-        message += f" {done}, but the reply failed. {result.get('reply_error_text', '')}".rstrip()
+        if result.get("reply_unknown"):
+            message += f" {done}. {UNKNOWN_REPLY}"
+        else:
+            message += f" {done}, but the reply failed. {result.get('reply_error_text', '')}".rstrip()
 
     if message_id and approval["type"] != "trash_email":
         status = "needs_attention" if result.get("reply_error") else ("replied" if result.get("reply") else "no_action")
@@ -692,6 +770,82 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
         store.add_failure(f"approval:{approval['type']}", result.get("share_error") or result.get("email_error"), message_id=message_id)
 
     return {"ok": True, "partial": partial, "message": message, "result": result}
+
+
+PRECHECK_FAILED = "I couldn't check that this is still OK to do, so I did nothing. Tap Approve again in a few minutes."
+
+
+def _precheck_failed(approval: dict[str, Any], exc: Exception, store: AgentStateStore) -> dict[str, Any]:
+    """
+    Reading the world before acting failed (Google busy, sign-in expired): nothing was done,
+    so the request goes back to open and the card keeps its buttons (audit M2: it used to
+    become 'failed' for good and the owner had to ask again from scratch).
+    """
+
+    report_failure(exc, "approval.precheck", approval_id=approval["id"], type=approval["type"])
+    store.add_failure(f"approval:{approval['type']}", f"Pre-check failed: {type(exc).__name__}: {exc}", message_id=approval.get("message_id"))
+    store.release_claim(approval["id"])
+    return {"ok": False, "message": f"{PRECHECK_FAILED} {safe_error_text(exc)}".strip()}
+
+
+def _share_failed(approval: dict[str, Any], result: dict[str, Any], store: AgentStateStore) -> dict[str, Any]:
+    """
+    An email with Google file links whose access could not be given: the email was not sent
+    (a link that doesn't open must not go out). Recorded as failed and the incoming email as
+    needing the owner (audit M3: it used to be 'approved' and the email 'no_action').
+    """
+
+    approval_id, message_id = approval["id"], approval.get("message_id")
+    message = email_link_outcome(approval, result)
+    store.finish_approval(approval_id, "failed", f"Access not given, email not sent: {result['share_error']}", result)
+    store.add_failure(f"approval:{approval['type']}", result["share_error"], message_id=message_id)
+    if result.get("shared"):  # some access was given before the failure
+        store.add_action(approval["type"], approval.get("target"), approval["payload"], "partial", message_id=message_id, result=result)
+    if message_id:
+        store.mark_processed(message_id, approval.get("thread_id"), status="needs_attention", summary=message)
+    return {"ok": False, "partial": bool(result.get("shared")), "message": message, "result": result}
+
+
+def _execution_failed(
+    approval: dict[str, Any], exc: Exception, *, unknown: bool, done: list[str], store: AgentStateStore,
+) -> dict[str, Any]:
+    """
+    A failed approval, reported truthfully.
+
+    unknown: the connection dropped (or Google answered 5xx) while it was acting, so it may
+    have happened. It is never retried and never reported as "nothing was changed"; the
+    request becomes 'unknown' and the owner is told where to check.
+    done: writes that did happen before the failure (a created doc, access given).
+    """
+
+    approval_id, kind = approval["id"], approval["type"]
+    message_id, thread_id = approval.get("message_id"), approval.get("thread_id")
+    error = f"{type(exc).__name__}: {exc}"
+    report_failure(exc, "approval.execute", approval_id=approval_id, type=kind, outcome="unknown" if unknown else "failed")
+
+    already = f" Already done: {'; '.join(done)}." if done else ""
+    if unknown:
+        what, where = UNKNOWN_WHAT.get(kind, ("it went through", "Gmail, Google Calendar, and Google Drive"))
+        if done and kind in {"create_document", "create_spreadsheet", "create_and_share"}:
+            what, where = "the rest of it went through", "that file"  # the file exists; a later step is in doubt
+        message = f"I can't tell whether {what}: the connection to Google dropped while I was doing it.{already} Check {where} before trying again."
+        summary = f"Approved change may or may not have happened (connection dropped): {error}"
+    elif done:
+        message = f"That only partly went through.{already} The rest wasn't done. {safe_error_text(exc)}"
+        summary = f"Approved change partly failed: {error}"
+    else:
+        message = f"That didn't go through, so nothing was changed. {safe_error_text(exc)}"
+        summary = f"Approved change failed: {error}"
+
+    store.finish_approval(approval_id, "unknown" if unknown else "failed", error, {"done": done} if done else None)
+    store.add_failure(f"approval:{kind}", error, message_id=message_id)
+    if unknown or done:
+        # Like the agent's own uncertain actions (graph.execute_tools): recorded, never as completed.
+        store.add_action(kind, approval.get("target"), approval["payload"], "unknown" if unknown else "partial",
+                         message_id=message_id, result={"done": done, "error": error})
+    if message_id:
+        store.mark_processed(message_id, thread_id, status="needs_attention", summary=summary)
+    return {"ok": False, "unknown": unknown, "message": message.strip(), "error": error}
 
 
 def reject(approval_id: int, store: AgentStateStore | None = None) -> dict[str, Any]:
@@ -708,6 +862,9 @@ def reject(approval_id: int, store: AgentStateStore | None = None) -> dict[str, 
 
     store.finish_approval(approval_id, "rejected", f"Rejected by owner at {datetime.now().isoformat(timespec='seconds')}")
     complete_followup_task(store, approval.get("message_id"))
+    if approval["type"] == "rule_conflict":
+        return {"ok": True, "message": "Okay, I didn't save the new rule. Your rules are unchanged."}
+    capture_approval_failure(approval, "rejected", store)
 
     if approval.get("message_id") and approval["type"] in {"book_meeting", "move_event", "cancel_event"} | REPLY_TYPES:
         store.mark_processed(
@@ -716,6 +873,34 @@ def reject(approval_id: int, store: AgentStateStore | None = None) -> dict[str, 
         )
 
     return {"ok": True, "message": "Rejected. No changes were made."}
+
+
+def decide_rule_conflict(approval_id: int, choice: str, store: AgentStateStore | None = None) -> dict[str, Any]:
+    """
+    The owner's answer on a rule_conflict card: "replace", "merge", or "both" (Cancel = reject()).
+    Claimed like any approval, so a double tap applies it once.
+    """
+
+    from app.memory.rule_engine import resolve_conflict
+
+    store = store or AgentStateStore()
+    approval = store.get_approval(approval_id)
+    if approval is None:
+        return {"ok": False, "message": "That request no longer exists."}
+    if approval["type"] != "rule_conflict":
+        return {"ok": False, "message": "This is not a rule question."}
+    if approval["status"] != "open" or not store.claim_approval(approval_id):
+        return {"ok": False, "duplicate": True, "message": _already(store.get_approval(approval_id) or approval)}
+
+    try:
+        result = resolve_conflict(approval["payload"], choice, store)
+    except Exception as exc:
+        report_failure(exc, "approval.rule_conflict", approval_id=approval_id, choice=choice)
+        store.finish_approval(approval_id, "failed", f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "message": f"I couldn't save the rule, so your rules are unchanged. {safe_error_text(exc)}"}
+
+    store.finish_approval(approval_id, "approved", f"Rule conflict: {choice}", result)
+    return {"ok": True, "message": result["message"], "choice": choice}
 
 
 def to_draft(approval_id: int, store: AgentStateStore | None = None) -> dict[str, Any]:

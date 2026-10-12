@@ -127,6 +127,16 @@ class SemanticMemory:
             )
             return cursor.rowcount > 0
 
+    def retire(self, memory_id: int, status: str = "replaced") -> bool:
+        """Take an active memory out of use because a newer rule replaced it (row kept)."""
+
+        with self.store._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE memories SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'active'",
+                (status, memory_id),
+            )
+            return cursor.rowcount > 0
+
     # ----- reading ---------------------------------------------------------------
 
     def count(self) -> int:

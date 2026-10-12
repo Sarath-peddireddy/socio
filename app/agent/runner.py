@@ -20,8 +20,10 @@ from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
 
+from app import observability
 from app.agent import clock
 from app.agent.decision import decide_reply_needed
+from app.agent.eval_feedback import lessons_prompt, remember_origin
 from app.agent.followups import complete_followup_task, create_followup_task
 from app.agent.graph import create_agent_graph
 from app.agent.llm import LLMUnavailableError
@@ -32,7 +34,7 @@ from app.agent.untrusted import inline_untrusted, wrap_untrusted_email
 from app.gmail.messages import search_messages
 from app.gmail.tools import get_thread_details
 from app.errors import plain_message, report_failure
-from app.google_api import GoogleApiUnavailableError
+from app.google_api import GoogleApiUnavailableError, GoogleSignInRequired
 from app.memory.episodic import notes_block
 from app.memory.semantic import format_memories, recall
 
@@ -171,8 +173,19 @@ def _outcome_status(actions: list[dict], failures: list[str]) -> str:
 def handle_message(message_id: str, thread_id: str, *, dry_run: bool = False, store: AgentStateStore | None = None) -> MessageOutcome:
     """Run the full loop for one email (one frozen "today" for triage and agent, app.agent.clock)."""
 
-    with clock.frozen():
-        return _handle_message(message_id, thread_id, dry_run=dry_run, store=store)
+    with clock.frozen() as now, observability.interaction(
+        "email_run",
+        session_id=f"gmail-thread-{thread_id}",
+        tags=["email"],
+        input={"message_id": message_id, "thread_id": thread_id},
+        metadata={"temporal_anchor": clock.temporal_context(now), "dry_run": dry_run},
+    ) as trace:
+        outcome = _handle_message(message_id, thread_id, dry_run=dry_run, store=store)
+        trace.update(
+            output={"status": outcome.status, "intent": outcome.intent, "summary": outcome.summary or outcome.reason},
+            **({"level": "ERROR", "status_message": outcome.reason[:300]} if outcome.status.startswith("failed") else {}),
+        )
+        return outcome
 
 
 def _handle_message(message_id: str, thread_id: str, *, dry_run: bool, store: AgentStateStore | None) -> MessageOutcome:
@@ -234,7 +247,11 @@ def _handle_message(message_id: str, thread_id: str, *, dry_run: bool, store: Ag
             agent = create_agent_graph()
             result = agent.invoke(
                 {
-                    "messages": [HumanMessage(content=_task_prompt(target, thread, decision, earlier_actions, memories, notes_block(store)))],
+                    "messages": [HumanMessage(content=_task_prompt(
+                        target, thread, decision, earlier_actions, memories,
+                        # 24 h notes, then the owner's written corrections of earlier email replies.
+                        "\n\n".join(block for block in (notes_block(store), lessons_prompt("email", store=store)) if block),
+                    ))],
                     "processed_message_ids": [],
                     "actions": [],
                     "pending_approvals": [],
@@ -251,6 +268,11 @@ def _handle_message(message_id: str, thread_id: str, *, dry_run: bool, store: Ag
                 config={"recursion_limit": AGENT_RECURSION_LIMIT},
             )
             outcome.actions = earlier_actions + result.get("actions", [])
+            if not dry_run:
+                remember_origin(
+                    [a["id"] for a in result.get("pending_approvals", []) if a.get("id")], mode="email",
+                    request=f"Incoming email from {outcome.sender}: {outcome.subject}", store=store,
+                )
             outcome.summary = _final_text(result)
             outcome.status = _outcome_status(outcome.actions, result.get("failures", []))
 
@@ -429,9 +451,9 @@ def _process_inbox(store: AgentStateStore, query: str, max_messages: int, dry_ru
 
         try:
             outcome = handle_message(message_id, thread_id, dry_run=dry_run, store=store)
-        except (GoogleApiUnavailableError, LLMUnavailableError) as exc:
-            # An outage is not this email's fault: stop the batch and do not
-            # count the attempt, so the email is retried normally next run.
+        except (GoogleApiUnavailableError, LLMUnavailableError, GoogleSignInRequired) as exc:
+            # An outage (or an expired Google sign-in, audit H4) is not this email's fault: stop
+            # the batch and do not count the attempt, so the email is retried normally next run.
             report_failure(exc, "process_inbox.outage", message_id=message_id)
             if not dry_run:
                 store.add_failure("process_inbox", str(exc), message_id=message_id)
@@ -472,4 +494,8 @@ def handle_owner_command(
     it) fixes "today" for the whole request (app.agent.clock); default: now.
     """
 
-    return handle_owner_request(text, dry_run=dry_run, history=history, context=context, received_at=received_at)
+    # A trace root of its own for the CLI and routines; inside the bot's trace it is a child.
+    with observability.interaction("owner_command", nest=False, tags=["cli"], input={"text": text}, metadata={"dry_run": dry_run}) as trace:
+        result = handle_owner_request(text, dry_run=dry_run, history=history, context=context, received_at=received_at)
+        trace.update(output={"reply": result.reply, "approval_cards": len(result.approval_ids)})
+        return result

@@ -6,7 +6,7 @@ if set); new documents go into Socio's own "Socio" folder. Owner mode only.
 """
 
 from app.files.drive import move_into_output_folder, resolve_drive_file
-from app.google_api import execute_with_retry
+from app.google_api import completed_write, execute_with_retry
 from app.workspace.client import get_workspace_service
 
 
@@ -66,6 +66,8 @@ def create_document(title: str, content: str) -> dict:
         retry=False,
     )
     doc_id = document["documentId"]
+    # It exists from here on: a failure below must not be reported as "nothing changed".
+    completed_write(f"created the Google Doc '{title.strip()}' ({_doc_url(doc_id)})")
 
     if content:
         execute_with_retry(
