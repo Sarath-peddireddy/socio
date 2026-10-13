@@ -281,6 +281,7 @@ def _worker_prompt() -> str:
 
 
 _TOOL_WORD = re.compile(r"\b[a-z]+(?:_[a-z]+)+\b")
+_SENTENCE_END = re.compile(r"(?<=[.!?:])\s+(?=[A-Z(\"'])")
 
 
 def only_tools(prompt: str, allowed: set[str], known: set[str]) -> str:
@@ -296,8 +297,16 @@ def only_tools(prompt: str, allowed: set[str], known: set[str]) -> str:
 
     def flush() -> None:
         named = {word for line in bullet for word in _TOOL_WORD.findall(line)} & known
-        if not named or named & allowed:
+        if not named or not (named - allowed):
             kept.extend(bullet)
+        elif named & allowed:
+            # A bullet about usable and unusable tools: keep only its sentences that name no
+            # tool or a usable one (audit M5, second pass).
+            text = " ".join(line.strip() for line in bullet).removeprefix("- ")
+            sentences = [s for s in _SENTENCE_END.split(text)
+                         if not (set(_TOOL_WORD.findall(s)) & known) or set(_TOOL_WORD.findall(s)) & allowed]
+            if sentences:
+                kept.append("- " + " ".join(sentences))
         bullet.clear()
 
     for line in prompt.splitlines():
