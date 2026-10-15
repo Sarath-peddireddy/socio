@@ -15,7 +15,7 @@ approve it. It remembers the rules you give it. You talk to it from Telegram.
 
 | Incoming email | What Socio does |
 |---|---|
-| "Can we schedule a 30-min interview?" | Finds a free slot and asks you on Telegram; once you approve, it books it with the sender invited and replies with the exact time |
+| "Can we schedule a 30-min interview?" | Finds a free slot and asks you on Telegram; once you approve, it books it with the sender invited and a Google Meet link, and replies with the exact time and the link |
 | "Could you send your resume?" | Finds it in your Google Drive and asks you on Telegram before sending it |
 | "Just to confirm, you join on 1 Nov?" | Writes the reply and asks you on Telegram: *Approve & Send*, *Edit in Gmail*, or *Reject* |
 | "What's your notice period?" (Socio doesn't know) | Saves a ready-to-send Gmail draft with the gaps marked for you |

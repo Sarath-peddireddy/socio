@@ -1,12 +1,47 @@
+import re
 from datetime import date, datetime, time, timedelta, timezone
+from uuid import uuid4
 
 
 from langchain_core.tools import tool
 
 from app.calendar.availability import find_free_slots
 from app.calendar.client import get_calendar_service
+from app.calendar.events import meet_link
 from app.calendar.holds import held_periods
 from app.google_api import execute_with_retry
+
+
+# Where a booking's confirmation email puts the Google Meet link that Calendar creates
+# when the owner approves (the model never writes a meeting link itself).
+MEET_LINK_PLACEHOLDER = "[meeting link]"
+_SIGN_OFF = re.compile(
+    r"(?im)^(best|best regards|regards|kind regards|warm regards|thanks|thank you|many thanks|cheers|sincerely)[,.!]?[ \t]*$"
+)
+
+
+def with_meet_placeholder(body: str) -> str:
+    """The reply with a line for the Meet link (before the sign-off) unless it already has one."""
+
+    if not body.strip() or MEET_LINK_PLACEHOLDER in body:
+        return body
+    line = f"Google Meet link: {MEET_LINK_PLACEHOLDER}"
+    sign_offs = list(_SIGN_OFF.finditer(body))
+    if sign_offs:
+        at = sign_offs[-1].start()
+        return f"{body[:at].rstrip()}\n\n{line}\n\n{body[at:]}"
+    return f"{body.rstrip()}\n\n{line}"
+
+
+def fill_meet_link(body: str, link: str) -> str:
+    """The placeholder replaced by the real link; with no link, the lines that mention it are dropped."""
+
+    if MEET_LINK_PLACEHOLDER not in body:
+        return body
+    if link:
+        return body.replace(MEET_LINK_PLACEHOLDER, link)
+    kept = "\n".join(line for line in body.split("\n") if MEET_LINK_PLACEHOLDER not in line)
+    return re.sub(r"\n{3,}", "\n\n", kept).strip()
 
 
 # All interview times are interpreted in India time. A fixed offset is used
@@ -131,10 +166,14 @@ def create_calendar_event(
     attendee_email: str = "",
     meeting_link: str = "",
     attendee_emails: list[str] | None = None,
+    video_call: bool = False,
 ) -> dict:
     """
     Create an interview or meeting event in the user's primary
     Google Calendar.
+
+    video_call=True asks Google to add a Google Meet call; its link is
+    returned as meet_link ("" if Google did not create one).
 
     attendee_emails (optional) invites several people; attendee_email is
     the single-person form and is merged with it.
@@ -284,6 +323,10 @@ def create_calendar_event(
     ))
     if invitees:
         event["attendees"] = [{"email": address} for address in invitees]
+    if video_call:
+        event["conferenceData"] = {
+            "createRequest": {"requestId": uuid4().hex, "conferenceSolutionKey": {"type": "hangoutsMeet"}}
+        }
 
     # Not retried: a timed-out insert may still have created the event.
     created_event = execute_with_retry(
@@ -292,12 +335,26 @@ def create_calendar_event(
             calendarId="primary",
             body=event,
             sendUpdates="all" if invitees else "none",
+            **({"conferenceDataVersion": 1} if video_call else {}),
         ),
         operation_name="calendar_create_event",
         retry=False,
     )
 
+    link = meet_link(created_event)
+    if video_call and not link and created_event.get("id"):
+        # Google may finish setting up the call just after the insert answers: look once more.
+        # The event exists either way, so a failed look only means no link in the reply.
+        try:
+            link = meet_link(execute_with_retry(
+                service.events().get(calendarId="primary", eventId=created_event["id"]),
+                operation_name="calendar_get_event",
+            ))
+        except Exception:
+            link = ""
+
     return {
+        "meet_link": link,
         "event_id": created_event.get("id"),
         "title": created_event.get("summary"),
         "start": created_event.get("start", {}).get("dateTime"),

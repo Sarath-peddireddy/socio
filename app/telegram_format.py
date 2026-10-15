@@ -402,9 +402,12 @@ def _link_lines(payload: dict[str, Any]) -> list[str]:
 
 def _follow_up(payload: dict[str, Any]) -> list[str]:
     reply = payload.get("reply")
-    if not reply:
-        return []
-    return ["", _field("Then reply to", reply.get("to")), quote(reply.get("body"))]
+    if reply:
+        return ["", _field("Then reply to", reply.get("to")), quote(reply.get("body"))]
+    notice = payload.get("notice")  # owner-mode move / cancel: the email to the attendees
+    if notice:
+        return ["", _field("Then email", ", ".join(notice.get("to") or [])), quote(notice.get("body"))]
+    return []
 
 
 def card_text(approval: dict[str, Any]) -> str:
@@ -456,6 +459,8 @@ def card_text(approval: dict[str, Any]) -> str:
         ]
         if payload.get("meeting_link"):
             lines.append(_field("Link", payload["meeting_link"]))
+        elif payload.get("video_call") == "google_meet":
+            lines.append(_field("Video call", "Google Meet (link created when you approve)"))
         lines += _follow_up(payload)
     elif kind == "move_event":
         lines = [
@@ -508,8 +513,9 @@ def card_text(approval: dict[str, Any]) -> str:
         if not sheet and payload.get("content"):
             lines.append(f"• <b>Content:</b>\n{quote(payload['content'])}")
         link = "🔗 Sheet link" if sheet else "🔗 Doc link"
+        in_thread = " (reply in the same conversation)" if payload.get("in_reply_to") else ""
         lines += [
-            f"• {_field('Subject', payload.get('subject') or '(no subject)')}",
+            f"• {_field('Subject', payload.get('subject') or '(no subject)')}{in_thread}",
             f"• <b>Message:</b>\n{quote(with_link(payload.get('body') or '', link))}",
             f"<i>{link} becomes the real link once it's created.</i>",
         ]

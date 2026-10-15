@@ -33,6 +33,7 @@ Failures are logged in full (app.errors) and reported with a short fixed message
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import datetime
 from email.utils import parseaddr
@@ -42,7 +43,7 @@ from app.agent.eval_feedback import capture_approval_failure
 from app.agent.followups import complete_followup_task
 from app.agent.state import AgentStateStore
 from app.calendar.events import cancel_event, find_conflicts, get_event, move_event, parse_ist, summarize_event
-from app.calendar.tools import INDIA_TZ, create_calendar_event
+from app.calendar.tools import INDIA_TZ, create_calendar_event, fill_meet_link
 from app.files.local import resolve_shareable_file
 from app.gmail.drafts import create_draft, create_reply_draft
 from app.gmail.messages import send_new_email, send_reply, trash_message
@@ -194,7 +195,8 @@ def check_still_current(approval: dict[str, Any]) -> str | None:
     """
 
     payload, kind = approval["payload"], approval["type"]
-    reply = payload.get("reply") or {}
+    # A Create & Share that answers an email checks its conversation like a reply does.
+    reply = payload.get("reply") or payload.get("in_reply_to") or {}
 
     if reply.get("thread_id") and reply.get("last_seen_message_id"):
         thread = get_thread_details(reply["thread_id"])
@@ -267,6 +269,32 @@ def format_time(value: str | None) -> str:
     return f"{moment:%a %d %b}, {clock_12(moment)} IST"
 
 
+def attendee_notice(kind: str, payload: dict[str, Any], body: str = "") -> dict[str, Any] | None:
+    """
+    Owner mode: the email the attendees get from the owner about a move or a cancellation, on
+    top of Google's automatic update; sent right after the change, on the same tap. body is the
+    agent's own text when it wrote one, otherwise a short note with the exact times.
+    """
+
+    attendees = [address for address in payload.get("other_attendees") or [] if address]
+    if kind not in {"move_event", "cancel_event"} or not attendees:
+        return None
+    title = payload.get("title") or "our meeting"
+    if kind == "move_event":
+        subject = f"Meeting moved: {title}"
+        note = (
+            f"I've moved \"{title}\" from {format_time(payload.get('old_start'))} "
+            f"to {format_time(payload.get('new_start'))}. The calendar invite has been updated."
+        )
+    else:
+        subject = f"Meeting cancelled: {title}"
+        note = f"I've cancelled \"{title}\" on {format_time(payload.get('old_start'))}."
+    if not body.strip():
+        owner = os.getenv("AGENT_OWNER_NAME", "").strip()
+        body = f"Hi,\n\n{note}\n\nBest,{chr(10) + owner if owner else ''}"
+    return {"to": attendees, "subject": subject, "body": body.strip()}
+
+
 def invitees(payload: dict[str, Any]) -> list[str]:
     """Everyone a booking invites (older approvals only have attendee_email)."""
 
@@ -290,6 +318,8 @@ def describe(approval: dict[str, Any]) -> str:
         )
         if payload.get("meeting_link"):
             text += f"\nLink: {payload['meeting_link']}"
+        elif payload.get("video_call") == "google_meet":
+            text += "\nVideo call: Google Meet (link created when approved)"
     elif kind == "move_event":
         text = (
             f"Move calendar event '{payload.get('title')}'\n"
@@ -332,7 +362,9 @@ def describe(approval: dict[str, Any]) -> str:
         what = "Google Sheet" if payload.get("kind") == "spreadsheet" else "Google Doc"
         text = (
             f"Create {what} '{payload.get('title')}', give {payload.get('recipient')} {access_words(payload)}, "
-            f"and email them the link\nSubject: {payload.get('subject') or '(none)'}\n\"{payload.get('body', '')}\""
+            f"and email them the link\nSubject: {payload.get('subject') or '(none)'}"
+            + (" (reply in the same conversation)" if payload.get("in_reply_to") else "")
+            + f"\n\"{payload.get('body', '')}\""
         )
         if payload.get("headers"):
             text += "\nColumns: " + " | ".join(payload["headers"])
@@ -381,6 +413,10 @@ def describe(approval: dict[str, Any]) -> str:
     if reply and kind not in REPLY_TYPES:
         text += f"\nThen reply to {reply.get('to')}:\n\"{reply.get('body')}\""
 
+    notice = payload.get("notice")  # owner-mode move / cancel: the email to the attendees
+    if notice and kind in {"move_event", "cancel_event"}:
+        text += f"\nThen email {', '.join(notice['to'])}:\n\"{notice['body']}\""
+
     return text
 
 
@@ -416,7 +452,7 @@ def _diff_lines(text: str, limit: int = 700) -> str:
     return "\n".join(f"+ {line}" for line in text.splitlines()) or "+ (empty)"
 
 
-def _send_follow_up_reply(payload: dict[str, Any]) -> dict[str, Any] | None:
+def _send_follow_up_reply(payload: dict[str, Any], meet_link: str = "") -> dict[str, Any] | None:
     reply = payload.get("reply")
     if not reply:
         return None
@@ -426,8 +462,18 @@ def _send_follow_up_reply(payload: dict[str, Any]) -> dict[str, Any] | None:
         message_id=reply["message_id"],
         to=reply["to"],
         subject="",
-        body=reply["body"],
+        # A booking's "[meeting link]" becomes the Meet link Google just created (or is dropped).
+        body=fill_meet_link(reply["body"], meet_link),
     )
+
+
+def _send_attendee_notice(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Owner mode: one email to every attendee about the move / cancellation (never retried)."""
+
+    notice = payload.get("notice")
+    if not notice:
+        return None
+    return send_new_email(to=", ".join(notice["to"]), subject=notice["subject"], body=notice["body"])
 
 
 def _execute(approval: dict[str, Any]) -> dict[str, Any]:
@@ -555,6 +601,7 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
             "attendee_email": payload.get("attendee_email", ""),
             "attendee_emails": payload.get("attendees") or [],
             "meeting_link": payload.get("meeting_link", ""),
+            "video_call": payload.get("video_call") == "google_meet",
         })
         if not event.get("verified"):
             raise RuntimeError(f"Google did not confirm the event: {event}")
@@ -570,7 +617,10 @@ def _execute(approval: dict[str, Any]) -> dict[str, Any]:
 
     # The calendar change succeeded; a failed reply must not hide that.
     try:
-        result["reply"] = _send_follow_up_reply(payload)
+        result["reply"] = _send_follow_up_reply(payload, (result["event"] or {}).get("meet_link") or "")
+        notice = _send_attendee_notice(payload)
+        if notice:
+            result["notice"] = notice
     except Exception as exc:
         report_failure(exc, "approval.follow_up_reply", approval_id=approval.get("id"), type=kind)
         result["reply_error"] = f"{type(exc).__name__}: {exc}"
@@ -748,14 +798,26 @@ def approve(approval_id: int, store: AgentStateStore | None = None) -> dict[str,
             message += f" {result['not_closed']} were already gone."
         for task_id in approval["payload"].get("task_ids", []):
             store.close_tracked_task(task_id, "closed_by_socio_cleanup")
+    if approval["type"] == "book_meeting" and (result.get("event") or {}).get("meet_link"):
+        message += f" Google Meet: {result['event']['meet_link']}"
+    elif approval["type"] == "book_meeting" and approval["payload"].get("video_call") == "google_meet":
+        message += " Google didn't add a video call, so there is no Meet link."
     if result.get("reply") and approval["type"] not in REPLY_TYPES:
         message += " The reply was sent in the conversation."
+    if result.get("notice"):
+        message += f" I emailed {', '.join(approval['payload']['notice']['to'])} about it."
     for key in ("document", "spreadsheet"):
         if (result.get(key) or {}).get("url"):
             message += f" {result[key]['url']}"
     if result.get("reply_error"):
         done = "Access was given" if approval["type"] == "share_file" else "The calendar was updated"
-        if result.get("reply_unknown"):
+        if approval["payload"].get("notice"):  # owner mode: the email to the attendees, not a reply
+            if result.get("reply_unknown"):
+                message += (f" {done}. I can't tell whether the email to the attendees went out (the connection "
+                            "to Google dropped). Check your Gmail Sent folder before sending it again.")
+            else:
+                message += f" {done}, but the email to the attendees didn't go through. {result.get('reply_error_text', '')}".rstrip()
+        elif result.get("reply_unknown"):
             message += f" {done}. {UNKNOWN_REPLY}"
         else:
             message += f" {done}, but the reply failed. {result.get('reply_error_text', '')}".rstrip()

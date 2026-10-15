@@ -836,7 +836,12 @@ class Bot:
             logger.warning("Could not set the command menu: %s", exc)
 
     def _run_instruction(self, text: str, received_at: datetime | None = None) -> None:
-        self.api.call("sendChatAction", chat_id=self.owner_chat_id, action="typing")
+        # "typing…" is cosmetic: a network drop here once cost the whole instruction (the update
+        # was already consumed, so the owner's message was silently lost).
+        try:
+            self.api.call("sendChatAction", chat_id=self.owner_chat_id, action="typing")
+        except Exception as exc:
+            logger.warning("Could not show 'typing': %s", exc)
         self._note_decisions()
         context = format_anchor(get_context_anchor(self.owner_chat_id, self.store))
         kwargs = {"received_at": received_at} if received_at else {}
@@ -1133,7 +1138,11 @@ class Bot:
     def run_forever(self) -> None:
         if self.owner_chat_id is not None:
             self.set_command_menu()
-            self.send("🤖 <b>Socio is online.</b> Send /help for commands.")
+            # A greeting must never stop the bot: a network drop here once made it exit at startup.
+            try:
+                self.send("🤖 <b>Socio is online.</b> Send /help for commands.")
+            except Exception as exc:
+                logger.warning("Could not send the 'online' message: %s", exc)
 
         # Langfuse keys: rejected -> tracing off with one warning; unreachable -> carry on.
         observability.check_connection_in_background()

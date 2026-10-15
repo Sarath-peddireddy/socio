@@ -18,7 +18,11 @@
    approvals too (`propose_create_task`, `propose_complete_task`, developer decision
    2026-10-11); Socio never adds tasks on its own (automatic follow-ups are off).
 4. **Never claim what didn't happen.** An action counts as done only when the
-   API result confirms it; sends are re-checked in the thread.
+   API result confirms it; sends are re-checked in the thread. Meeting links are
+   never written by the model: a booking's Google Meet link comes from Google on
+   approval, an existing meeting's from its calendar event, and any other video-call
+   link in an outgoing write must appear in what Socio read
+   (`graph._invented_meeting_link`).
 5. **Memory informs, never authorizes.** Learned preferences and saved skills
    shape what the agent proposes; every gate above still applies.
 
@@ -448,8 +452,8 @@ thread part.
 | `create_and_share` | create a Sheet/Doc, give the recipient access, email them the link |
 | `share_file` | give someone access to a file Socio created (Google emails them) |
 | `enable_skill_script` | trust `skills/<name>.py` at the SHA-256 shown (re-checked) |
-| `book_meeting` | create the event (conflict re-checked, every attendee invited), then the reply |
-| `move_event` / `cancel_event` | patch / delete the event (attendees notified), then the reply |
+| `book_meeting` | create the event with a Google Meet call (conflict re-checked, every attendee invited; from an email the sender is always invited), then the reply with the real Meet link in place of `[meeting link]` |
+| `move_event` / `cancel_event` | patch / delete the event (Google notifies attendees), then the reply in the email thread; on the owner's instruction instead one email from the owner to all attendees (old -> new time, or cancelled; shown on the card as "Then email") |
 | `trash_email` | move the message or thread to Trash |
 
 `approvals.to_draft()` (Edit in Gmail, `--draft ID`) saves a held email as a

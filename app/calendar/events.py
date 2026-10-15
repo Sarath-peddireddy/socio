@@ -28,6 +28,19 @@ def parse_ist(value: str) -> datetime:
     return parsed.astimezone(INDIA_TZ)
 
 
+def meet_link(event: dict) -> str:
+    """The event's Google Meet (video call) link, or "" when it has none."""
+
+    if not isinstance(event, dict):
+        return ""
+    if isinstance(event.get("hangoutLink"), str) and event["hangoutLink"]:
+        return event["hangoutLink"]
+    for point in (event.get("conferenceData") or {}).get("entryPoints", []):
+        if point.get("entryPointType") == "video" and point.get("uri"):
+            return point["uri"]
+    return ""
+
+
 def summarize_event(event: dict) -> dict:
     """Compact, LLM-friendly view of an event."""
 
@@ -39,6 +52,8 @@ def summarize_event(event: dict) -> dict:
         "start": event.get("start", {}).get("dateTime") or event.get("start", {}).get("date"),
         "end": event.get("end", {}).get("dateTime") or event.get("end", {}).get("date"),
         "status": event.get("status"),
+        # The only meeting link Socio may give out for this event ("" = it has no video call).
+        "meet_link": meet_link(event),
         # Attendees other than the owner ("self" is set by Google for the owner).
         "other_attendees": [a.get("email", "").lower() for a in attendees if not a.get("self") and a.get("email")],
         "organizer_is_owner": bool(event.get("organizer", {}).get("self")),

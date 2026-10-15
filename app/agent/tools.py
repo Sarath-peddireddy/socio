@@ -7,6 +7,7 @@ from langchain_core.tools import tool
 from app.agent.decision import decide_reply_needed
 from app.agent.untrusted import untrusted_email_view
 from app.calendar.events import INDIA_TZ, get_event, list_events, parse_ist, summarize_event, validate_new_time
+from app.calendar.tools import MEET_LINK_PLACEHOLDER, with_meet_placeholder
 from app.files.local import resolve_shareable_file, search_documents
 from app.gmail.drafts import create_reply_draft as create_gmail_reply_draft
 from app.gmail.tools import search_emails, get_thread_details
@@ -297,7 +298,10 @@ def find_calendar_events(query: str = "", days_ahead: int = 14, days_back: int =
     location, and attendees (e.g. a person's name or email). Searches from
     days_back days ago to days_ahead days ahead (max 60).
 
-    Each result has event_id, title, start, end, and other_attendees.
+    Each result has event_id, title, start, end, other_attendees, and meet_link
+    (the event's Google Meet link, "" if it has no video call). To send someone a
+    meeting's link, use exactly this meet_link; if it is empty, say the meeting has
+    no video link. Never make one up.
     """
 
     now = datetime.now(INDIA_TZ)
@@ -326,7 +330,11 @@ def propose_move_calendar_event(
     Nothing changes until the owner approves. new_start_time/new_end_time
     are ISO 8601 (naive times are IST) and must be free. reply_body is the
     email reply to send in this thread AFTER the move is approved, stating
-    the new time; do not send a separate reply yourself.
+    the new time; do not send a separate reply yourself. On the owner's
+    instruction (no email thread), the attendees get one email about the move
+    on the same approval: reply_body is that email if you write one (only if
+    the owner said what to tell them), otherwise a short note with the old and
+    new time is used. Do not send a separate email.
     """
 
     event = summarize_event(get_event(event_id))
@@ -388,15 +396,26 @@ def propose_book_meeting(
     then. start_time/end_time are ISO 8601 (naive times are IST) and must be
     free. attendee_email / attendee_emails (optional, any number of people) are
     invited by Google, which emails each of them the invite with Accept / Decline.
-    meeting_link is added to the description. reply_body is the email reply to
-    send in this thread AFTER the booking is approved, stating the exact time; do
-    not send a separate reply yourself.
+    Google Meet: when the owner approves, Google adds a real Meet video call and its
+    link goes into the invite. NEVER write a meeting link yourself. Leave meeting_link
+    empty unless the email itself contains the link to use (e.g. the sender's own Zoom
+    link): only then is it used instead of Meet. reply_body is the email reply to send
+    in this thread AFTER the booking is approved, stating the exact time; write
+    [meeting link] where the Meet link should go (it is replaced by the real link; if
+    you leave it out, a "Google Meet link:" line is added). Do not send a separate
+    reply yourself.
     """
 
     start, end = parse_ist(start_time), parse_ist(end_time)
     validate_new_time(start, end)
 
     attendees = attendee_list(attendee_email, attendee_emails)
+    meeting_link = meeting_link.strip()
+    if meeting_link:
+        # The sender's own link is used as is; the reply has no Meet link to fill in.
+        reply_body = reply_body.replace(MEET_LINK_PLACEHOLDER, meeting_link)
+    else:
+        reply_body = with_meet_placeholder(reply_body)
 
     return {
         "proposal": {
@@ -409,6 +428,8 @@ def propose_book_meeting(
             "other_attendees": attendees,
             "description": description,
             "meeting_link": meeting_link,
+            # Approving asks Google for a Meet call unless the sender gave their own link.
+            "video_call": "" if meeting_link else "google_meet",
             "reason": reason,
             "reply_body": reply_body,
         }
@@ -422,7 +443,11 @@ def propose_cancel_calendar_event(event_id: str, reason: str, reply_body: str = 
 
     Nothing changes until the owner approves; attendees are then notified by
     Google. reply_body is the email reply to send in this thread AFTER the
-    cancellation is approved; do not send a separate reply yourself.
+    cancellation is approved; do not send a separate reply yourself. On the
+    owner's instruction (no email thread), the attendees get one email about
+    the cancellation on the same approval: reply_body is that email if you
+    write one (only if the owner said what to tell them), otherwise a short
+    standard note is used. Do not send a separate email.
     """
 
     event = summarize_event(get_event(event_id))
@@ -594,8 +619,14 @@ def create_and_share_file(
     headers: list[str] | None = None,
     content: str = "",
     role: str = "",
+    thread_id: str = "",
+    message_id: str = "",
 ) -> dict:
     """
+    When the file answers an email (someone asked for it), pass that email's thread_id and
+    message_id: the link then goes as a REPLY in that conversation (subject left as it is),
+    never as a separate new email. Leave both empty only when no email asked for it.
+
     Create a new Google Sheet (kind="spreadsheet", optional header row) or Google Doc
     (kind="document", with content), give recipient_email access, and email them the
     link. role: "editor", "commenter" or "viewer" when the owner said which (default

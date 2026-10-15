@@ -1,7 +1,7 @@
 import json
 import re
 import threading
-from email.utils import getaddresses
+from email.utils import getaddresses, parseaddr
 from typing import Annotated, Any
 
 from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage, ToolMessage
@@ -12,7 +12,8 @@ from typing_extensions import TypedDict
 from app.agent.llm import SUPERVISOR, WORKER, get_llm, invoke_llm
 from app.agent.prompts import build_system_prompt, only_tools
 from app.agent.state import AgentStateStore
-from app.agent.approvals import GAP_MARKER, describe
+from app.agent.approvals import GAP_MARKER, attendee_notice, describe
+from app.calendar.tools import MEET_LINK_PLACEHOLDER
 from app.agent.tools import (
     append_sheet_row,
     append_to_document,
@@ -377,6 +378,68 @@ def _steered_write(tool_name: str, state: "AgentState") -> str | None:
     )
 
 
+# Video-call links. A model once wrote "https://meet.google.com/new" into a reply as "the
+# meeting link": that address starts a new, empty call for whoever opens it.
+_MEETING_URL = re.compile(
+    r"(?i)\b(?:https?://)?(?:meet\.google\.com|(?:[\w-]+\.)*zoom\.us|teams\.microsoft\.com|teams\.live\.com"
+    r"|(?:[\w-]+\.)*webex\.com)(?:/[^\s<>()\[\]\"']*)?"
+)
+_MEET_CODE = re.compile(r"(?i)^meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}$")
+
+
+def _strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [text for item in value.values() for text in _strings(item)]
+    if isinstance(value, (list, tuple)):
+        return [text for item in value for text in _strings(item)]
+    return []
+
+
+def _bare_link(url: str) -> str:
+    return re.sub(r"(?i)^https?://", "", url).rstrip(".,;:!?").rstrip("/").lower()
+
+
+def _invented_meeting_link(tool_name: str, args: dict[str, Any], state: "AgentState") -> str | None:
+    """
+    Refuse a write that carries a meeting link nobody gave: every video-call link in it must
+    appear in what the model read (the instruction or email, tool results such as a calendar
+    event's meet_link), never only in its own words. Socio's own bookings get a real Google Meet
+    link from Google on approval ("[meeting link]" in the booking's reply_body).
+    """
+
+    if tool_name not in SIDE_EFFECT_TOOLS | PROPOSAL_TOOLS | OWNER_GATED_TOOLS | CONDITIONAL_PROPOSAL_TOOLS:
+        return None
+    texts = _strings(args)
+    if tool_name != "propose_book_meeting" and any(MEET_LINK_PLACEHOLDER in text for text in texts):
+        return (
+            f"Refused: {MEET_LINK_PLACEHOLDER} is only filled in for a new booking (propose_book_meeting). "
+            "For an existing meeting, write its meet_link from find_calendar_events; if that is empty, "
+            "say the meeting has no video link."
+        )
+    links = {_bare_link(match) for text in texts for match in _MEETING_URL.findall(text)}
+    if not links:
+        return None
+    sources = " ".join(
+        [state.get("owner_text") or ""]
+        + [message.text for message in state.get("messages", []) if isinstance(message, (HumanMessage, ToolMessage))]
+    )
+    sources = re.sub(r"(?i)https?://", "", sources).lower()
+    owner_words = re.sub(r"(?i)https?://", "", state.get("owner_text") or "").lower()
+    for link in sorted(links):
+        # A Meet address without a meeting code (meet.google.com/new) is not a meeting.
+        fake_meet = link.startswith("meet.google.com") and not _MEET_CODE.match(link) and link not in owner_words
+        if fake_meet or link not in sources:
+            return (
+                f"Refused: {link} is not a real link to this meeting (it is not in the conversation, the "
+                "owner's message, or the calendar). Never write a meeting link yourself: a new booking gets "
+                f"a real Google Meet link when the owner approves (write {MEET_LINK_PLACEHOLDER} in reply_body), "
+                "and an existing meeting's link is the meet_link from find_calendar_events. Nothing was sent."
+            )
+    return None
+
+
 def _dry_run_result(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "dry_run": True,
@@ -635,7 +698,7 @@ def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any
         title = (args.get("title") or "").strip()
         if not title or _placeholder_title(title):
             title = _title_from_subject(args.get("subject") or "", kind, recipient)
-        return {
+        proposal = {
             "type": "create_and_share",
             "kind": kind,
             "title": title,
@@ -646,6 +709,24 @@ def _owner_write_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any
             "subject": (args.get("subject") or "").strip() or title,
             "body": args["message"].strip(),
         }
+        # Answering an email: the link goes as a reply in that conversation (it once went as a
+        # separate "Re: Requirement" email). Same checks as an owner-mode reply.
+        thread_id, message_id = (args.get("thread_id") or "").strip(), (args.get("message_id") or "").strip()
+        if thread_id or message_id:
+            from app.agent.tools import check_reply_target
+            from app.gmail.tools import get_thread_details
+
+            if not (thread_id and message_id):
+                raise ValueError("To reply in a conversation, give both its thread_id and the message_id being answered.")
+            thread = get_thread_details(thread_id)
+            check_reply_target(thread, thread_id, message_id, recipient)
+            original = next((m.get("subject", "") for m in thread if m.get("id") == message_id), "").strip()
+            proposal["subject"] = original if original.lower().startswith("re:") else f"Re: {original}".strip()
+            proposal["in_reply_to"] = {
+                "thread_id": thread_id, "message_id": message_id,
+                "last_seen_message_id": thread[-1].get("id", "") if thread else "",
+            }
+        return proposal
 
     if tool_name == "share_drive_file":
         from app.workspace.sharing import normalize_role, shareable_file, validate_recipient
@@ -683,6 +764,12 @@ def _record_proposal(
             failures.append(f"{kind}: {refusal}")
             return refusal
 
+        # A meeting booked from an email always invites the person who asked for it (the
+        # recipient comes from the runner, like a reply's). A Re-check once booked "nobody".
+        sender = parseaddr(state.get("reply_recipient") or "")[1].strip().lower()
+        if kind == "book_meeting" and sender and not proposal.get("attendees"):
+            proposal.update(attendee_email=sender, attendees=[sender], other_attendees=[sender])
+
         if reply_body:
             proposal["reply"] = {
                 "thread_id": state.get("target_thread_id"),
@@ -692,6 +779,12 @@ def _record_proposal(
                 "body": reply_body,
                 "last_seen_message_id": state.get("thread_last_message_id", ""),
             }
+    else:
+        # Owner mode: the attendees also get an email from the owner about a move or
+        # cancellation, not only Google's automatic update (developer decision 2026-10-14).
+        notice = attendee_notice(kind, proposal, reply_body)
+        if notice:
+            proposal["notice"] = notice
 
     summary = describe({"type": kind, "payload": proposal})
 
@@ -821,7 +914,11 @@ def _run_tool_call(
     args = tool_call.get("args", {})
     target = _action_target(tool_name, args)
 
-    refusal = _scope_violation(tool_name, args, state) or _steered_write(tool_name, state)
+    refusal = (
+        _scope_violation(tool_name, args, state)
+        or _steered_write(tool_name, state)
+        or _invented_meeting_link(tool_name, args, state)
+    )
 
     # Never reply twice to the same message, including across restarts. In owner mode only a
     # reply that really went out counts: is_processed() is also true for emails the inbox

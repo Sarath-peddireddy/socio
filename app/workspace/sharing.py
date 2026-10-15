@@ -252,7 +252,7 @@ def create_and_share(payload: dict[str, Any]) -> dict[str, Any]:
     """
 
     from app.errors import report_failure, safe_error_text
-    from app.gmail.messages import send_new_email
+    from app.gmail.messages import send_new_email, send_reply
     from app.workspace import docs, sheets
 
     if payload["kind"] == "spreadsheet":
@@ -271,8 +271,15 @@ def create_and_share(payload: dict[str, Any]) -> dict[str, Any]:
         return result
 
     body = with_link(payload["body"], created["url"])
+    thread = payload.get("in_reply_to")  # answering an email: reply in that conversation
     try:
-        result["email"] = send_new_email(to=payload["recipient"], subject=payload.get("subject", ""), body=body)
+        if thread:
+            result["email"] = send_reply(
+                thread_id=thread["thread_id"], message_id=thread["message_id"],
+                to=payload["recipient"], subject="", body=body,
+            )
+        else:
+            result["email"] = send_new_email(to=payload["recipient"], subject=payload.get("subject", ""), body=body)
     except Exception as exc:
         report_failure(exc, "sharing.email", file=file_id)
         result["email_error"] = safe_error_text(exc)
