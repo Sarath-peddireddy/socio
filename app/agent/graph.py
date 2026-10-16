@@ -12,8 +12,8 @@ from typing_extensions import TypedDict
 from app.agent.llm import SUPERVISOR, WORKER, get_llm, invoke_llm
 from app.agent.prompts import build_system_prompt, only_tools
 from app.agent.state import AgentStateStore
-from app.agent.approvals import GAP_MARKER, attendee_notice, describe
-from app.calendar.tools import MEET_LINK_PLACEHOLDER
+from app.agent.approvals import GAP_MARKER, attendee_notice, clock_12, describe
+from app.calendar.tools import MEET_LINK_PLACEHOLDER, clock_mentions, in_working_hours
 from app.agent.tools import (
     append_sheet_row,
     append_to_document,
@@ -241,7 +241,9 @@ def should_continue(state: AgentState):
 
     last_message = state["messages"][-1]
     tool_calls = getattr(last_message, "tool_calls", [])
-    return "tools" if tool_calls else END
+    if tool_calls:
+        return "tools"
+    return "nudge" if _promised_card_missing(state) else END
 
 
 def _execute_tool(tool_call: dict[str, Any]):
@@ -440,6 +442,252 @@ def _invented_meeting_link(tool_name: str, args: dict[str, Any], state: "AgentSt
     return None
 
 
+# Tools whose results carry an email's own text (where a requested time can come from).
+EMAIL_READ_TOOLS = {"get_recent_emails", "get_email", "search_gmail", "get_thread", "check_reply_needed"}
+_SLOT_ARGS = {"propose_book_meeting": ("start_time", "end_time"), "propose_move_calendar_event": ("new_start_time", "new_end_time")}
+
+
+def _unrequested_time(tool_name: str, args: dict[str, Any], state: "AgentState") -> str | None:
+    """
+    Developer rule (2026-10-15): book or move inside weekdays 11:00-16:00 IST, unless the owner or
+    the email named that exact time. A model once booked 9:30 AM (3:00 PM IST converted to UTC)
+    for an email that said 3 PM. Sources: the owner's words, the email in the task, and emails
+    read with Gmail tools; never the model's own words or calendar data.
+    """
+
+    keys = _SLOT_ARGS.get(tool_name)
+    if not keys:
+        return None
+    try:
+        start, end = parse_ist(args.get(keys[0]) or ""), parse_ist(args.get(keys[1]) or "")
+    except ValueError:
+        return None  # the tool itself explains a malformed time
+    if in_working_hours(start, end):
+        return None
+
+    messages = state.get("messages", [])
+    email_calls = {
+        call.get("id") for message in messages for call in (getattr(message, "tool_calls", None) or [])
+        if call.get("name") in EMAIL_READ_TOOLS
+    }
+    sources = [state.get("owner_text") or ""] + [
+        message.text for message in messages
+        if isinstance(message, HumanMessage) or (isinstance(message, ToolMessage) and message.tool_call_id in email_calls)
+    ]
+    wanted = (start.hour, start.minute)
+    if any(wanted in mention for text in sources for mention in clock_mentions(text)):
+        return None
+    return (
+        f"Refused: {start:%a %d %b}, {clock_12(start)} IST is outside working hours (weekdays 11:00-16:00 IST) "
+        "and neither the owner nor the email asked for that time. Use a free slot inside the window "
+        "(find_calendar_availability), or exactly the time that was asked for, in IST "
+        "(e.g. 2026-10-16T15:00:00+05:30). Never convert times to UTC."
+    )
+
+
+# The owner asks for a new file to go to someone: "share", "send", "email them", "give X access".
+_SHARE_CUE = re.compile(r"\b(share[ds]?|sharing|send|sent|e-?mail|mail|access|invite)\b", re.IGNORECASE)
+_CREATE_ONLY_REFUSAL = "Refused: to create a file AND share or send it"
+
+
+def _create_without_share(tool_name: str, state: "AgentState") -> str | None:
+    """
+    Manual test T05 (2026-10-16): "Create a Google Sheet ..., give X viewer access, and email
+    them" ran on Mistral (both Gemini keys 503) as create_spreadsheet alone: the sheet was
+    created and never shared or sent. Refused once per run when the owner's words ask to share
+    or send and create_and_share_file is available; the same call again goes through (a request
+    that only mentions an email, e.g. "a doc summarising Priya's email", is not blocked).
+    """
+
+    if tool_name not in {"create_spreadsheet", "create_document"} or not _SHARE_CUE.search(state.get("owner_text") or ""):
+        return None
+    if "create_and_share_file" not in {agent_tool.name for agent_tool in _allowed_tools(state)}:
+        return None
+    if any(
+        isinstance(message, ToolMessage) and message.text.startswith(_CREATE_ONLY_REFUSAL)
+        for message in state.get("messages", [])
+    ):
+        return None
+    return (
+        f"{_CREATE_ONLY_REFUSAL} (the owner asked to share / send / email it), call create_and_share_file "
+        "once instead: one approval creates it, gives the access the owner named (viewer / commenter / "
+        "editor), and emails the link with your message. Nothing was created. Only if the owner did not "
+        f"ask for the file to go to anyone, call {tool_name} again unchanged."
+    )
+
+
+_EXISTING_FILE_REFUSAL = "Refused: a file with this name already exists"
+_FOUND_NAME = re.compile(r"""['"]name['"]: (['"])(.*?)\1""")
+
+
+def _recreates_existing_file(tool_name: str, args: dict[str, Any], state: "AgentState") -> str | None:
+    """
+    Live test L12 (2026-10-16): "Send the T05 Vendor Tracker sheet to X" once became
+    create_and_share_file with the found file in an unknown "file" argument: the card offered to
+    create a second, empty "T05 Vendor Tracker". Refused once per run when it names an existing
+    file or a file find_documents just found; the same call again goes through (a new file with
+    the same name, if the owner really asked for one).
+    """
+
+    if tool_name != "create_and_share_file":
+        return None
+    messages = state.get("messages", [])
+    if any(isinstance(m, ToolMessage) and m.text.startswith(_EXISTING_FILE_REFUSAL) for m in messages):
+        return None
+    given = next((str(args[key]) for key in ("file", "path", "file_id", "spreadsheet", "document") if args.get(key)), "")
+    title = (args.get("title") or "").strip().casefold()
+    found_calls = {
+        call.get("id") for message in messages for call in (getattr(message, "tool_calls", None) or [])
+        if call.get("name") == "find_documents"
+    }
+    found = {
+        match.group(2).strip().casefold()
+        for message in messages
+        if isinstance(message, ToolMessage) and message.tool_call_id in found_calls
+        for match in _FOUND_NAME.finditer(message.text)
+    }
+    if not given and not (title and title in found):
+        return None
+    return (
+        f"{_EXISTING_FILE_REFUSAL} ({given or args.get('title')}). Nothing was created. To send an existing "
+        "file, call send_new_email (or send_gmail_reply) with attachment_paths=[its path from find_documents] "
+        "and [link] in the body: it goes as its live link. Only if the owner asked for a NEW file with the "
+        "same name, call create_and_share_file again unchanged."
+    )
+
+
+# Edge test E5 (2026-10-16): "Kal 11 baje Priya ke saath meeting set karo" became a booking "with Priya"
+# that invited nobody (her address was unknown) instead of asking for it.
+_MEETING_WITH = re.compile(
+    r"\bwith\s+(?P<name>[A-Z][A-Za-z.'-]+)|\b(?P<hi>[A-Z][A-Za-z.'-]+)\s+(?:(?:ke|ki|k)\s+sa+t?h|se)\b"
+    r"|\bwith\s+(?P<mail>[\w.+-]+@[\w-]+\.[\w.-]+)"
+)
+_NOT_A_PERSON = {"me", "my", "myself", "nobody", "no", "the", "a", "an", "our", "google", "meet", "zoom", "teams", "ist"}
+_SOLO_EVENT = re.compile(r"(?i)\b(no attendees?|nobody|no one|just me|only me|by myself|for myself|block|focus time|hold)\b")
+_NO_INVITEE_REFUSAL = "Refused: nobody is invited"
+
+
+def _meeting_without_invitee(tool_name: str, args: dict[str, Any], state: "AgentState") -> str | None:
+    """Owner mode: a booking with someone named in the request must invite them (refused once per run)."""
+
+    if tool_name != "propose_book_meeting" or _is_email_mode(state):
+        return None
+    if (args.get("attendee_email") or "").strip() or [a for a in args.get("attendee_emails") or [] if str(a).strip()]:
+        return None
+    messages = state.get("messages", [])
+    source = state.get("owner_text") or next((m.text for m in messages if isinstance(m, HumanMessage)), "")
+    if not source or _SOLO_EVENT.search(source):
+        return None
+    if any(isinstance(m, ToolMessage) and m.text.startswith(_NO_INVITEE_REFUSAL) for m in messages):
+        return None
+    who = [
+        match.group("name") or match.group("hi") or match.group("mail") for match in _MEETING_WITH.finditer(source)
+        if (match.group("name") or match.group("hi") or "").lower() not in _NOT_A_PERSON
+    ]
+    if not who:
+        return None
+    return (
+        f"{_NO_INVITEE_REFUSAL}, but the owner asked for a meeting with {who[0]}. Pass their address as "
+        "attendee_email (from the owner's message, the conversation, or search_gmail). If you cannot find it, "
+        f"ask the owner for {who[0]}'s email address in one short question instead of booking. Only if the owner "
+        "said it is just for them, call propose_book_meeting again unchanged."
+    )
+
+
+# Live test L9 (2026-10-16): "Cancel my 'Socio L2 test' meeting" answered "I will ask you to confirm
+# cancelling it" and called no tool: the owner waits for a card that never comes.
+_PROMISED_CARD = re.compile(
+    r"(?i)\b(?:ask(?:ing)? you to (?:confirm|approve)|approval (?:request|card)|confirmation (?:request|card)"
+    r"|(?:waiting|ready) for your (?:approval|confirmation)|awaiting your (?:approval|confirmation)|(?:tap|press) approve)\b"
+)
+# Complex test C2 (2026-10-16): workers (Mistral) found the event and the owner's exact new time, then
+# stopped with "Should I proceed with this change?" in 3 of 3 runs, prompt rule or not.
+_ASKS_TO_PROCEED = re.compile(
+    r"(?i)\b(?:should|shall|can|may) i (?:proceed|go ahead)\b|\bproceed with (?:this|the) (?:change|proposal|move|booking|request)\b"
+    r"|\b(?:do|would) you (?:want|like) me to (?:proceed|go ahead)\b"
+    # Multi-task test M1: "I will propose booking ... Please confirm to proceed." with no card.
+    r"|\bconfirm (?:to|before i|and i(?:'ll| will)|so i can) (?:proceed|go ahead|add|book|send|append|create|move|cancel)\b"
+)
+_NUDGE_PREFIX = "Socio check:"
+_CARDS_ONLY_WORD = re.compile(r"\bCARDS_ONLY\b")
+_UNFULFILLED_NUDGE = f"{_NUDGE_PREFIX} you told the owner"
+_PROCEED_NUDGE = f"{_NUDGE_PREFIX} the approval card IS the owner's confirmation"
+
+
+def _unfulfilled_reason(state: "AgentState") -> str | None:
+    """
+    Why the run must not end yet (None = it may): an owner-mode action whose answer promises a card
+    that was never proposed (L9), or that stops to ask "Should I proceed?" instead of proposing (C2).
+    Once per run; never in email mode or when a proposal exists.
+    """
+
+    if _is_email_mode(state) or not state.get("owner_text") and not state.get("worker"):
+        return None
+    messages = state.get("messages") or []
+    last = messages[-1] if messages else None
+    if last is None or getattr(last, "tool_calls", None):
+        return None
+    if state.get("pending_approvals") or any(
+        action.get("status") in {"proposed", "dry_run"} for action in state.get("actions") or []
+    ):
+        return None
+    if any(isinstance(m, HumanMessage) and m.text.startswith(_NUDGE_PREFIX) for m in messages):
+        return None
+    text = last.text or ""
+    can_propose = bool({agent_tool.name for agent_tool in _allowed_tools(state)} & (PROPOSAL_TOOLS | OWNER_GATED_TOOLS))
+    if state.get("worker"):
+        if not can_propose:
+            return None
+        if _ASKS_TO_PROCEED.search(text):
+            return "proceed"
+        return "promised" if _PROMISED_CARD.search(text) else None
+    # Edge test E1: "Trash every email I received last week" found nothing and answered CARDS_ONLY with
+    # no card; the owner would have read "I'm not sure what you'd like me to do yet".
+    if _CARDS_ONLY_WORD.search(text) and not any(
+        action.get("status") == "completed" for action in state.get("actions") or []
+    ):
+        return "cards_only"
+    from app.agent.supervisor import is_action_request  # supervisor imports this module
+
+    if not is_action_request(state.get("owner_text") or ""):
+        return None
+    if can_propose and _ASKS_TO_PROCEED.search(text):
+        return "proceed"
+    return "promised" if _PROMISED_CARD.search(text) else None
+
+
+def _promised_card_missing(state: "AgentState") -> bool:
+    return _unfulfilled_reason(state) is not None
+
+
+def nudge_unfulfilled(state: AgentState):
+    """One extra turn: make the proposal now, or say plainly what is missing."""
+
+    reason = _unfulfilled_reason(state)
+    if reason == "cards_only":
+        text = (
+            f"{_UNFULFILLED_NUDGE} CARDS_ONLY, but no approval card was made in this request. Do not answer "
+            "CARDS_ONLY. Tell the owner plainly, in one or two sentences, what you found (for example that "
+            "nothing matched) or ask the one thing you need to know."
+        )
+    elif reason == "proceed":
+        text = (
+            f"{_PROCEED_NUDGE}: do not ask whether to proceed. If you have what is needed (which item, "
+            "the time, the recipient), call the proposal tool now (e.g. propose_move_calendar_event, "
+            "propose_book_meeting); the owner approves or rejects it on the card. Ask a question only if a "
+            "fact is genuinely missing, and then ask only for that fact."
+        )
+    else:
+        text = (
+            f"{_UNFULFILLED_NUDGE} an approval card is coming, but no approval request was made in this "
+            "request. If the owner asked for an action, call the right tool now (e.g. propose_cancel_calendar_event, "
+            "propose_book_meeting, send_new_email); it creates the card. If something is missing, ask the owner "
+            "in one short question instead. If you were only answering a question about an earlier card, "
+            "repeat your answer and call nothing."
+        )
+    return {"messages": [HumanMessage(content=text)]}
+
+
 def _dry_run_result(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "dry_run": True,
@@ -486,10 +734,54 @@ def _real_line_breaks(args: dict[str, Any]) -> dict[str, Any]:
 def _as_reply_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """create_reply_draft's arguments in send_gmail_reply's shape (one attachment -> a list)."""
 
+    if args.get("body"):
+        args = {**args, "body": _without_optional_gaps(args["body"])}
     if tool_name != "create_reply_draft":
         return args
     path = (args.get("attachment_path") or "").strip()
     return {**args, "attachment_paths": [path] if path else []}
+
+
+# Edge test EN7 (2026-10-16): no NDA on file, the reply said "I've attached the signed NDA" with nothing
+# attached. First person only: "thanks for the attached contract" is about the sender's file.
+_CLAIMS_ATTACHED = re.compile(
+    r"(?i)\b(?:i(?:'ve| have)? attached|i(?:'m| am) attaching|attached (?:is|are|please find|herewith)|"
+    r"please find (?:\w+\s){0,5}(?:attached|enclosed)|(?:is|are) attached|enclosed (?:is|are)|i(?:'ve| have) enclosed)\b"
+)
+
+
+def _claims_missing_attachment(tool_name: str, args: dict[str, Any]) -> str | None:
+    """A reply / email whose text says a file is attached while no file goes with it."""
+
+    if tool_name not in {"send_gmail_reply", "create_reply_draft", "send_new_email"}:
+        return None
+    files = [p for p in (args.get("attachment_paths") or []) if str(p).strip()] + (
+        [args["attachment_path"]] if str(args.get("attachment_path") or "").strip() else []
+    )
+    body = GAP_MARKER.sub("", args.get("body") or "")
+    if files or not _CLAIMS_ATTACHED.search(body):
+        return None
+    return (
+        "Refused: the text says a file is attached, but no file is attached. If the file exists, find it "
+        "(find_documents) and pass it in attachment_paths. If it is not there, do not say it is attached: "
+        "write the reply with an [OWNER: ...] gap for when the owner will send it (create_reply_draft)."
+    )
+
+
+# A gap is a missing FACT. "[OWNER: Add any additional notes if needed.]" (edge test EN3, 2026-10-16) is
+# not one: it turned a complete reply into "Reply Needs Your Input" and blocked Approve & Send.
+_OPTIONAL_GAP = re.compile(
+    r"\s*\[OWNER:[^\]]*\b(?:if needed|if necessary|if any|optional(?:ly)?|any (?:additional|other|extra) "
+    r"(?:notes?|details?|comments?|info\w*)|add (?:any )?(?:notes?|comments?)|anything else)\b[^\]]*\]",
+    re.IGNORECASE,
+)
+
+
+def _without_optional_gaps(body: str) -> str:
+    """The reply with optional / note-style [OWNER: ...] markers removed (real gaps stay)."""
+
+    cleaned = _OPTIONAL_GAP.sub("", body or "")
+    return re.sub(r"[ \t]+\n", "\n", re.sub(r"\n{3,}", "\n\n", cleaned)).strip() if cleaned != body else body
 
 
 def _reply_proposal(args: dict[str, Any]) -> dict[str, Any]:
@@ -918,6 +1210,11 @@ def _run_tool_call(
         _scope_violation(tool_name, args, state)
         or _steered_write(tool_name, state)
         or _invented_meeting_link(tool_name, args, state)
+        or _unrequested_time(tool_name, args, state)
+        or _create_without_share(tool_name, state)
+        or _recreates_existing_file(tool_name, args, state)
+        or _meeting_without_invitee(tool_name, args, state)
+        or _claims_missing_attachment(tool_name, args)
     )
 
     # Never reply twice to the same message, including across restarts. In owner mode only a
@@ -1072,13 +1369,15 @@ def create_agent_graph():
     graph = StateGraph(AgentState)
     graph.add_node("agent", call_model)
     graph.add_node("tools", execute_tools)
+    graph.add_node("nudge", nudge_unfulfilled)
     graph.add_edge(START, "agent")
     graph.add_conditional_edges(
         "agent",
         should_continue,
-        {"tools": "tools", END: END},
+        {"tools": "tools", "nudge": "nudge", END: END},
     )
     graph.add_edge("tools", "agent")
+    graph.add_edge("nudge", "agent")
     return graph.compile()
 
 

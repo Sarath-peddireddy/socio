@@ -54,6 +54,30 @@ COMPOUND_DOMAINS: dict[str, frozenset[str]] = {
 }
 
 
+# Read-only tools a write needs first, added to a task that has the write (same domain only).
+# Multi-task test M1 (2026-10-16): a sheet task got append_sheet_row without read_sheet; the
+# prompt says "read_sheet first", the call was refused, and the worker asked the owner instead.
+COMPANION_TOOLS: dict[str, tuple[str, ...]] = {
+    "append_sheet_row": ("find_documents", "read_sheet"),
+    "append_to_document": ("find_documents", "read_document"),
+    "share_drive_file": ("find_documents",),
+    "propose_book_meeting": ("find_calendar_availability",),
+    "propose_move_calendar_event": ("find_calendar_events", "find_calendar_availability"),
+    "propose_cancel_calendar_event": ("find_calendar_events",),
+    "propose_complete_task": ("list_tasks",),
+}
+
+
+def with_companions(tools: list[str], domain: str, allowed_tools: set[str]) -> list[str]:
+    """tools plus the read-only tools their writes need, if the domain and the caller allow them."""
+
+    extra = [
+        name for tool in tools for name in COMPANION_TOOLS.get(tool, ())
+        if name in DOMAIN_TOOLS.get(domain, ()) and name in allowed_tools
+    ]
+    return list(dict.fromkeys(tools + extra))
+
+
 def covered_domains(domain: str, tools: list[str]) -> set[str]:
     """The domains a task takes care of: its own plus those its compound tools include."""
 
@@ -127,6 +151,7 @@ def normalize_plan(tasks: list[dict[str, Any]], allowed_tools: set[str]) -> list
                             f"belong to {domain}; split it into one task per domain.")
         if outside:
             logger.warning("Task %s (%s): left out tools from other domains: %s", task_id, domain, ", ".join(outside))
+        tools = with_companions(tools, domain, allowed_tools)
 
         cleaned.append({
             "task_id": task_id,

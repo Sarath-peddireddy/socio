@@ -41,16 +41,31 @@ def meet_link(event: dict) -> str:
     return ""
 
 
+def _ist_text(value: str | None) -> str | None:
+    """An event time as IST text ('2026-10-16T15:00:00+05:30'); all-day dates unchanged.
+
+    Google answers in the calendar's own time zone (the dummy account's is UTC: '...T09:30:00Z'),
+    and a model shown UTC times once booked 9:30 AM IST for a reply saying 3:00 PM IST.
+    """
+
+    if not value or "T" not in value:
+        return value
+    try:
+        return parse_ist(value).isoformat()
+    except ValueError:
+        return value
+
+
 def summarize_event(event: dict) -> dict:
-    """Compact, LLM-friendly view of an event."""
+    """Compact, LLM-friendly view of an event (times always in IST)."""
 
     attendees = event.get("attendees", [])
 
     return {
         "event_id": event.get("id"),
         "title": event.get("summary", "Untitled event"),
-        "start": event.get("start", {}).get("dateTime") or event.get("start", {}).get("date"),
-        "end": event.get("end", {}).get("dateTime") or event.get("end", {}).get("date"),
+        "start": _ist_text(event.get("start", {}).get("dateTime")) or event.get("start", {}).get("date"),
+        "end": _ist_text(event.get("end", {}).get("dateTime")) or event.get("end", {}).get("date"),
         "status": event.get("status"),
         # The only meeting link Socio may give out for this event ("" = it has no video call).
         "meet_link": meet_link(event),

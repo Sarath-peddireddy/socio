@@ -7,7 +7,7 @@ from langchain_core.tools import tool
 from app.agent.decision import decide_reply_needed
 from app.agent.untrusted import untrusted_email_view
 from app.calendar.events import INDIA_TZ, get_event, list_events, parse_ist, summarize_event, validate_new_time
-from app.calendar.tools import MEET_LINK_PLACEHOLDER, with_meet_placeholder
+from app.calendar.tools import MEET_LINK_PLACEHOLDER, check_reply_times, with_meet_placeholder
 from app.files.local import resolve_shareable_file, search_documents
 from app.gmail.drafts import create_reply_draft as create_gmail_reply_draft
 from app.gmail.tools import search_emails, get_thread_details
@@ -289,14 +289,16 @@ def create_reply_draft(
 
 
 @tool
-def find_calendar_events(query: str = "", days_ahead: int = 14, days_back: int = 0) -> list[dict]:
+def find_calendar_events(query: str = "", days_ahead: int = 14, days_back: int = 0, date: str = "") -> list[dict]:
     """
     List existing events in the owner's primary Google Calendar.
 
-    Use this to locate an event someone wants to move or cancel. query is
-    optional free text matched by Google against title, description,
-    location, and attendees (e.g. a person's name or email). Searches from
-    days_back days ago to days_ahead days ahead (max 60).
+    Use this to locate an event someone wants to move or cancel, or to say what is on a day.
+    - One day ("what's on Monday?"): pass date="YYYY-MM-DD" and leave query empty: that
+      whole day (IST) is listed. Never put a date in query (query is text, not a date).
+    - Otherwise: searches from days_back days ago to days_ahead days ahead (max 60).
+    query is optional free text matched by Google against title, description, location,
+    and attendees (e.g. a person's name or email).
 
     Each result has event_id, title, start, end, other_attendees, and meet_link
     (the event's Google Meet link, "" if it has no video call). To send someone a
@@ -305,8 +307,19 @@ def find_calendar_events(query: str = "", days_ahead: int = 14, days_back: int =
     """
 
     now = datetime.now(INDIA_TZ)
-    start = now - timedelta(days=max(0, min(int(days_back), 60)))
-    end = now + timedelta(days=max(1, min(int(days_ahead), 60)))
+    if str(date or "").strip():
+        # Multi-task test M2 (2026-10-16): "What's on Monday 19 Oct?" ran as query="19 Oct 2026"
+        # (text search: nothing) and was answered "Your calendar is empty".
+        try:
+            day = datetime.strptime(str(date).strip()[:10], "%Y-%m-%d").replace(tzinfo=INDIA_TZ)
+        except ValueError as exc:
+            raise ValueError(f"'{date}' is not a date. Use YYYY-MM-DD, e.g. {now:%Y-%m-%d}.") from exc
+        if abs((day.date() - now.date()).days) > 60:
+            raise ValueError("I can only look 60 days back or ahead.")
+        start, end = day, day + timedelta(days=1)
+    else:
+        start = now - timedelta(days=max(0, min(int(days_back), 60)))
+        end = now + timedelta(days=max(1, min(int(days_ahead), 60)))
 
     return [summarize_event(event) for event in list_events(start, end, query=query)]
 
@@ -328,7 +341,9 @@ def propose_move_calendar_event(
     Ask the owner to approve moving an existing calendar event to a new time.
 
     Nothing changes until the owner approves. new_start_time/new_end_time
-    are ISO 8601 (naive times are IST) and must be free. reply_body is the
+    are ISO 8601 in IST (e.g. 2026-10-16T15:00:00+05:30; never convert to UTC)
+    and must be free; inside weekdays 11:00-16:00 IST unless the email or the
+    owner named an exact time. reply_body is the
     email reply to send in this thread AFTER the move is approved, stating
     the new time; do not send a separate reply yourself. On the owner's
     instruction (no email thread), the attendees get one email about the move
@@ -343,6 +358,9 @@ def propose_move_calendar_event(
 
     new_start, new_end = parse_ist(new_start_time), parse_ist(new_end_time)
     validate_new_time(new_start, new_end, ignore_event_id=event_id)
+    # The reply may name the old time ("moved from 12 PM to 3 PM") and the new one, nothing else.
+    old_times = [parse_ist(value) for value in (event["start"], event["end"]) if value and "T" in value]
+    check_reply_times(reply_body, new_start, new_end, *old_times)
 
     return {
         "proposal": {
@@ -388,13 +406,19 @@ def propose_book_meeting(
     meeting_link: str = "",
     reply_body: str = "",
     attendee_emails: list[str] | None = None,
+    in_person: bool = False,
 ) -> dict:
     """
     Ask the owner to approve booking a new calendar event (meeting, interview, call).
 
+    in_person=True for an event in a place (a dinner, lunch, office visit, onsite): it gets no
+    video call and the reply has no meeting link.
+
     Nothing is booked until the owner approves; the slot is checked again
-    then. start_time/end_time are ISO 8601 (naive times are IST) and must be
-    free. attendee_email / attendee_emails (optional, any number of people) are
+    then. start_time/end_time are ISO 8601 in IST (e.g. 2026-10-16T15:00:00+05:30;
+    naive times are IST; never convert to UTC) and must be free. Book inside weekdays
+    11:00-16:00 IST unless the email or the owner named an exact time: then use that
+    time. Any time the reply_body names must be this slot's time. attendee_email / attendee_emails (optional, any number of people) are
     invited by Google, which emails each of them the invite with Accept / Decline.
     Google Meet: when the owner approves, Google adds a real Meet video call and its
     link goes into the invite. NEVER write a meeting link yourself. Leave meeting_link
@@ -408,12 +432,16 @@ def propose_book_meeting(
 
     start, end = parse_ist(start_time), parse_ist(end_time)
     validate_new_time(start, end)
+    check_reply_times(reply_body, start, end)
 
     attendees = attendee_list(attendee_email, attendee_emails)
     meeting_link = meeting_link.strip()
     if meeting_link:
         # The sender's own link is used as is; the reply has no Meet link to fill in.
         reply_body = reply_body.replace(MEET_LINK_PLACEHOLDER, meeting_link)
+    elif in_person:
+        # Edge test EN4 (2026-10-16): a team dinner got "Google Meet link: [meeting link]".
+        reply_body = "\n".join(line for line in reply_body.split("\n") if MEET_LINK_PLACEHOLDER not in line)
     else:
         reply_body = with_meet_placeholder(reply_body)
 
@@ -429,7 +457,7 @@ def propose_book_meeting(
             "description": description,
             "meeting_link": meeting_link,
             # Approving asks Google for a Meet call unless the sender gave their own link.
-            "video_call": "" if meeting_link else "google_meet",
+            "video_call": "" if meeting_link or in_person else "google_meet",
             "reason": reason,
             "reply_body": reply_body,
         }

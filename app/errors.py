@@ -56,6 +56,17 @@ _handler: logging.Handler | None = None
 _handler_lock = threading.Lock()
 _gateway_logger = logging.getLogger("socio.errors")
 
+# A Telegram request URL carries the bot token (".../bot123456:AAH.../getUpdates"), and requests
+# puts the URL into its exception text: every "Telegram connection problem" line logged it.
+_BOT_TOKEN = re.compile(r"bot\d{5,}:[A-Za-z0-9_-]{20,}")
+
+
+class RedactingFormatter(logging.Formatter):
+    """LOG_FORMAT with secrets masked in the message and the traceback alike."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return _BOT_TOKEN.sub("bot<token>", super().format(record))
+
 
 def log_path() -> Path:
     return Path(os.getenv("AGENT_LOG_DIR") or PROJECT_ROOT / "logs") / "agent.log"
@@ -70,7 +81,7 @@ def _file_handler() -> logging.Handler:
             path = log_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             _handler = RotatingFileHandler(path, maxBytes=2_000_000, backupCount=3, encoding="utf-8", delay=True)
-            _handler.setFormatter(logging.Formatter(LOG_FORMAT))
+            _handler.setFormatter(RedactingFormatter(LOG_FORMAT))
             _handler.setLevel(logging.INFO)
         return _handler
 
@@ -89,6 +100,8 @@ def setup_logging(console_level: int = logging.WARNING) -> None:
 
     logging.basicConfig(level=console_level, format=LOG_FORMAT)
     root = logging.getLogger()
+    for console in root.handlers:
+        console.setFormatter(RedactingFormatter(LOG_FORMAT))
     handler = _file_handler()
     if handler not in root.handlers:
         root.addHandler(handler)

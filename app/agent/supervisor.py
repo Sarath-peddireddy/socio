@@ -146,7 +146,10 @@ QUESTION_LIKE = re.compile(
     r"^\s*(?:(?:hey|hi|hello|ok|okay|so|socio)\b[\s,!.]*)*"
     r"(?:what|what's|whats|when|where|who|whom|whose|which|why|how|is|are|am|was|were|"
     r"(?:do|does|did|have|has|had)\s+(?:i|you|we|they|he|she|it|my|your|socio|anyone|there)|"
-    r"can i|could i|should|shall|any|tell me|show me|list|give me|check|find|search|look|let me know|status)\b",
+    r"can i|could i|should|shall|any|tell me|show me|list|give me|check|find|search|look|let me know|status|"
+    # "Go through my emails and tell me which need a reply" asks for an answer (live test C3,
+    # 2026-10-16: planned, its per-email findings shrank to one sentence in the fan-in report).
+    r"go through|review|summari[sz]e|scan|read)\b",
     re.IGNORECASE,
 )
 
@@ -287,10 +290,17 @@ Rules:
 - Write every date as the exact date with its weekday and ISO form (e.g. "Friday 16 Oct 2026
   (2026-10-16)", computed from today's date), never "Friday", "tomorrow" or "next week": workers
   must not work dates out. A calendar task checking one day says to call
-  find_calendar_availability with date=<that ISO date>.
+  find_calendar_availability with date=<that ISO date>; one listing what is on a day says to call
+  find_calendar_events with date=<that ISO date> and an empty query.
 - One message to several people is ONE email task with all of them as recipients ("send one email
   to a@x.com and b@y.com"), never one task or one email per person. A "meeting invite" or
   "calendar invite" is a calendar task: propose_book_meeting with every person as an attendee.
+- "If I'm free at <time>, book ..." is ONE calendar task with tools_allowed=[find_calendar_availability,
+  propose_book_meeting]: check exactly that time (find_calendar_availability with date and at_time),
+  then book that time if it is free. Never split checking and booking into two tasks.
+- Moving or cancelling an event AND telling its attendees (sorry, the reason, the new time) is ONE
+  calendar task: the move / cancel card emails the attendees, with the worker's reply_body as the
+  text. Never add an email task for that message.
 - Missing details with a sensible default (a document title, a subject, a short message) are
   not questions: tell the worker to choose a clear one; the person sees it on the approval card
   and can change or reject it. Only if NOTHING can start without an answer (e.g. who to send it
@@ -599,7 +609,11 @@ def build_parts(tasks: list[dict[str, Any]], results: dict[str, dict[str, Any]],
     for task in tasks:
         payload = results.get(task["task_id"], {"status": "FAILED", "diff_summary": "It didn't run.", "modified_entities": []})
         summary = plain_reply(payload.get("diff_summary", ""))
-        proposed = any(entity.get("kind") == "approval" for entity in payload.get("modified_entities", []))
+        # A dry run's proposal counts as a card too, so a dry run says what a real run would.
+        proposed = any(
+            entity.get("kind") == "approval" or entity.get("status") == "dry_run"
+            for entity in payload.get("modified_entities", [])
+        )
 
         # A "?" inside a link (".../edit?usp=sharing") is not a question (audit M4).
         asks = "?" in re.sub(r"https?://\S+", "", summary)

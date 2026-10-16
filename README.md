@@ -241,6 +241,7 @@ See [`.env.example`](.env.example).
 |---|---|
 | `GEMINI_API_KEY` | LLM used for decisions and writing (first choice) |
 | `GEMINI_FALLBACK_API_KEY` | Optional second Gemini key (another Google Cloud project), used when the first is rate-limited or out of quota |
+| `GEMINI_FALLBACK_2_API_KEY` | Optional third Gemini key, tried after the second (before Mistral). `AGENT_GEMINI_FALLBACK_2_MODEL` gives it another Gemini model (default: `AGENT_GEMINI_MODEL`), so a model that is overloaded on the first two keys has a backup |
 | `MISTRAL_API_KEY` | Optional Mistral key: first choice for parallel subtasks, last resort for everything else |
 | `GROQ_API_KEY` | Optional Groq key: second choice for parallel subtasks |
 | `AGENT_GEMINI_MODEL` / `AGENT_MISTRAL_MODEL` / `AGENT_GROQ_MODEL` | Model names (default `gemini-3.5-flash-lite` / `ministral-14b-latest` / `openai/gpt-oss-120b`) |

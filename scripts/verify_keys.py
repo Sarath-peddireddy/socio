@@ -59,6 +59,9 @@ def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     results = [probe(provider) for provider in (lr.GEMINI_PRIMARY, lr.GEMINI_FALLBACK, lr.MISTRAL, lr.GROQ)]
+    # Optional third Gemini key: checked only when it is set.
+    if lr.GEMINI_FALLBACK_2.api_key():
+        results.append(probe(lr.GEMINI_FALLBACK_2))
     return 0 if all(results) else 1
 
 

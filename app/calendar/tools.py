@@ -33,6 +33,66 @@ def with_meet_placeholder(body: str) -> str:
     return f"{body.rstrip()}\n\n{line}"
 
 
+# Clock times in text: "3 PM", "3:00 pm", "9.30 a.m.", "15:00", "at 3". Each mention gives the
+# (hour, minute) readings it may mean ("3:00" without AM/PM could be 03:00 or 15:00).
+_CLOCK = re.compile(
+    r"(?i)\b(\d{1,2})(?:[:.](\d{2}))?\s*(a\.?\s?m\.?|p\.?\s?m\.?)(?![a-z])"   # 3 pm, 3:30 pm, 9.30 a.m.
+    r"|\b(\d{1,2})[:.](\d{2})\b(?![:.]\d)"                                    # 15:00, 3:30 (not 15:00:00 / 16.10.2026)
+    r"|\bat\s+(\d{1,2})\b(?![:.\d])"                                          # at 3
+)
+# Machine timestamps ("2026-10-16T09:30:00+05:30", "+0000") are not times anyone wrote as such.
+_MACHINE_TIME = re.compile(r"\d{4}-\d{2}-\d{2}[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?|[+-]\d{2}:?\d{2}\b")
+
+
+def clock_mentions(text: str) -> list[set[tuple[int, int]]]:
+    """Every clock time written in text, each as the set of (hour, minute) it could mean."""
+
+    mentions = []
+    for match in _CLOCK.finditer(_MACHINE_TIME.sub(" ", text or "")):
+        if match.group(3):
+            hour, minute = int(match.group(1)), int(match.group(2) or 0)
+            if not (1 <= hour <= 12 and minute < 60):
+                continue
+            pm = match.group(3).lower().startswith("p")
+            mentions.append({(hour % 12 + (12 if pm else 0), minute)})
+        elif match.group(4):
+            hour, minute = int(match.group(4)), int(match.group(5))
+            if hour > 23 or minute > 59:
+                continue
+            mentions.append({(hour, minute), (hour + 12, minute)} if 1 <= hour < 12 else {(hour, minute)})
+        else:
+            hour = int(match.group(6))
+            if 1 <= hour <= 12:
+                mentions.append({(hour % 12, 0), (hour % 12 + 12, 0)})
+    return mentions
+
+
+def in_working_hours(start: datetime, end: datetime) -> bool:
+    """Whether [start, end) lies on one weekday inside the 11:00-16:00 IST window."""
+
+    start, end = start.astimezone(INDIA_TZ), end.astimezone(INDIA_TZ)
+    window_start = datetime.combine(start.date(), time(WORK_START_HOUR), tzinfo=INDIA_TZ)
+    window_end = datetime.combine(start.date(), time(WORK_END_HOUR), tzinfo=INDIA_TZ)
+    return start.weekday() < 5 and window_start <= start and end <= window_end
+
+
+def check_reply_times(reply_body: str, *slots: datetime) -> None:
+    """
+    ValueError when the reply names a clock time that is none of the given slot times (IST). A
+    booking once said "3:00 PM IST" in the email while the slot was 9:30 AM IST.
+    """
+
+    allowed = {(moment.astimezone(INDIA_TZ).hour, moment.astimezone(INDIA_TZ).minute) for moment in slots if moment}
+    for mention in clock_mentions(reply_body):
+        if not mention & allowed:
+            times = " / ".join(sorted({f"{moment.astimezone(INDIA_TZ):%H:%M}" for moment in slots if moment}))
+            raise ValueError(
+                f"The reply names a time that is not the meeting's ({times} IST). Use start_time / end_time "
+                "exactly as the time the reply states (IST, e.g. 2026-10-16T15:00:00+05:30), or fix the reply. "
+                "Never convert times to UTC."
+            )
+
+
 def fill_meet_link(body: str, link: str) -> str:
     """The placeholder replaced by the real link; with no link, the lines that mention it are dropped."""
 
@@ -114,6 +174,7 @@ def find_calendar_availability(
     duration_minutes: int = 30,
     date: str = "",
     days_ahead: int = 7,
+    at_time: str = "",
 ) -> dict:
     """
     Find free meeting slots in the owner's primary Google Calendar.
@@ -122,9 +183,13 @@ def find_calendar_availability(
     - For one specific day ("tomorrow", "Friday", "12 Oct"), pass date="YYYY-MM-DD":
       exactly that day is checked.
     - Otherwise the next days_ahead days are checked, starting today (max 21).
+    - Is ONE exact time free ("am I free at 2 PM?", "if I'm free at 2, book it")? Pass date
+      and at_time="14:00" (24-hour IST): the answer is "requested" {"start", "end", "free":
+      true/false, "why"}. Use it, not "slots", to answer about that time.
 
-    Returns {"slots": [{"start", "end"}, ...] (the earliest slot of each free gap, in
-    order), "days": [{"date", "day", "free": ["11:00-16:00", ...], "note"?}], "note"?}.
+    Returns {"slots": [{"start", "end"}, ...] (ONLY the earliest start of each free gap, not
+    every free time: a free day shows one slot at 11:00), "days": [{"date", "day", "free":
+    ["11:00-16:00", ...], "note"?}] (the whole free windows), "note"?}.
     An empty "slots" always comes with a "note" saying why (weekend, day over, fully
     booked) and the next weekday to try. Slots already proposed to someone and waiting
     for the owner's approval count as busy.
@@ -139,6 +204,8 @@ def find_calendar_availability(
     today = now.date()
     held = [(hold["start"], hold["end"]) for hold in held_periods()]
 
+    if str(at_time or "").strip() and not str(date or "").strip():
+        raise ValueError("at_time needs date=YYYY-MM-DD: the day to check that time on.")
     if str(date or "").strip():
         days = [_parse_day(date, today)]
     else:
@@ -155,7 +222,48 @@ def find_calendar_availability(
         reasons = "; ".join(entry["note"] for entry in checked if entry.get("note")) or "No free time."
         nxt = _next_weekday(days[-1])
         result["note"] = f"{reasons} The next weekday to try is {_day_label(nxt)} (date={nxt.isoformat()})."
+    if str(at_time or "").strip():
+        result["requested"] = _check_time(days[0], at_time, duration_minutes, now, held)
     return result
+
+
+_CLOCK_ARG = re.compile(r"(?i)^\s*(\d{1,2})(?:[:.](\d{2})(?::00)?)?\s*(a\.?m\.?|p\.?m\.?)?\s*$")  # "12:00:00" too
+
+
+def _check_time(day: date, at_time: str, duration_minutes: int, now: datetime, held: list) -> dict:
+    """
+    Whether one exact time is free (live test C1, 2026-10-16: "If I'm free Mon 2 PM, book it" was
+    answered from "slots", which only lists 11:00 for a free day: "you're not free at 2 PM", or
+    a booking at 11:00). Outside the usual window is reported, not refused: the owner named it.
+    """
+
+    from app.calendar.events import find_conflicts
+
+    match = _CLOCK_ARG.match(str(at_time))
+    hour, minute = (int(match.group(1)), int(match.group(2) or 0)) if match else (99, 0)
+    if match and match.group(3):
+        if not 1 <= hour <= 12:
+            hour = 99
+        else:
+            hour = hour % 12 + (12 if match.group(3).lower().startswith("p") else 0)
+    if hour > 23 or minute > 59:
+        raise ValueError(f"'{at_time}' is not a time. Use 24-hour HH:MM in IST, e.g. 14:00.")
+    start = datetime.combine(day, time(hour, minute), tzinfo=INDIA_TZ)
+    end = start + timedelta(minutes=duration_minutes)
+    answer: dict = {"start": start.isoformat(), "end": end.isoformat()}
+    if start <= now:
+        return {**answer, "free": False, "why": "That time has already passed."}
+    busy = [event.get("title") or "an event" for event in find_conflicts(start, end)]
+    held_here = [(hold_start, hold_end) for hold_start, hold_end in held if hold_start < end and hold_end > start]
+    if busy:
+        answer.update(free=False, why=f"It overlaps {', '.join(busy)}.")
+    elif held_here:
+        answer.update(free=False, why="It is held for another meeting proposal waiting for the owner's approval.")
+    else:
+        answer.update(free=True, why="Nothing is booked then.")
+    if day.weekday() >= 5 or not in_working_hours(start, end):
+        answer["note"] = "Outside the usual weekdays 11:00-16:00 window: book it only because the owner named this time."
+    return answer
 
 @tool
 def create_calendar_event(

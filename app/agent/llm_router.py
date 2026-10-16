@@ -42,6 +42,9 @@ SUPERVISOR = "supervisor"
 WORKER = "worker"
 
 GEMINI_MODEL = os.getenv("AGENT_GEMINI_MODEL", "gemini-3.5-flash-lite")
+# The third key may use another Gemini model: a 503 "high demand" is per model, and on 2026-10-16
+# both keys on gemini-3.5-flash-lite failed together while other Gemini models answered.
+GEMINI_FALLBACK_2_MODEL = os.getenv("AGENT_GEMINI_FALLBACK_2_MODEL", GEMINI_MODEL)
 GROQ_MODEL = os.getenv("AGENT_GROQ_MODEL", "openai/gpt-oss-120b")
 # mistral-small/medium get 0 requests/minute on the free tier; ministral-14b gets 30.
 MISTRAL_MODEL = os.getenv("AGENT_MISTRAL_MODEL", "ministral-14b-latest")
@@ -161,6 +164,7 @@ class Provider:
     model: str
     rpm_env: str
     default_rpm: int
+    optional: bool = False  # no "is not set" warning when its key is missing
 
     def api_key(self) -> str:
         return os.getenv(self.key_env, "").strip()
@@ -170,12 +174,17 @@ class Provider:
 # Keep some in reserve; 0 turns a limiter off. Each key has its own limiter.
 GEMINI_PRIMARY = Provider("Gemini (primary key)", "gemini", "GEMINI_API_KEY", GEMINI_MODEL, "AGENT_LLM_RPM", 14)
 GEMINI_FALLBACK = Provider("Gemini (fallback key)", "gemini", "GEMINI_FALLBACK_API_KEY", GEMINI_MODEL, "AGENT_LLM_RPM", 14)
+GEMINI_FALLBACK_2 = Provider(
+    "Gemini (fallback key 2)", "gemini", "GEMINI_FALLBACK_2_API_KEY", GEMINI_FALLBACK_2_MODEL, "AGENT_LLM_RPM", 14,
+    optional=True,
+)
 GROQ = Provider("Groq", "groq", "GROQ_API_KEY", GROQ_MODEL, "AGENT_GROQ_RPM", 28)
 MISTRAL = Provider("Mistral", "mistral", "MISTRAL_API_KEY", MISTRAL_MODEL, "AGENT_MISTRAL_RPM", 28)
 
+# A provider without a key is left out (configured_chain), so the third key is optional.
 CHAINS: dict[str, tuple[Provider, ...]] = {
-    SUPERVISOR: (GEMINI_PRIMARY, GEMINI_FALLBACK, MISTRAL),
-    WORKER: (MISTRAL, GROQ, GEMINI_FALLBACK, GEMINI_PRIMARY),
+    SUPERVISOR: (GEMINI_PRIMARY, GEMINI_FALLBACK, GEMINI_FALLBACK_2, MISTRAL),
+    WORKER: (MISTRAL, GROQ, GEMINI_FALLBACK_2, GEMINI_FALLBACK, GEMINI_PRIMARY),
 }
 
 
@@ -259,11 +268,11 @@ def configured_chain(role: str) -> list[Provider]:
     for provider in CHAINS[role]:
         if provider.api_key():
             chain.append(provider)
-        elif provider.key_env not in _warned_missing:
+        elif not provider.optional and provider.key_env not in _warned_missing:
             _warned_missing.add(provider.key_env)
             logger.warning("[ModelRouter] %s is not set; %s is left out of the fallback chain.", provider.key_env, provider.name)
     if not chain:
-        raise ValueError("No model API key is configured: set GEMINI_API_KEY (and optionally GEMINI_FALLBACK_API_KEY, MISTRAL_API_KEY, GROQ_API_KEY) in the .env file.")
+        raise ValueError("No model API key is configured: set GEMINI_API_KEY (and optionally GEMINI_FALLBACK_API_KEY, GEMINI_FALLBACK_2_API_KEY, MISTRAL_API_KEY, GROQ_API_KEY) in the .env file.")
     return chain
 
 
@@ -429,8 +438,14 @@ def _label(role: str, provider: Provider, *, lead: bool) -> str:
 
     if role not in CHAINS or provider not in CHAINS[role]:
         return f"provider {provider.name}" if lead else provider.name
-    priority = f"priority {CHAINS[role].index(provider) + 1} ({provider.name})"
+    priority = f"priority {_priority(role, provider)} ({provider.name})"
     return f"{role.capitalize()} {priority}" if lead else priority
+
+
+def _priority(role: str, provider: Provider) -> int:
+    """Position among the providers that have a key (an unset optional key takes no number)."""
+
+    return [p for p in CHAINS[role] if p is provider or p.api_key()].index(provider) + 1
 
 
 def route(chain: list[Provider], runnable_for: Callable[[Provider], Any], model_input, *, role: str = "",
@@ -465,7 +480,7 @@ def route(chain: list[Provider], runnable_for: Callable[[Provider], Any], model_
                 call_kwargs["config"] = observability.llm_config(config, run_name=f"{role}_llm", metadata={
                     "router_role": role,
                     "provider": provider.name,
-                    "priority": CHAINS[role].index(provider) + 1 if provider in CHAINS[role] else None,
+                    "priority": _priority(role, provider) if provider in CHAINS[role] else None,
                     "attempt": attempt,
                     **({"failover_from": failed_over_from[0], "failover_reason": failed_over_from[1]} if failed_over_from else {}),
                 })
