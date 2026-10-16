@@ -91,21 +91,35 @@ task in the Tasks app yourself and it stops asking. (Automatic follow-up tasks f
 
 </details>
 
-<details>
-<summary><b>Routines and news</b></summary>
+### Scheduled routines (cron jobs in plain words)
 
-Ask for anything on a schedule: *"send me the top AI news every day at 9 AM"* gets "Scheduled! I will prepare
-and send your **Top AI updates** daily at 09:00 AM IST.", and every morning a **Scheduled Briefing** arrives with
-the headlines and links.
+Ask for anything on a schedule and Socio turns it into a recurring job: no cron syntax, no separate tool.
 
-- Daily, every weekday, weekly on one day, or once; times are IST unless you name another timezone.
+```text
+send me the top AI news every day at 9 AM
+every weekday at 8:30, tell me what's on my calendar today
+every Monday at 10 AM, list the emails still waiting for my reply
+on 1 Nov at 9 AM, remind me to renew the domain
+```
+
+*"send me the top AI news every day at 9 AM"* gets "Scheduled! I will prepare and send your **Top AI updates**
+daily at 09:00 AM IST.", and every morning a **Scheduled Briefing** arrives with the headlines and links.
+
+| Frequency | Example                 | Stored as (cron, in the job's timezone) |
+|-----------|-------------------------|-----------------------------------------|
+| Daily     | "every day at 9 AM"     | `0 9 * * *`                             |
+| Weekdays  | "every weekday at 8:30" | `30 8 * * 1-5`                          |
+| Weekly    | "every Monday at 10 AM" | `0 10 * * 1`                            |
+| Once      | "on 1 Nov at 9 AM"      | a single run on that date               |
+
+- Times are IST unless you name another timezone; any IANA zone works, daylight saving included.
 - `/schedules` lists your routines with a **Cancel** button each (or just ask "stop the AI news routine").
-- News comes from public tech sites (Hacker News, TechCrunch, The Verge, Ars Technica, MIT Technology Review);
-  Socio only reports headlines it actually read. Anything a routine wants to change still waits for your tap.
-- If the PC was off at a routine's time, it runs when Socio is back (within 6 hours); after that it is skipped
-  once and you're told.
-
-</details>
+- Each run is an ordinary request: it can read your mail, calendar, Drive, and the news, but anything it wants
+  to change (an email, an event, a sheet row) still arrives as a card and waits for your tap.
+- News comes from public tech sites (Hacker News, TechCrunch, The Verge, Ars Technica, MIT Technology Review, or
+  your own feeds via `AGENT_NEWS_FEEDS`); Socio only reports headlines it actually read.
+- If the PC was off at a routine's time, it runs when Socio is back (within 6 hours,
+  `AGENT_SCHEDULE_GRACE_HOURS`); after that it is skipped once and you're told. Missed days never pile up.
 
 ---
 
@@ -156,6 +170,10 @@ toolset (see [Safety model](#safety-model)).
 <tr>
 <td><b>Contradictory rules.</b> "No calls after 6" and "7 PM is fine" both saved.</td>
 <td><b>Rule conflict detection.</b> A new rule is checked against your saved ones first; a clash becomes a decision card.</td>
+</tr>
+<tr>
+<td><b>Fragile cron scripts.</b> A restart fires the same job twice, or a missed week of jobs fires all at once.</td>
+<td><b>Claim-then-run scheduler.</b> Each slot runs at most once, a missed slot runs once if under 6 hours late, and older ones are skipped with a notice.</td>
 </tr>
 <tr>
 <td><b>Double taps run twice.</b> A flaky connection resends the tap; the email goes out twice.</td>
@@ -316,6 +334,14 @@ Never purged: open or in-flight approvals, the list of handled emails, memories,
 re-checks that the thread and slot are unchanged. A timeout after a write was sent is reported as unknown ("I
 can't tell whether the email went out ... Check your Gmail Sent folder"), never as "nothing was changed". A
 request stuck in `executing` for 15 minutes shows in `/status` and is never retried automatically.
+
+**Scheduler** (`app/scheduler/`). Routines live in SQLite (`scheduled_jobs`), each with a cron expression, a
+timezone, and its next run time in UTC. The bot checks for due jobs every 60 seconds, with no extra scheduling
+library: the next run is computed with Python's `zoneinfo`. Each run first *claims* its slot with one
+conditional `UPDATE`, so a crash, a restart, or a second process can never run the same slot twice, and a failed
+run is not retried behind your back (the next slot runs normally). While a routine runs it cannot create or
+cancel routines, so a job can never schedule itself in a loop. The same loop also runs the inbox check every
+`AGENT_POLL_MINUTES`, the daily database cleanup, and the Google Tasks due-date check.
 
 **Time and budgets.** One frozen "today" per request, copied into every worker thread. Model calls time out at
 60 s, Google calls at 30 s, and each worker has a 180 s budget (`AGENT_WORKER_TIMEOUT`); a timed-out worker
