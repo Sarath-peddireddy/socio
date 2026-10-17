@@ -41,32 +41,31 @@ EXPANDABLE_AFTER = 600  # longer quotes start collapsed
 
 # Every command, in menu order: (command, argument shown on /help, short description).
 # The /help card and Telegram's "/" suggestion menu (setMyCommands) both come from this list.
+# One name per job (developer request 2026-10-17: no duplicate commands).
 BOT_COMMANDS = [
     ("check", "", "Check the inbox now (I never check it on my own)"),
     ("status", "", "What's waiting for you and how Socio is doing"),
     ("approvals", "", "Review pending decision cards"),
     ("memories", "", "View your saved rules and standing preferences"),
-    ("schedules", "", "See or cancel your scheduled routines"),
+    ("routines", "", "See or cancel your scheduled routines"),
     ("remember", "TEXT", "Save a rule, e.g. no calls before 12:00"),
     ("forget", "ID", "Delete a saved rule (numbers from /memories)"),
     ("forget_lesson", "ID", "Delete a lesson from your corrections (see /memories)"),
-    ("new", "", "Start a fresh conversation"),
-    ("reset", "", "Clear the conversation context (like /new)"),
+    ("new", "", "Start a fresh conversation (forget the chat so far)"),
     ("dryrun", "", "Check the inbox without sending or changing anything"),
     ("skills", "", "List your saved skills (reusable workflows)"),
     ("save_skill", "NAME", "Save your last multi-step request as a skill"),
     ("forget_skill", "NAME", "Archive a saved skill"),
     ("help", "", "Show what I can do and these commands"),
 ]
-# Other names for the same command: shown next to it on /help, and in the "/" menu.
-COMMAND_ALIASES = {"check": ["run"], "schedules": ["routines"], "reset": ["clear"], "help": ["start"]}
+# Former duplicate names -> the command that does that job now. Typing one gets a one-line pointer.
+RETIRED_COMMANDS = {"run": "check", "reset": "new", "clear": "new", "schedules": "routines"}
 
 
 def commands_html() -> str:
     lines = []
     for command, argument, description in BOT_COMMANDS:
-        names = " · ".join(f"<code>/{name}</code>" for name in COMMAND_ALIASES.get(command, []))
-        usage = f"<code>{html.escape(f'/{command} {argument}'.strip())}</code>" + (f" · {names}" if names else "")
+        usage = f"<code>{html.escape(f'/{command} {argument}'.strip())}</code>"
         lines.append(f"• {usage} — {html.escape(description, quote=False)}")
     return "\n".join(lines)
 
@@ -74,11 +73,7 @@ def commands_html() -> str:
 def menu_commands() -> list[dict[str, str]]:
     """The "/" suggestion menu for setMyCommands (plain text, no arguments)."""
 
-    menu = []
-    for command, _, description in BOT_COMMANDS:
-        menu.append({"command": command, "description": description})
-        menu += [{"command": alias, "description": f"Same as /{command}"} for alias in COMMAND_ALIASES.get(command, [])]
-    return menu
+    return [{"command": command, "description": description} for command, _, description in BOT_COMMANDS]
 
 
 WELCOME_HTML = """👋 <b>Welcome to Socio</b>
@@ -161,14 +156,59 @@ def is_inbox_check_request(text: str) -> bool:
 # A message that only closes the conversation ("Okay", "Thanks!", "hmm", "ok cool 👍"):
 # the bot reacts 👍 instead of replying (developer request 2026-10-11). "yes", "sure",
 # "done" are not here: they answer a question or say a task is finished.
-_THANKS = r"thanks?(?: (?:a lot|so much|very much))?|thank you(?: (?:so|very) much)?|thx|thnx|tq|ty|cheers|bye"
+_THANKS = r"thanks?(?: (?:a lot|so much|very much))?|thank you(?: (?:so|very) much)?|thx|thnx|tq|ty|cheers"
+_BYE = r"good ?bye|bye(?: bye)?|good night|gn|see (?:you|ya)(?: later| soon| tomorrow)?|take care|tc|ttyl"
 _OK = (
     r"ok(?:a+y|ey|ie|i)?|o?k+|h+m+|m+h*m+|cool|great|nice|good|got it|gotcha|alright|all right|fine|noted"
     r"|perfect|awesome|understood|sounds good|no worries|np"
 )
 _EMOJI = "[\U0001F44C\U0001F44D\U0001F44F\U0001F64F\U0001F600-\U0001F64F\U0001F3FB-\U0001F3FF❤✅☺️]+"
-ACKNOWLEDGEMENT = re.compile(rf"^\s*(?:(?:(?:{_THANKS}|{_OK})\b|{_EMOJI})[\s,.!~]*){{1,4}}$", re.IGNORECASE)
-THANKS = re.compile(rf"\b(?:{_THANKS})\b", re.IGNORECASE)
+ACKNOWLEDGEMENT = re.compile(rf"^\s*(?:(?:(?:{_THANKS}|{_BYE}|{_OK})\b|{_EMOJI})[\s,.!~]*){{1,4}}$", re.IGNORECASE)
+# Thanks and goodbyes never answer a question of ours.
+THANKS = re.compile(rf"\b(?:{_THANKS}|{_BYE})\b", re.IGNORECASE)
+
+# Reactions on the owner's own message, so the chat shows what Socio is doing, like WhatsApp (developer
+# request 2026-10-17). Bots may only use Telegram's fixed reaction list (Bot API ReactionTypeEmoji):
+# 🔍 and 👋 are not on it, so 👀 stands for "looking into it" and 🫡 for "bye".
+REACTION_LOOKING = "👀"      # checking the inbox, searching, researching, answering a question
+REACTION_WORKING = "👨‍💻"    # doing something: drafting, booking, creating, sharing
+REACTION_WRITING = "✍"      # filling a reply with the owner's answer
+REACTION_DONE = "👌"         # finished (the reply or the cards are in the chat)
+REACTION_NEEDS_YOU = "🤔"    # finished with a question for the owner
+REACTION_FAILED = "🤷"       # couldn't do it (the status card says why)
+
+# "Research ...", "look up ...", "find ...", "check whether ...": a lookup even if it also asks for an action.
+LOOKUP_REQUEST = re.compile(
+    r"^\s*(?:(?:hey|hi|ok|okay|socio)\b[\s,!.]*)*(?:(?:please|pls|can you|could you|would you)\s+)?"
+    r"(?:research|look\s+(?:up|into|for)|find(?:\s+out)?|search|investigate|check|compare|explore|dig\s+into)\b",
+    re.IGNORECASE,
+)
+
+
+def working_reaction(text: str, is_action: bool) -> str:
+    """👀 while Socio looks something up or answers a question, 👨‍💻 while it does something."""
+
+    return REACTION_LOOKING if LOOKUP_REQUEST.match(text or "") or not is_action else REACTION_WORKING
+
+
+def acknowledgement_reaction(text: str) -> str:
+    """The reaction to an "Okay" / "Thanks" / "Bye" message: the one that fits it (first match wins)."""
+
+    lowered = (text or "").lower()
+    rules = [
+        (r"\b(?:good night|gn)\b", "😴"),
+        (rf"\b(?:{_BYE})\b", "🫡"),
+        (rf"\b(?:{_THANKS})\b|🙏", "🙏"),
+        (r"❤", "❤"),
+        (r"\bperfect\b|👌", "👌"),
+        (r"\b(?:great|awesome|nice)\b|👏", "🔥"),
+        (r"\bcool\b", "🆒"),
+        (r"\b(?:h+m+|m+h*m+)\b", "🤔"),
+    ]
+    for pattern, emoji in rules:
+        if re.search(pattern, lowered):
+            return emoji
+    return "👍"
 
 
 def is_acknowledgement(text: str, last_reply: str = "") -> bool:
@@ -357,7 +397,7 @@ def routine_header(title: str) -> str:
 
 
 def schedules_html(jobs: list[dict], describe, next_run) -> tuple[str, list]:
-    """The /schedules message: one line per active routine and one Cancel button each (no ids shown)."""
+    """The /routines message: one line per active routine and one Cancel button each (no ids shown)."""
 
     if not jobs:
         return NO_ROUTINES_HTML, []

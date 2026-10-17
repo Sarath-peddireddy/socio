@@ -117,7 +117,7 @@ daily at 09:00 AM IST.", and every morning a **Scheduled Briefing** arrives with
 | Once      | "on 1 Nov at 9 AM"      | a single run on that date               |
 
 - Times are IST unless you name another timezone; any IANA zone works, daylight saving included.
-- `/schedules` lists your routines with a **Cancel** button each (or just ask "stop the AI news routine").
+- `/routines` lists your routines with a **Cancel** button each (or just ask "stop the AI news routine").
 - Each run is an ordinary request: it can read your mail, calendar, Drive, and the news, but anything it wants
   to change (an email, an event, a sheet row) still arrives as a card and waits for your tap.
 - News comes from public tech sites (Hacker News, TechCrunch, The Verge, Ars Technica, MIT Technology Review, or
@@ -349,6 +349,11 @@ cancel routines, so a job can never schedule itself in a loop. The same loop run
 The inbox is never on a timer: it is checked when you ask (`/check`), and that check also refreshes the Google
 Tasks due-date tracker.
 
+**Replies survive network drops.** Each exchange is saved to the conversation before Socio replies, so a reply
+that fails to send never makes the next question lose its context. A reply that never reached Telegram (no DNS,
+no connection) is held and sent, in order, as soon as Telegram answers again; one that may already have
+arrived (a read timeout) is never sent twice. Unsent approval cards were already re-sent on the next poll.
+
 **Time and budgets.** One frozen "today" per request, copied into every worker thread. Model calls time out at
 60 s, Google calls at 30 s, and each worker has a 180 s budget (`AGENT_WORKER_TIMEOUT`); a timed-out worker
 fails alone and its siblings finish.
@@ -367,9 +372,10 @@ strings clipped before export, and an off or unreachable Langfuse never stops So
 
 ### Testing
 
-45 offline test suites (Google APIs mocked, scripted models, no side effects) cover approvals, stale checks,
-unknown outcomes, idempotency, router failover, retention, rule conflicts, booking times, Meet links, and the
-Telegram cards. Separate live evaluations run the real models against faked Google services.
+48 offline test suites (Google APIs mocked, scripted models, no side effects) cover approvals, stale checks,
+unknown outcomes, idempotency, router failover, retention, rule conflicts, booking times, Meet links, the
+Telegram cards, commands and reactions, on-request inbox checks (the real bot start with a simulated clock), and
+replies lost to a network drop. Separate live evaluations run the real models against faked Google services.
 
 ---
 
@@ -420,19 +426,31 @@ all gitignored. If the bot reports **Google Sign-In Needed**, run `--google-logi
 
 | Command                                                          | What it does                                                 |
 |------------------------------------------------------------------|--------------------------------------------------------------|
-| `/check` (or `/run`, or just "check my emails")                  | Check the inbox now, then refresh Google Tasks               |
+| `/check` (or just say "check my emails")                         | Check the inbox now, then refresh Google Tasks               |
 | `/dryrun`                                                        | Check the inbox without sending, booking, or saving anything |
 | `/status`                                                        | Outcomes, open approvals, recent failures                    |
 | `/approvals`                                                     | Open approval cards                                          |
-| `/new` (or `/reset`, `/clear`)                                   | Forget the conversation so far                               |
+| `/new`                                                           | Start a fresh conversation (forget the chat so far)          |
 | `/remember TEXT`, `/memories`, `/forget ID`, `/forget_lesson ID` | Rules and lessons                                            |
 | `/save_skill NAME`, `/skills`, `/forget_skill NAME`              | Saved recipes                                                |
-| `/schedules` (or `/routines`)                                    | Your routines, with Cancel buttons                           |
-| `/help` (or `/start`)                                            | Overview of what Socio does                                  |
+| `/routines`                                                      | Your routines, with Cancel buttons                           |
+| `/help`                                                          | Overview of what Socio does                                  |
 
-Typing `/` in the chat shows every command. The inbox is checked only when you ask. Each approval
-arrives as one card with its buttons, named by subject, name, or time (never internal numbers). A message that
-only closes the chat ("Okay", "Thanks") gets a thumbs-up reaction, not a reply.
+Typing `/` in the chat shows every command, one name per job. The inbox is checked only when you ask. Each approval
+arrives as one card with its buttons, named by subject, name, or time (never internal numbers).
+
+**Status on your own message, like WhatsApp.** As soon as Socio picks up a message, it reacts to it, so you can
+see it is working:
+
+| While it works                                        | When it is finished                              |
+|-------------------------------------------------------|--------------------------------------------------|
+| "Eyes": checking the inbox, researching, answering    | "OK hand": done (the answer or the cards are in) |
+| "Technologist": doing something (draft, book, create) | "Thinking face": it has a question for you       |
+| "Writing hand": filling a reply with your answer      | "Shrug": it couldn't (a short message says why)  |
+
+A message that only closes the chat gets a fitting reaction instead of a reply: thanks gets folded hands, bye a
+salute, good night a sleeping face, "okay" a thumbs-up. Telegram lets bots use only its own fixed list of
+reactions, which has no magnifying glass and no waving hand, so "eyes" and "salute" stand in for them.
 
 ---
 

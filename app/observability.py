@@ -303,7 +303,7 @@ def interaction(
 ) -> Iterator[Observation]:
     """
     The root of a trace: one owner message, one email, one routine. Inside another
-    interaction it is a child span (an email handled during /run), or nothing at all
+    interaction it is a child span (an email handled during /check), or nothing at all
     with nest=False (the CLI's owner_command when the bot's trace is already open).
     Texts passed to record_reply() become its output unless one was set.
     """

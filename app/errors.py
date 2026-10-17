@@ -37,7 +37,7 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 CARDS = {
     "google_busy": ("Google Service Busy", "Google services are busy or unreachable right now. Please try again in a few minutes."),
     "system_busy": ("Workspace Busy", "The system is completing another task. Please try again in a moment."),
-    "ai_timeout": ("AI Reasoning Timeout", "The AI model took too long to respond. Tap /run or send the request again."),
+    "ai_timeout": ("AI Reasoning Timeout", "The AI model took too long to respond. Tap /check or send the request again."),
     "ai_quota": ("AI Daily Limit Reached", "The AI model's daily limit is used up. Please try again later."),
     "generic": ("Task Paused", "Unable to complete that action right now. The details have been logged for review."),
     # Retrying never fixes an expired / revoked Google sign-in: say what does (audit H4).
@@ -193,7 +193,7 @@ def user_html(exc: BaseException) -> str:
 
     title, sentence = CARDS[classify(exc)]
     sentence = sentence.replace("python -m app.main --google-login", "<code>python -m app.main --google-login</code>")
-    return f"⚠️ <b>{title}</b>\n{sentence.replace('/run', '<code>/run</code>')}"
+    return f"⚠️ <b>{title}</b>\n{sentence.replace('/check', '<code>/check</code>')}"
 
 
 def plain_message(exc: BaseException) -> str:

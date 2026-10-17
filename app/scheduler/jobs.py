@@ -220,7 +220,7 @@ def create_job(
     at = parse_time_of_day(time_of_day)
 
     if len(store.scheduled_jobs()) >= MAX_ACTIVE_JOBS:
-        raise ValueError(f"You already have {MAX_ACTIVE_JOBS} routines. Cancel one first (/schedules).")
+        raise ValueError(f"You already have {MAX_ACTIVE_JOBS} routines. Cancel one first (/routines).")
 
     weekday = None
     if frequency == "weekly":

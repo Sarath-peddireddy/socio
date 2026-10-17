@@ -9,7 +9,7 @@ sent without its tool responses (providers reject that with HTTP 400).
 
 Stored turns hold plain text only (the owner's instruction and Socio's final reply
 with the cards it showed); raw tool output never goes into history. Turns older
-than HISTORY_HOURS, or archived by /new, /clear, /reset, are not loaded.
+than HISTORY_HOURS, or archived by /new, are not loaded.
 
 Tokens are estimated as characters / 4 (no tokenizer dependency); the estimate is
 used only for the history budget, so it errs on the safe side for English text.

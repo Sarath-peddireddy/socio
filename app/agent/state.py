@@ -1111,7 +1111,7 @@ class AgentStateStore:
             return cursor.rowcount > 0
 
     def archive_conversation_turns(self, chat_id: int) -> int:
-        """Stop loading this chat's earlier turns (/new, /clear, /reset). The rows are kept."""
+        """Stop loading this chat's earlier turns (/new). The rows are kept."""
 
         with self._connect() as conn:
             cursor = conn.execute("UPDATE conversation_turns SET archived = 1 WHERE chat_id = ? AND archived = 0", (chat_id,))

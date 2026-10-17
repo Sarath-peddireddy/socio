@@ -907,7 +907,7 @@ def list_scheduled_tasks() -> dict:
             }
             for job in jobs
         ],
-        "note": "Describe routines by title and time, never by job_id. The owner can also send /schedules.",
+        "note": "Describe routines by title and time, never by job_id. The owner can also send /routines.",
     }
 
 

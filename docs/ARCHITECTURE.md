@@ -128,7 +128,7 @@ contact (email addresses only), and document the chat was last about, taken from
 the agent's tool calls, its proposals, and approved cards. It is added to the
 owner instruction and the planner request as an `<active_context>` block
 (reference only) and ignored after 24 h. Workers never see either: they get only
-their task. `/new`, `/reset`, `/clear` archive the turns and clear the anchor.
+their task. `/new` archives the turns and clears the anchor.
 
 The owner sees each approval request as its own card, so the owner-mode prompt
 (not workers) tells the model not to narrate them and to answer exactly
@@ -137,9 +137,32 @@ The owner sees each approval request as its own card, so the owner-mode prompt
 only the cards (no "I have sent an approval request..." preamble). If the
 model says `CARDS_ONLY` but also did something directly (a Google Task) or a
 tool failed, those are listed instead, so nothing done goes unreported.
-`/start`, `/help`, and capability questions ("what can you do?",
+`/help` and capability questions ("what can you do?",
 `telegram_format.is_capability_question`) get a fixed welcome card without a
-model call.
+model call; so does `/start`, which Telegram sends when the bot is first opened
+(not in the menu). One command name per job (`telegram_format.BOT_COMMANDS`, developer
+request 2026-10-17): the former duplicates `/run`, `/reset`, `/clear`, `/schedules`
+(`RETIRED_COMMANDS`) only answer "That command is now /check" (or /new, /routines),
+and an unknown `/command` gets "I don't know that command" instead of going to the agent.
+
+Status reactions on the owner's own message (developer request 2026-10-17, "like WhatsApp"; `setMessageReaction`,
+one bot reaction per message, each call replaces the last; best-effort like "typing…"). `Bot._status_reactions`
+wraps the work: 👀 (`REACTION_LOOKING`) for `/check`, `/dryrun` and instructions that are lookups
+(`telegram_format.LOOKUP_REQUEST`: research / look up / find / search / check ...) or questions
+(`not supervisor.is_action_request`); 👨‍💻 for other instructions; ✍ while a gap answer fills a reply. Then
+`outcome_reaction`: 🤷 when the result has only PROBLEM parts (or the inbox check itself failed, or an exception:
+the error gateway's card follows as before), 🤔 when it ends with a QUESTION, else 👌. Acknowledgements get
+`acknowledgement_reaction` (thanks 🙏, bye / take care 🫡, good night 😴, perfect 👌, great 🔥, cool 🆒, hmm 🤔,
+❤ ❤, else 👍); bye phrases count as acknowledgements now. Bots may only use Telegram's fixed `ReactionTypeEmoji`
+list: no 🔍 / 👋, so 👀 / 🫡 stand in. `tests/test_reactions.py`.
+
+Replies when Telegram is unreachable (2026-10-17 live bug: a "remember: ..." rule was saved, its "✓ Rule saved"
+failed on a DNS outage, so the turn was never stored and "Is it done?" was answered about the request before).
+`_handle_instruction` now stores the turn and the anchor BEFORE sending. Replies go through `Bot._deliver`: a
+request that certainly never reached Telegram (`_never_reached`: DNS failure, connection refused, connect
+timeout) is held in `pending_messages` (max 20) and sent first on the next poll whose `getUpdates` succeeds,
+in order, up to `MAX_EDIT_TRIES` polls; a read timeout (the reply may have arrived) still raises to the error
+gateway and is never resent. Cards were already safe (unsent cards stay `notified = 0`). `tests/test_lost_reply.py`.
 
 Plain language (developer requirement: the reader is an end user, not a
 developer): the owner/worker prompts (`PLAIN_LANGUAGE`) say to address the
@@ -347,7 +370,7 @@ timezone="Asia/Kolkata", day_of_week, date)`, `list_scheduled_tasks`,
 - **Confirmation:** the reply to a new routine is the tool's own text ("✅ Scheduled! I
   will prepare and send your **X** daily at 09:00 AM IST."), added by
   `supervisor.owner_reply`; the model answers `CARDS_ONLY` when that was all.
-- **Telegram:** `/schedules` (alias `/routines`) lists active routines with one
+- **Telegram:** `/routines` lists active routines with one
   Cancel button each (`unsched:<job_id>`, owner only); the message is redrawn after a
   tap. No ids in the visible text.
 - **News:** `get_news(topic, max_items)` reads public RSS / Atom feeds (Hacker
@@ -603,7 +626,7 @@ text, so `datetime('now', '-N days')` is valid (unlike `scheduled_jobs.next_run_
 - Rate limits: a process-wide sliding window per provider key (`AGENT_LLM_RPM`,
   `AGENT_MISTRAL_RPM`, `AGENT_GROQ_RPM`) attached to the real model, so parallel workers queue
   instead of hitting 429s.
-- Inbox checks on request only (developer decision 2026-10-17): `/check`, `/run`, or a whole message such as
+- Inbox checks on request only (developer decision 2026-10-17): `/check`, or a whole message such as
   "check my emails" / "run inbox sweep" (`telegram_format.is_inbox_check_request`, regex, no model call) ->
   `Bot.check_now`: `process_inbox`, then `tracker.check_tasks` (failures logged only). `AGENT_POLL_MINUTES`
   defaults to 0, so the loop never reads the inbox or Google Tasks on its own; a number > 0 opts back in. The

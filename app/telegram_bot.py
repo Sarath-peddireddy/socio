@@ -7,7 +7,10 @@ Telegram front end for Socio.
   set, the bot only replies with the sender's chat id so it can be configured.
 - Every message is Telegram HTML (parse_mode="HTML", app.telegram_format):
   dynamic values are escaped, the agent's Markdown is converted, never raw.
-- /start, /help, and "what can you do?" get the capabilities card (no model call).
+- /help and "what can you do?" get the capabilities card (no model call); so does /start, which Telegram
+  sends when the bot is first opened (not in the menu). One command name per job: a former duplicate
+  (/run, /reset, /clear, /schedules) gets a one-line pointer to its replacement, and an unknown command
+  is never sent to the agent.
 - Plain messages are instructions for the agent (owner mode); multi-part ones
   are split across worker subagents (app.agent.supervisor).
 - Each approval request is one card with its buttons (Approve / Reject; emails
@@ -27,14 +30,18 @@ Telegram front end for Socio.
   and how the owner decided, so "create a task for this" refers to it. It is
   stored in SQLite (app.memory.context_assembler: whole turns, 2,000-token cap,
   24 h), with the thread / contact / document the chat is about
-  (app.memory.context_anchor), so both survive a restart. /new, /clear, /reset
-  start over.
+  (app.memory.context_anchor), so both survive a restart. /new starts over.
 - /save_skill NAME saves the last successful multi-step instruction as a skill.
 - Routines ("send me the top AI news every day at 9 AM", app.scheduler) are checked once a
-  minute; each result arrives as "⏰ Scheduled Briefing". /schedules lists them with Cancel buttons.
-- The inbox is checked only when the owner asks: /check (or /run), or a message like "check my emails"
+  minute; each result arrives as "⏰ Scheduled Briefing". /routines lists them with Cancel buttons.
+- The inbox is checked only when the owner asks: /check, or a message like "check my emails"
   (developer decision 2026-10-17: Socio never scans the inbox on its own). The same check refreshes the
   Google Tasks tracker. AGENT_POLL_MINUTES > 0 would bring back a timer; the default is 0 (off).
+- Status as reactions on the owner's own message (developer request 2026-10-17, like WhatsApp): 👀 while
+  Socio checks the inbox, researches, or answers a question; 👨‍💻 while it does something; ✍ while it fills
+  a reply with the owner's answer; then 👌 done, 🤔 a question for you, 🤷 couldn't. "Thanks" / "Bye" /
+  "Okay" get a fitting reaction and no reply (🙏 / 🫡 / 👍 ...). Only Telegram's fixed reaction list works
+  for bots: no 🔍 or 👋 (telegram_format.REACTION_*).
 - Every handler runs behind the error gateway (app.errors): details go to
   logs/agent.log, the chat only ever gets a short predefined status card.
 
@@ -48,9 +55,11 @@ import os
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import requests
+import urllib3
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
 from app import observability
@@ -68,7 +77,7 @@ from app.agent.runner import (
     recheck_stale_approval,
 )
 from app.agent.state import AgentStateStore
-from app.agent.supervisor import save_last_plan
+from app.agent.supervisor import ANSWER, DONE, PROBLEM, QUESTION, is_action_request, save_last_plan
 from app.calendar.tools import INDIA_TZ
 from app.errors import MESSAGES as ERROR_MESSAGES, report_failure, scrub, setup_logging
 from app.google_api import GoogleApiUnavailableError
@@ -92,7 +101,14 @@ from app.scheduler.service import TICK_SECONDS, RoutineRun, run_due_jobs
 from app.tasks.tracker import check_tasks
 from app.telegram_format import (
     MAX_MESSAGE_CHARS,
+    REACTION_DONE,
+    REACTION_FAILED,
+    REACTION_LOOKING,
+    REACTION_NEEDS_YOU,
+    REACTION_WRITING,
+    RETIRED_COMMANDS,
     WELCOME_HTML,
+    acknowledgement_reaction,
     approval_card,
     card_text,
     clip_html,
@@ -108,6 +124,7 @@ from app.telegram_format import (
     schedules_html,
     stale_notice,
     strip_html,
+    working_reaction,
 )
 
 
@@ -125,7 +142,6 @@ RULE_CHOICES = {"rule_replace": "replace", "rule_merge": "merge", "rule_both": "
 KEPT_OPEN_TEXT = "👍 Okay, I'll leave it open."
 KEPT_ALL_TEXT = "👍 Okay, I'll leave them as they are."
 DRAFTED_TEXT = "✏️ Saved to Gmail Drafts. Nothing was sent."
-RESET_TEXT = "🧹 <b>Context Reset</b>\nActive conversational memory cleared. Ready for a new task."
 OLD_RULE_BUTTON_TEXT = "That button is no longer used. To add a rule, just tell me, e.g. \"remember: never book calls before noon\"."
 DECISION_WORDS = {"approve": "approved", "reject": "rejected", "draft": "moved to Gmail Drafts (not sent)"}
 # What a Re-check found, by the email's new outcome (any new card arrives right below).
@@ -154,6 +170,41 @@ def _gateway_text(reason: str) -> bool:
     return any((reason or "").startswith(text.removeprefix("⚠️").strip()) for text in ERROR_MESSAGES.values())
 
 
+def _never_reached(exc: BaseException) -> bool:
+    """
+    True when a request certainly never got to Telegram (no DNS answer, connection refused or
+    timed out while connecting), so sending it again cannot make a duplicate.
+    """
+
+    if isinstance(exc, requests.ConnectTimeout):
+        return True
+    if isinstance(exc, requests.ConnectionError) and exc.args:
+        reason = getattr(exc.args[0], "reason", None)
+        return isinstance(reason, (urllib3.exceptions.NewConnectionError, urllib3.exceptions.ConnectTimeoutError))
+    return False
+
+
+def outcome_reaction(result) -> str:
+    """
+    How an instruction ended, as the reaction on the owner's message: 🤷 when it only failed,
+    🤔 when it ends with a question for the owner, otherwise 👌 (answered, done, or cards to decide).
+    """
+
+    kinds = {part.kind for part in (getattr(result, "parts", None) or [])}
+    delivered = bool(getattr(result, "approval_ids", None)) or bool(kinds & {ANSWER, DONE})
+    if PROBLEM in kinds and not delivered:
+        return REACTION_FAILED
+    if QUESTION in kinds:
+        return REACTION_NEEDS_YOU
+    return REACTION_DONE
+
+
+def _check_failed(outcomes) -> bool:
+    """The inbox check itself failed (e.g. Google unreachable), not just one email in it."""
+
+    return any(o.status == "failed" and o.message_id == "-" for o in outcomes or [])
+
+
 def already_text(approval: dict) -> str:
     """What a tap on a card that is no longer open says (plain words, no numbers)."""
 
@@ -166,6 +217,8 @@ BACKLOG_MINUTES = 10
 SHORT_CARD_CHARS = 1500
 # A card update lost to a network drop is retried on this many polls before giving up.
 MAX_EDIT_TRIES = 5
+# Replies held while Telegram is unreachable (oldest dropped beyond this).
+MAX_PENDING_MESSAGES = 20
 # Database maintenance (WAL checkpoint): at startup, then once a day.
 MAINTENANCE_SECONDS = 24 * 60 * 60
 
@@ -246,6 +299,8 @@ class Bot:
         self.decisions: list[str] = []
         # Card updates Telegram didn't receive (network drop): retried each poll, newest wins.
         self.pending_edits: dict[tuple, dict] = {}
+        # Replies that never reached Telegram (no DNS / no connection): sent once it answers again.
+        self.pending_messages: list[dict] = []
         # The last card sent, if it is a reply waiting for the owner's answer in chat.
         self.last_gap_card: int | None = None
         # Question messages opened by 💬 Answer -> the card they belong to.
@@ -294,6 +349,45 @@ class Bot:
             params["reply_markup"] = {"inline_keyboard": buttons}
         return self._call_html("sendMessage", params)
 
+    def _deliver(self, text: str) -> None:
+        """
+        A reply to an instruction. If Telegram was never reached (no DNS answer, no connection), the
+        reply is kept and sent as soon as Telegram answers again, in order, instead of being lost.
+        Anything else (a read timeout: it may have arrived) still raises as before, so nothing is
+        ever sent twice.
+        """
+
+        if self.pending_messages:  # keep the order: earlier replies are still waiting
+            self._queue_message(text)
+            return
+        try:
+            self.send(text)
+        except requests.RequestException as exc:
+            if not _never_reached(exc):
+                raise
+            logger.warning("Could not send a reply (%s); sending it when Telegram is reachable again.", type(exc).__name__)
+            self._queue_message(text)
+
+    def _queue_message(self, text: str) -> None:
+        self.pending_messages.append({"text": text, "tries": 0})
+        del self.pending_messages[:-MAX_PENDING_MESSAGES]  # an outage can't grow it without limit
+
+    def _send_pending_messages(self) -> None:
+        """Telegram answered again: send the replies that couldn't go out, oldest first."""
+
+        while self.pending_messages:
+            item = self.pending_messages[0]
+            try:
+                self.send(item["text"])
+            except requests.RequestException as exc:
+                item["tries"] += 1
+                if _never_reached(exc) and item["tries"] < MAX_EDIT_TRIES:
+                    return  # still unreachable: try again on the next poll, order kept
+                logger.warning("Gave up sending a reply after %d tries: %s", item["tries"], type(exc).__name__)
+            except TelegramError as exc:
+                logger.warning("Telegram refused a held reply: %s", exc)
+            self.pending_messages.pop(0)
+
     def notify_approvals(self, resend_open: bool = False) -> int:
         """Send approval requests the owner has not seen yet (or all open ones), one card each."""
 
@@ -338,7 +432,7 @@ class Bot:
 
     # ----- inbox -----------------------------------------------------------------
 
-    def run_inbox(self, dry_run: bool = False, announce: bool = False) -> None:
+    def run_inbox(self, dry_run: bool = False, announce: bool = False) -> list:
         query = os.getenv("AGENT_INBOX_QUERY", DEFAULT_QUERY)
         outcomes = process_inbox(query=query, dry_run=dry_run)
 
@@ -346,7 +440,7 @@ class Bot:
             # Another process (e.g. the CLI) is processing the inbox; the scheduled check stays quiet.
             if announce:
                 self.send(f"⏳ {esc(outcomes[0].reason)}")
-            return
+            return outcomes
 
         # An email with a card is shown by its card alone (developer: never the same thing
         # twice). The rest get one line each, in fixed wording, never the agent's own notes.
@@ -373,21 +467,24 @@ class Bot:
         elif announce:
             waiting = any(o.message_id in carded for o in outcomes)
             self.send(f"{prefix}📬 Inbox checked. " + ("What needs you is in the cards." if waiting else "Nothing needs you right now."))
+        return outcomes
 
-    def check_now(self) -> None:
+    def check_now(self, message: dict | None = None) -> None:
         """
-        The owner asked for an inbox check (/check, /run, "check my emails"): the only way the inbox is
+        The owner asked for an inbox check (/check, "check my emails"): the only way the inbox is
         read unless AGENT_POLL_MINUTES is set. Then the Google Tasks tracker is refreshed too ("Is this
         done?" cards, and the open tasks the agent knows about), quietly: a Tasks problem never hides
-        the inbox result.
+        the inbox result. The owner's message shows 👀 while it runs, then 👌 (or 🤷 if the check failed).
         """
 
-        self.send("📬 Checking the inbox…")
-        self.run_inbox(announce=True)
-        try:
-            check_tasks(self.store)
-        except Exception as exc:
-            report_failure(exc, "telegram.task_check")
+        with self._status_reactions(message, REACTION_LOOKING) as status:
+            self.send("📬 Checking the inbox…")
+            if _check_failed(self.run_inbox(announce=True)):
+                status["emoji"] = REACTION_FAILED
+            try:
+                check_tasks(self.store)
+            except Exception as exc:
+                report_failure(exc, "telegram.task_check")
 
     # ----- incoming updates ------------------------------------------------------
 
@@ -675,14 +772,17 @@ class Bot:
         if text.startswith("/"):
             observability.annotate_root(intent=f"command {command}")
 
-        if command in {"/start", "/help"} or is_capability_question(text):
+        # /start is not in the menu, but Telegram sends it when the bot is first opened (the Start button).
+        if command in {"/help", "/start"} or is_capability_question(text):
             self.send(HELP_TEXT)
-        elif command in {"/check", "/run"} or (not text.startswith("/") and is_inbox_check_request(text)):
+        elif command == "/check" or (not text.startswith("/") and is_inbox_check_request(text)):
             observability.annotate_root(intent="inbox_check")
-            self.check_now()
+            self.check_now(message)
         elif command == "/dryrun":
-            self.send("🧪 Dry run: checking the inbox without sending or changing anything…")
-            self.run_inbox(dry_run=True, announce=True)
+            with self._status_reactions(message, REACTION_LOOKING) as status:
+                self.send("🧪 Dry run: checking the inbox without sending or changing anything…")
+                if _check_failed(self.run_inbox(dry_run=True, announce=True)):
+                    status["emoji"] = REACTION_FAILED
         elif command == "/status":
             self.send(self._status_text())
         elif command == "/approvals":
@@ -691,9 +791,6 @@ class Bot:
         elif command == "/new":
             self.reset_context()
             self.send("Okay, starting fresh.")
-        elif command in {"/clear", "/reset"}:
-            self.reset_context()
-            self.send(RESET_TEXT)
         elif command == "/remember":
             if argument:
                 self._learn(argument, None)
@@ -709,7 +806,7 @@ class Bot:
             self.send(f"Forgot lesson {esc(argument)}." if ok else "Usage: <code>/forget_lesson ID</code> (see /memories).")
         elif command == "/skills":
             self.send(self._skills_text())
-        elif command in {"/schedules", "/routines"}:
+        elif command == "/routines":
             self.send(*self._schedules())
         elif command == "/save_skill":
             self._save_skill(argument)
@@ -719,17 +816,22 @@ class Bot:
             except skill_store.SkillError:
                 ok = False
             self.send(f"Archived skill <b>{esc(argument)}</b> (skills/.archive)." if ok else "Usage: <code>/forget_skill NAME</code> (see /skills).")
-        elif not text.startswith("/") and self._answer_gap(message, text):
+        elif text.startswith("/"):
+            # A former duplicate name points to its replacement; no unknown command goes to the agent.
+            replacement = RETIRED_COMMANDS.get(command.removeprefix("/"))
+            self.send(f"That command is now <code>/{replacement}</code>." if replacement
+                      else "I don't know that command. Send /help to see them all.")
+        elif self._answer_gap(message, text):
             observability.annotate_root(intent="gap_answer")
             pass  # it answered a reply card's question: the filled-in card was sent
-        elif not text.startswith("/") and self._answer_correction(message, text):
+        elif self._answer_correction(message, text):
             observability.annotate_root(intent="correction")
         elif is_acknowledgement(text, self._last_reply()):
             observability.annotate_root(intent="acknowledgement")
-            self._react(message)
+            self._react(message, acknowledgement_reaction(text))
         else:
             observability.annotate_root(intent="instruction")
-            self._run_instruction(text, sent_at(message))
+            self._run_instruction(text, sent_at(message), message=message)
 
     def _ask_for_answer(self, approval_id: int, query: dict) -> None:
         """💬 Answer on a reply card: open Telegram's reply box with the question."""
@@ -774,30 +876,32 @@ class Bot:
         approval = self._gap_card_for(message)
         if not approval:
             return False
-        try:
-            self.api.call("sendChatAction", chat_id=self.owner_chat_id, action="typing")
-        except Exception as exc:
-            logger.info("Could not show typing: %s", exc)
+        with self._status_reactions(message, REACTION_WRITING) as status:
+            try:
+                self.api.call("sendChatAction", chat_id=self.owner_chat_id, action="typing")
+            except Exception as exc:
+                logger.info("Could not show typing: %s", exc)
 
-        payload = approval["payload"]
-        draft = payload.get("body") if approval["type"] == "send_email" else (payload.get("reply") or {}).get("body", "")
-        filled = fill_gaps(draft, payload.get("question", ""), text)
-        if not filled.is_answer:
-            return False  # an instruction sent after the card: handled as usual
+            payload = approval["payload"]
+            draft = payload.get("body") if approval["type"] == "send_email" else (payload.get("reply") or {}).get("body", "")
+            filled = fill_gaps(draft, payload.get("question", ""), text)
+            if not filled.is_answer:
+                status["emoji"] = None  # an instruction sent after the card: it shows its own reaction
+                return False
 
-        new_id = fill_reply(approval["id"], filled.body, filled.still_missing, self.store)
-        if new_id is None:
-            self.send("That reply was already handled, so I left it as it was.")
+            new_id = fill_reply(approval["id"], filled.body, filled.still_missing, self.store)
+            if new_id is None:
+                self.send("That reply was already handled, so I left it as it was.")
+                return True
+            self.last_gap_card = None
+            if approval.get("card_message_id"):
+                old = self.store.get_approval(approval["id"]) or approval
+                self._edit_message(
+                    self.owner_chat_id, approval["card_message_id"],
+                    f"{card_text(old)}\n\n✏️ <i>Filled in with your answer. The updated reply is below.</i>",
+                )
+            self.notify_approvals()
             return True
-        self.last_gap_card = None
-        if approval.get("card_message_id"):
-            old = self.store.get_approval(approval["id"]) or approval
-            self._edit_message(
-                self.owner_chat_id, approval["card_message_id"],
-                f"{card_text(old)}\n\n✏️ <i>Filled in with your answer. The updated reply is below.</i>",
-            )
-        self.notify_approvals()
-        return True
 
     def _answer_correction(self, message: dict, text: str) -> bool:
         """
@@ -831,16 +935,40 @@ class Bot:
         replies = [m.content for m in self.history if isinstance(m, AIMessage)]
         return str(replies[-1]) if replies else ""
 
-    def _react(self, message: dict) -> None:
-        """A 👍 on the owner's "Okay" / "Thanks": no reply, no model call, nothing saved."""
+    def _react(self, message: dict | None, emoji: str) -> None:
+        """
+        Put one reaction on the owner's message (a new one replaces the last). Cosmetic, like
+        "typing…": a network drop here never stops the work.
+        """
 
+        message_id = (message or {}).get("message_id")
+        if message_id is None:
+            return
         try:
             self.api.call(
-                "setMessageReaction", chat_id=self.owner_chat_id, message_id=message["message_id"],
-                reaction=[{"type": "emoji", "emoji": "👍"}],
+                "setMessageReaction", chat_id=self.owner_chat_id, message_id=message_id,
+                reaction=[{"type": "emoji", "emoji": emoji}],
             )
         except Exception as exc:
             logger.info("Could not react to the message: %s", exc)
+
+    @contextmanager
+    def _status_reactions(self, message: dict | None, working: str):
+        """
+        Show on the owner's message that Socio is on it (👀 / 👨‍💻 / ✍), then how it ended: 👌 done, or
+        what the block sets in status["emoji"] (🤔 a question for you, 🤷 couldn't). An error -> 🤷
+        and the error goes on to the error gateway as before.
+        """
+
+        self._react(message, working)
+        status = {"emoji": REACTION_DONE}
+        try:
+            yield status
+        except Exception:
+            self._react(message, REACTION_FAILED)
+            raise
+        if status["emoji"]:
+            self._react(message, status["emoji"])
 
     def set_command_menu(self) -> None:
         """The command suggestions Telegram shows when the owner types "/" (owner chat only)."""
@@ -853,7 +981,13 @@ class Bot:
         except Exception as exc:
             logger.warning("Could not set the command menu: %s", exc)
 
-    def _run_instruction(self, text: str, received_at: datetime | None = None) -> None:
+    def _run_instruction(self, text: str, received_at: datetime | None = None, message: dict | None = None) -> None:
+        """An owner instruction, with its status shown on the owner's message (👀 / 👨‍💻, then 👌 / 🤔 / 🤷)."""
+
+        with self._status_reactions(message, working_reaction(text, is_action_request(text))) as status:
+            status["emoji"] = outcome_reaction(self._handle_instruction(text, received_at))
+
+    def _handle_instruction(self, text: str, received_at: datetime | None = None):
         # "typing…" is cosmetic: a network drop here once cost the whole instruction (the update
         # was already consumed, so the owner's message was silently lost).
         try:
@@ -865,19 +999,9 @@ class Bot:
         kwargs = {"received_at": received_at} if received_at else {}
         result = handle_owner_command(text, history=self.history, context=context, **kwargs)
 
-        # One message per intent (answer / done / problem), then the approval cards, then any
-        # question. Nothing at all when the cards say it all (no "I have sent an approval request").
-        if result.parts:
-            before, after = reply_messages(result.parts)
-        else:
-            before, after = ([md_to_html(result.reply)] if result.reply.strip() else []), []
-        for message in before:
-            self.send(message)
-        if result.approval_ids:
-            self.notify_approvals()
-        for message in after:
-            self.send(message)
-
+        # The turn is saved BEFORE anything is sent: a send that fails must not erase it from the
+        # conversation (2026-10-17: "remember: ..." was saved, its "✓ Rule saved" never arrived
+        # because Telegram was unreachable, so "Is it done?" was answered about the turn before).
         # The context for follow-ups says what each card proposed, not just that cards were sent.
         remembered = result.reply
         cards = [self.store.get_approval(i) for i in result.approval_ids]
@@ -893,6 +1017,20 @@ class Bot:
             if card:
                 entities.update(entities_from_approval(card))
         update_context_anchor(self.owner_chat_id, entities, self.store)
+
+        # One message per intent (answer / done / problem), then the approval cards, then any
+        # question. Nothing at all when the cards say it all (no "I have sent an approval request").
+        if result.parts:
+            before, after = reply_messages(result.parts)
+        else:
+            before, after = ([md_to_html(result.reply)] if result.reply.strip() else []), []
+        for message in before:
+            self._deliver(message)
+        if result.approval_ids:
+            self.notify_approvals()  # a card that can't be sent stays unsent and goes out on a later poll
+        for message in after:
+            self._deliver(message)
+        return result
 
     # ----- scheduled routines --------------------------------------------------------
 
@@ -1040,7 +1178,7 @@ class Bot:
         lines.append("<b>Email outcomes:</b> " + (esc(", ".join(f"{k} {v}" for k, v in sorted(counts.items()))) or "none yet"))
         lines.append(f"<b>Open approval requests:</b> {len(self.store.pending_approvals())} (/approvals to show)")
         lines.append(f"<b>Open tasks I'm keeping an eye on:</b> {len(self.store.tracked_tasks('open'))}")
-        lines.append(f"<b>Scheduled routines:</b> {len(self.store.scheduled_jobs())} (/schedules)")
+        lines.append(f"<b>Scheduled routines:</b> {len(self.store.scheduled_jobs())} (/routines)")
         interrupted = self.store.interrupted_supervisor_runs()
         if interrupted:
             lines.append(f"<b>Instructions stopped by a restart</b> (not re-run): {len(interrupted)}")
@@ -1068,6 +1206,8 @@ class Bot:
             timeout=long_poll_seconds,
             allowed_updates=["message", "callback_query"],
         )
+        if self.pending_messages:  # Telegram is reachable again: replies that couldn't go out first
+            self._send_pending_messages()
         if self.pending_edits:  # Telegram is reachable again: catch up on card updates
             self._retry_card_edits()
 
