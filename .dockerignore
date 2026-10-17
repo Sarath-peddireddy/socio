@@ -1,0 +1,45 @@
+# Only app/, scripts/ and requirements.txt go into the image. Everything personal stays out:
+# secrets and tokens are mounted at run time, never copied.
+
+# Version control, environments, caches
+.git
+.gitignore
+.venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache/
+.cache/
+.vscode/
+.claude/
+
+# Secrets and Google tokens
+.env
+.env.*
+credentials.json
+token.json
+token.pickle
+calendar_token.json
+drive_token.json
+workspace_token.json
+
+# Local state, logs, personal files (** = in any folder: the database lives in app/)
+**/*.sqlite3
+**/*.sqlite3-*
+**/*.log
+logs/
+backups/
+downloads/
+documents/
+skills/
+
+# Tests and local notes
+tests/
+test_*.py
+CLAUDE.md
+HANDOFF.md
+
+# Docker files themselves
+Dockerfile
+docker-compose.yml
+.dockerignore

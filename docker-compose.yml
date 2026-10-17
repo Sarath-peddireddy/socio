@@ -1,0 +1,190 @@
+# Socio in Docker.
+#
+#   docker compose up -d --build        bot + local Langfuse (tracing still only if LANGFUSE_TRACING_ENABLED=true)
+#   docker compose up -d socio-bot      bot only
+#   docker compose logs -f socio-bot    follow the bot's output
+#   docker compose down                 stop everything (volumes, so the database, are kept)
+#
+# Before the first start: sign in to Google on the host (python -m app.main --google-login) so the three token
+# files exist, and stop any bot running outside Docker (Telegram allows one poller per bot token).
+#
+# Langfuse secrets below have local-only defaults; set real ones in .env (see .env.example). Nothing Langfuse
+# runs is reachable from outside this machine: the dashboard is bound to 127.0.0.1, the databases to an
+# internal network, and Langfuse's own usage telemetry is switched off.
+
+x-langfuse-env: &langfuse-env
+  DATABASE_URL: postgresql://langfuse:${LANGFUSE_DB_PASSWORD:-langfuse-local}@langfuse-db:5432/langfuse
+  SALT: ${LANGFUSE_SALT:-socio-local-salt}
+  ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+  NEXTAUTH_URL: http://localhost:3000
+  TELEMETRY_ENABLED: "false"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+  CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+  CLICKHOUSE_USER: clickhouse
+  CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse-local}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  REDIS_HOST: langfuse-redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${LANGFUSE_REDIS_PASSWORD:-redis-local}
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-minio-local-secret}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+
+x-langfuse-depends: &langfuse-depends
+  langfuse-db:
+    condition: service_healthy
+  langfuse-clickhouse:
+    condition: service_healthy
+  langfuse-redis:
+    condition: service_healthy
+  langfuse-minio:
+    condition: service_healthy
+
+services:
+  socio-bot:
+    build: .
+    image: socio-bot:local
+    env_file: .env
+    environment:
+      SOCIO_DATA_DIR: /app/data
+      AGENT_STATE_DB: ""                     # so a path in .env can't point the container elsewhere
+      AGENT_LOG_DIR: /app/data/logs
+      AGENT_MODEL_CACHE: /app/data/fastembed  # the embedding model is downloaded once, into the volume
+      HF_HOME: /app/data/huggingface
+      AGENT_FILES_DIR: /app/documents
+      AGENT_SKILLS_DIR: /app/skills
+      LANGFUSE_BASE_URL: http://langfuse-web:3000  # only used when LANGFUSE_TRACING_ENABLED=true
+      TZ: Asia/Kolkata
+    volumes:
+      - socio_data:/app/data
+      # Google sign-in: the client file read-only, the tokens writable so refreshes are saved.
+      # create_host_path: false -> a missing file is an error, not an empty folder created in its place.
+      - { type: bind, source: ./credentials.json, target: /app/credentials.json, read_only: true, bind: { create_host_path: false } }
+      - { type: bind, source: ./token.json, target: /app/token.json, bind: { create_host_path: false } }
+      - { type: bind, source: ./calendar_token.json, target: /app/calendar_token.json, bind: { create_host_path: false } }
+      - { type: bind, source: ./workspace_token.json, target: /app/workspace_token.json, bind: { create_host_path: false } }
+      - ./documents:/app/documents:ro
+      - ./skills:/app/skills
+    tmpfs:
+      - /tmp
+      - /app/downloads:uid=1000,gid=1000
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    stop_signal: SIGINT        # the bot stops cleanly on Ctrl+C (SIGINT), not on Docker's default SIGTERM
+    stop_grace_period: 60s
+    restart: unless-stopped
+    healthcheck:               # the database opens and is migrated (not a check that Telegram is reachable)
+      test: ["CMD", "python", "-c", "import os, sqlite3; p = os.path.join(os.environ['SOCIO_DATA_DIR'], 'agent_state.sqlite3'); c = sqlite3.connect(f'file:{p}?mode=ro', uri=True, timeout=30); assert c.execute('PRAGMA user_version').fetchone()[0] >= 1"]
+      interval: 5m
+      timeout: 40s
+      start_period: 2m
+      retries: 2
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: "3" }
+    networks: [socio-network]
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    depends_on: *langfuse-depends
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-socio-local-nextauth-secret}
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "127.0.0.1:3000:3000"   # dashboard for this machine's browser only
+    restart: unless-stopped
+    networks: [socio-network, langfuse-backend]
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    depends_on: *langfuse-depends
+    environment: *langfuse-env
+    restart: unless-stopped
+    networks: [langfuse-backend]
+
+  langfuse-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD:-langfuse-local}
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    networks: [langfuse-backend]
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse-local}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+    networks: [langfuse-backend]
+
+  langfuse-redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--requirepass", "${LANGFUSE_REDIS_PASSWORD:-redis-local}", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    environment:
+      REDIS_PASSWORD: ${LANGFUSE_REDIS_PASSWORD:-redis-local}
+    restart: unless-stopped
+    networks: [langfuse-backend]
+
+  langfuse-minio:
+    image: cgr.dev/chainguard/minio:latest   # MinIO no longer publishes minio/minio images
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_PASSWORD:-minio-local-secret}
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+    networks: [langfuse-backend]
+
+networks:
+  socio-network:
+    driver: bridge
+  langfuse-backend:
+    driver: bridge
+    internal: true    # Postgres, ClickHouse, Redis, MinIO: no internet, no host ports
+
+volumes:
+  socio_data:
+  langfuse_pgdata:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:

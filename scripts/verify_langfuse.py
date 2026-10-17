@@ -60,20 +60,30 @@ def main() -> int:
     observability.flush()
     print(f"[OK]   Trace {trace_id} sent (flushed)")
 
-    # Read it back: proves the trace was stored, not just sent. Organizations created
-    # since 16 Sep 2026 only have the v2 observations API (GET /api/public/traces answers 410).
+    # Read it back: proves the trace was stored, not just sent. Langfuse Cloud organizations created
+    # since 16 Sep 2026 only have the v2 observations API (GET /api/public/traces answers 410); a
+    # self-hosted Langfuse v3 (the Docker stack) has only the classic trace API (v2 answers 404).
     expected = {"verify_langfuse", "verify_generation", "verify_tool"}
     deadline = time.monotonic() + WAIT_SECONDS
     last_error = ""
     observations = []
+    trace = None
+    use_v2 = True
     while time.monotonic() < deadline:
         try:
-            observations = client.api.observations.get_many(trace_id=trace_id, fields="core,basic,io", limit=50).data
+            if use_v2:
+                observations = client.api.observations.get_many(trace_id=trace_id, fields="core,basic,io", limit=50).data
+            else:
+                trace = client.api.trace.get(trace_id)
+                observations = trace.observations
             # Ingestion is eventually consistent: an observation can appear before its output.
             if expected <= {o.name for o in observations} and all(o.output for o in observations if o.name in expected):
                 break
         except Exception as exc:
             last_error = observability.error_text(exc)
+            if use_v2 and "v4 write mode" in str(exc):
+                use_v2 = False   # self-hosted server: switch to the classic trace API
+                continue
         time.sleep(3)   # ingestion is asynchronous: a few seconds
     else:
         print(f"[FAIL] The trace did not show up in Langfuse within {WAIT_SECONDS} s. {last_error}")
@@ -90,7 +100,8 @@ def main() -> int:
     print(f"[{'OK' if nested else 'FAIL'}]   Read back (HTTP 200): {len(observations)} observations, "
           f"types {types}, children nested under the parent: {nested}")
     print(f"[{'OK' if stripped else 'FAIL'}]   Base64 attachment stripped before upload: {stripped}")
-    print(f"       Session: {root.session_id}  User: {root.user_id}")
+    owner = trace or root   # the classic API keeps session and user on the trace, not the observations
+    print(f"       Session: {owner.session_id}  User: {owner.user_id}  (read with the {'v2 observations' if use_v2 else 'classic trace'} API)")
     print(f"       {observability.trace_url(trace_id) or '(trace URL unavailable)'}")
     return 0 if nested and stripped else 1
 

@@ -4,7 +4,8 @@
 
 **Gmail, Calendar, Drive, Docs, Sheets, and Tasks, run from one Telegram chat. Socio does the work; nothing leaves without your tap.**
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](#quick-start)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](#quick-start)
+[![Docker](https://img.shields.io/badge/run-Docker%20Compose-2496ED?logo=docker&logoColor=white)](#run-with-docker)
 [![Telegram](https://img.shields.io/badge/interface-Telegram-26A5E4?logo=telegram&logoColor=white)](#telegram-setup)
 [![LangGraph](https://img.shields.io/badge/agents-LangGraph-1C3C3C)](#architecture)
 [![SQLite WAL](https://img.shields.io/badge/state-SQLite%20WAL-003B57?logo=sqlite&logoColor=white)](#hardened-engine)
@@ -370,7 +371,7 @@ Telegram cards. Separate live evaluations run the real models against faked Goog
 ## Quick start
 
 > [!IMPORTANT]
-> **Requirements:** Python 3.11+, a Google Cloud project with the Gmail, Google Calendar, Google Drive, Google
+> **Requirements:** Python 3.12+ (developed on 3.14), a Google Cloud project with the Gmail, Google Calendar, Google Drive, Google
 > Docs, Google Sheets, and Google Tasks APIs enabled, an OAuth client (`credentials.json`, type "Desktop app"), a
 > Gemini API key (optionally a second and third Gemini key, a Mistral key, and a Groq key for failover and
 > parallel tasks), and a Telegram bot token.
@@ -427,6 +428,67 @@ all gitignored. If the bot reports **Google Sign-In Needed**, run `--google-logi
 Typing `/` in the chat shows every command. The inbox is also checked every `AGENT_POLL_MINUTES`. Each approval
 arrives as one card with its buttons, named by subject, name, or time (never internal numbers). A message that
 only closes the chat ("Okay", "Thanks") gets a thumbs-up reaction, not a reply.
+
+---
+
+## Run with Docker
+
+Optional: everything above keeps working without Docker. The container runs the same Telegram bot, with its
+database on a Docker volume.
+
+> [!IMPORTANT]
+> **Sign in to Google on your computer first** (`python -m app.main --google-login`): the container has no
+> browser, so it uses the token files you already have and saves their refreshes back to them. **Run one bot at a
+> time**: stop the bot outside Docker before starting the container (Telegram allows one bot connection per token).
+
+```bash
+python scripts/docker_import_state.py   # once, if you already used Socio: copies your database into the volume
+python scripts/verify_docker.py --build # build the image and check the setup (does not start the bot)
+```
+
+| Command                                                     | What it does                                                     |
+|-------------------------------------------------------------|------------------------------------------------------------------|
+| `docker compose up -d --build`                              | Start the full stack: the bot and a local Langfuse               |
+| `docker compose up -d socio-bot`                            | Start only the bot (no Langfuse)                                 |
+| `docker compose logs -f socio-bot`                          | Follow the bot's output                                          |
+| `docker compose exec socio-bot python -m app.main --status` | Run any CLI command inside the running container                 |
+| `docker compose down`                                       | Stop everything cleanly; the database and Langfuse data are kept |
+
+<details>
+<summary><b>What the container does</b></summary>
+
+| Item              | How                                                                                                                                                              |
+|-------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Image             | `python:3.14-slim`, two-stage build (compilers only in the build stage)                                                                                          |
+| User              | `appuser` (UID 1000), never root; the code is read-only, the root filesystem is read-only, no Linux capabilities                                                 |
+| Database and logs | Named volume `socio_data` at `/app/data` (`SOCIO_DATA_DIR`): the SQLite database in WAL mode, `logs/agent.log`, the embedding model                              |
+| Google sign-in    | `credentials.json` mounted read-only; `token.json`, `calendar_token.json`, `workspace_token.json` mounted writable so token refreshes are saved on your computer |
+| Your files        | `documents/` mounted read-only, `skills/` writable (`/save_skill`)                                                                                               |
+| Stopping          | Sends Ctrl+C (SIGINT), the bot's own clean shutdown, and waits up to 60 seconds                                                                                  |
+| Health            | Every 5 minutes the container checks that the database opens (not that Telegram is reachable)                                                                    |
+
+`docker compose down` keeps the volumes. `docker compose down -v` deletes them, including Socio's database:
+rules, routines, open cards, and the record of emails already handled.
+
+</details>
+
+<details>
+<summary><b>Local Langfuse in the same stack</b></summary>
+
+`docker compose up -d --build` also starts a self-hosted Langfuse v3 (web, worker, Postgres, ClickHouse, Redis,
+MinIO). It needs about 4 GB of memory for Docker. Tracing stays **off** until you turn it on:
+
+1. Open http://localhost:3000 (only reachable from this computer), sign up, create a project, and copy its keys.
+2. In `.env`: `LANGFUSE_TRACING_ENABLED=true`, `LANGFUSE_PUBLIC_KEY=pk-lf-...`, `LANGFUSE_SECRET_KEY=sk-lf-...`.
+   The container always sends traces to the local Langfuse (`http://langfuse-web:3000`), whatever
+   `LANGFUSE_BASE_URL` says.
+3. `docker compose up -d socio-bot` to restart the bot with the new settings.
+
+Langfuse's databases sit on an internal Docker network with no ports and no internet access, and Langfuse's own
+usage telemetry is switched off. Its secrets have local-only defaults; set your own `LANGFUSE_*` values in `.env`
+before the first start (listed in `.env.example`).
+
+</details>
 
 ---
 
@@ -507,17 +569,9 @@ All settings live in `.env` (copy [`.env.example`](.env.example)). Never commit 
 <details>
 <summary><b>Local Langfuse (optional)</b></summary>
 
-Socio does not ship a Docker setup. If you want traces without sending data to a cloud service, run Langfuse's
-own self-hosted stack on your machine (needs Docker), following
-[Langfuse's self-hosting guide](https://langfuse.com/self-hosting):
-
-```bash
-git clone https://github.com/langfuse/langfuse.git
-cd langfuse
-docker compose up -d              # Langfuse UI on http://localhost:3000
-```
-
-Create a project in the local UI, copy its keys, then in Socio's `.env`:
+Socio's `docker-compose.yml` includes a local Langfuse (see [Run with Docker](#run-with-docker)). To trace a bot
+running *outside* Docker into it, start only Langfuse (`docker compose up -d langfuse-web langfuse-worker`), create a project at
+http://localhost:3000, copy its keys, then in Socio's `.env`:
 
 ```bash
 LANGFUSE_TRACING_ENABLED=true

@@ -8,7 +8,21 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "agent_state.sqlite3"
+DB_FILENAME = "agent_state.sqlite3"
+DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / DB_FILENAME
+
+
+def default_db_path() -> Path:
+    """
+    Where the database lives when no path is given: AGENT_STATE_DB (a full file path) wins, then
+    SOCIO_DATA_DIR (a folder, set in Docker to the data volume), else app/ as before.
+    """
+
+    explicit = os.getenv("AGENT_STATE_DB", "").strip()
+    if explicit:
+        return Path(explicit)
+    data_dir = os.getenv("SOCIO_DATA_DIR", "").strip()
+    return Path(data_dir) / DB_FILENAME if data_dir else DEFAULT_DB_PATH
 
 # Final outcomes: a message with one of these statuses is never processed again.
 HANDLED_STATUSES = (
@@ -41,7 +55,7 @@ class AgentStateStore:
     """Persist agent progress so a restarted run does not repeat completed work."""
 
     def __init__(self, db_path: str | Path | None = None):
-        self.db_path = Path(db_path or os.getenv("AGENT_STATE_DB") or DEFAULT_DB_PATH)
+        self.db_path = Path(db_path or default_db_path())
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
