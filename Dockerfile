@@ -24,7 +24,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH" \
     SOCIO_DATA_DIR=/app/data \
-    TZ=Asia/Kolkata
+    TZ=Asia/Kolkata \
+    ORT_DISABLE_TELEMETRY=1
 
 # sqlite3 and curl are for inspecting the database and the network from a shell in the container.
 RUN apt-get update \

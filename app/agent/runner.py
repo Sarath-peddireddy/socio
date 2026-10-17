@@ -458,7 +458,7 @@ def _process_inbox(store: AgentStateStore, query: str, max_messages: int, dry_ru
             if not dry_run:
                 store.add_failure("process_inbox", str(exc), message_id=message_id)
                 store.abort_attempt(message_id, reason=str(exc))
-            retry = "" if dry_run else " I'll retry this email on the next inbox check."
+            retry = "" if dry_run else " I'll retry this email the next time the inbox is checked."
             outcomes.append(MessageOutcome(message_id, thread_id, status="failed", reason=plain_message(exc) + retry))
             break
         except Exception as exc:

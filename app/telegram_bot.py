@@ -32,7 +32,9 @@ Telegram front end for Socio.
 - /save_skill NAME saves the last successful multi-step instruction as a skill.
 - Routines ("send me the top AI news every day at 9 AM", app.scheduler) are checked once a
   minute; each result arrives as "⏰ Scheduled Briefing". /schedules lists them with Cancel buttons.
-- The inbox is processed every AGENT_POLL_MINUTES (default 10, 0 = off).
+- The inbox is checked only when the owner asks: /check (or /run), or a message like "check my emails"
+  (developer decision 2026-10-17: Socio never scans the inbox on its own). The same check refreshes the
+  Google Tasks tracker. AGENT_POLL_MINUTES > 0 would bring back a timer; the default is 0 (off).
 - Every handler runs behind the error gateway (app.errors): details go to
   logs/agent.log, the chat only ever gets a short predefined status card.
 
@@ -97,6 +99,7 @@ from app.telegram_format import (
     esc,
     is_acknowledgement,
     is_capability_question,
+    is_inbox_check_request,
     md_to_html,
     menu_commands,
     reply_messages,
@@ -131,13 +134,13 @@ RECHECK_OUTCOMES = {
     "no_action": "🔄 Re-checked: nothing needs doing in this conversation now.",
     "needs_review": "🔄 Re-checked: this one needs you. Anything I prepared is below or in Gmail Drafts.",
     "needs_attention": "🔄 Re-checked, but something didn't go through. Please look at it in Gmail.",
-    "failed": "🔄 Re-checked, but I couldn't finish. I'll try again on the next inbox check.",
+    "failed": "🔄 Re-checked, but I couldn't finish. I'll try again the next time you ask me to check the inbox.",
 }
 # Shown the instant a card's button is tapped (toast, and on the card until the result).
 WORKING_TOAST = {"approve": "Working on it…", "draft": "Saving it to Gmail Drafts…", "reject": "Rejected."}
 # Inbox summary lines for emails that got no card (fixed wording; never the agent's own notes).
 INBOX_NOTES = {
-    "failed": "I couldn't finish this one. I'll try again on the next check.",
+    "failed": "I couldn't finish this one. I'll try again the next time you ask me to check the inbox.",
     "failed_permanently": "I tried 3 times and couldn't finish it. Please handle it in Gmail.",
     "needs_attention": "Something didn't go through. Please check it in Gmail.",
     "needs_review": "This one needs you. Please look at it in Gmail.",
@@ -229,7 +232,7 @@ def _trace_metadata(message: dict) -> dict:
 
 
 class Bot:
-    def __init__(self, api, owner_chat_id: int | None, poll_minutes: float = 10, store: AgentStateStore | None = None):
+    def __init__(self, api, owner_chat_id: int | None, poll_minutes: float = 0, store: AgentStateStore | None = None):
         self.api = api
         self.owner_chat_id = owner_chat_id
         self.poll_seconds = max(0.0, poll_minutes) * 60
@@ -370,6 +373,21 @@ class Bot:
         elif announce:
             waiting = any(o.message_id in carded for o in outcomes)
             self.send(f"{prefix}📬 Inbox checked. " + ("What needs you is in the cards." if waiting else "Nothing needs you right now."))
+
+    def check_now(self) -> None:
+        """
+        The owner asked for an inbox check (/check, /run, "check my emails"): the only way the inbox is
+        read unless AGENT_POLL_MINUTES is set. Then the Google Tasks tracker is refreshed too ("Is this
+        done?" cards, and the open tasks the agent knows about), quietly: a Tasks problem never hides
+        the inbox result.
+        """
+
+        self.send("📬 Checking the inbox…")
+        self.run_inbox(announce=True)
+        try:
+            check_tasks(self.store)
+        except Exception as exc:
+            report_failure(exc, "telegram.task_check")
 
     # ----- incoming updates ------------------------------------------------------
 
@@ -659,9 +677,9 @@ class Bot:
 
         if command in {"/start", "/help"} or is_capability_question(text):
             self.send(HELP_TEXT)
-        elif command == "/run":
-            self.send("📬 Checking the inbox…")
-            self.run_inbox(announce=True)
+        elif command in {"/check", "/run"} or (not text.startswith("/") and is_inbox_check_request(text)):
+            observability.annotate_root(intent="inbox_check")
+            self.check_now()
         elif command == "/dryrun":
             self.send("🧪 Dry run: checking the inbox without sending or changing anything…")
             self.run_inbox(dry_run=True, announce=True)
@@ -1062,8 +1080,9 @@ class Bot:
                 self._report_error(report_failure(exc, "telegram.update", html=True, update_id=update.get("update_id"), kind=kind))
 
         if self.owner_chat_id is not None:
-            # Routines first, so a 9:00 briefing is not held up by an inbox check. Runs even
-            # when inbox checks are off (AGENT_POLL_MINUTES=0).
+            # Routines the owner scheduled (an explicit instruction) are checked every minute,
+            # whether or not an inbox timer is set. The inbox and task checks below run only with
+            # AGENT_POLL_MINUTES > 0 (default 0: on request only, see check_now).
             if time.monotonic() >= self.next_routine_check:
                 self.next_routine_check = time.monotonic() + TICK_SECONDS
                 try:
@@ -1183,8 +1202,9 @@ def main() -> int:
     if owner_chat_id is None:
         print("TELEGRAM_OWNER_CHAT_ID is not set: setup mode. Send any message to your bot to get your chat id.")
 
-    poll_minutes = float(os.getenv("AGENT_POLL_MINUTES", "10"))
-    print(f"Bot running. Inbox check every {poll_minutes:g} min (0 = off). Press Ctrl+C to stop.")
+    poll_minutes = max(0.0, float(os.getenv("AGENT_POLL_MINUTES", "0") or 0))
+    checks = f"every {poll_minutes:g} min (AGENT_POLL_MINUTES)" if poll_minutes else "only when you ask (/check)"
+    print(f"Bot running. Inbox checks: {checks}. Press Ctrl+C to stop.")
 
     try:
         Bot(TelegramAPI(token), owner_chat_id, poll_minutes).run_forever()

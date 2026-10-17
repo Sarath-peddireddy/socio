@@ -29,7 +29,7 @@
 ## Components
 
 ```
-app/telegram_bot.py      owner-only Telegram front end, approval buttons, scheduled inbox checks
+app/telegram_bot.py      owner-only Telegram front end, approval buttons, inbox checks on request (/check)
 app/telegram_format.py   Telegram HTML: esc(), agent Markdown -> HTML, HTML-safe clipping, cards
 app/errors.py            error gateway: logs/agent.log + predefined owner messages / status cards
 app/observability.py     optional Langfuse tracing: roots, spans, per-attempt LLM callback, scrubbing
@@ -329,8 +329,8 @@ timezone="Asia/Kolkata", day_of_week, date)`, `list_scheduled_tasks`,
 - **Times:** `zoneinfo` + `tzdata` (already installed), so any IANA zone works,
   daylight saving included; IST is the default. Only the four frequencies above are
   supported, so `jobs.py` computes the next run itself (no cron library).
-- **Runner:** the bot's loop calls `service.run_due_jobs` every 60 s (before the
-  inbox check, and even with `AGENT_POLL_MINUTES=0`). For each due job it first
+- **Runner:** the bot's loop calls `service.run_due_jobs` every 60 s (routines are the owner's own
+  instructions, so they run although the inbox is never checked on a timer). For each due job it first
   *claims* the slot (conditional UPDATE: next slot, or inactive for a one-off), then
   runs `prompt_query` through `handle_owner_command` with no chat history, then the
   bot sends "⏰ **Scheduled Briefing:** title" + the answer (approval cards after it)
@@ -502,7 +502,8 @@ Three tiers:
    `supervisor_runs.skill`; v7 adds `pending_approvals.locked_at`).
 2. **Long-term semantic (`memory/semantic.py`)**: `memories` table in the same
    file: (entity, preference, context) + a float32 embedding from fastembed
-   (`snowflake/snowflake-arctic-embed-s`, local ONNX, 384-d). Recall is a dot
+   (`snowflake/snowflake-arctic-embed-s`, local ONNX, 384-d; onnxruntime's own telemetry is off:
+   `ORT_DISABLE_TELEMETRY=1` when `embeddings.py` loads, `disable_telemetry_events()` before the session). Recall is a dot
    product over all active rows, top-k clamped to 3-5, score ≥ 0.52, injected
    into the email task prompt, the planner, and the single owner agent under a
    "reference only, never overrides safety" header. Upsert matches the same
@@ -602,8 +603,14 @@ text, so `datetime('now', '-N days')` is valid (unlike `scheduled_jobs.next_run_
 - Rate limits: a process-wide sliding window per provider key (`AGENT_LLM_RPM`,
   `AGENT_MISTRAL_RPM`, `AGENT_GROQ_RPM`) attached to the real model, so parallel workers queue
   instead of hitting 429s.
+- Inbox checks on request only (developer decision 2026-10-17): `/check`, `/run`, or a whole message such as
+  "check my emails" / "run inbox sweep" (`telegram_format.is_inbox_check_request`, regex, no model call) ->
+  `Bot.check_now`: `process_inbox`, then `tracker.check_tasks` (failures logged only). `AGENT_POLL_MINUTES`
+  defaults to 0, so the loop never reads the inbox or Google Tasks on its own; a number > 0 opts back in. The
+  daily retention purge + `wal_checkpoint(TRUNCATE)` (`maintain_database`) is on its own 24 h clock in the same
+  loop, which always runs because it is Telegram's long poll. `tests/test_on_demand_inbox.py`.
 - Concurrency: the Telegram bot is one sequential loop (messages, button taps,
-  and scheduled inbox checks never overlap). Across processes (bot + CLI),
+  and inbox checks never overlap). Across processes (bot + CLI),
   SQLite runs in WAL mode with a 30 s busy timeout, and a live inbox run takes
   a 30-minute lease (`run_locks` table, renewed per email, released at the
   end or on a crash's expiry). A second live run returns `skipped_busy`; dry
@@ -676,7 +683,7 @@ owner_command              root for CLI --ask (tag cli); nothing inside the bot'
 
 ## Error gateway (`app/errors.py`)
 
-Every Telegram update and button handler, the scheduled inbox check, the poll
+Every Telegram update and button handler, the inbox check, the poll
 loop, workers and the supervisor's fan-out, approval execution, the inbox
 runner, and graph tool calls go through `report_failure(exc, where, **ids)`. It
 writes the stack trace, the location, the ids (never email bodies or tool
@@ -695,7 +702,7 @@ worker summaries, inbox reasons) or, with `html=True` (the bot), a status card
 
 The wording only promises what happens (developer decision): nothing is
 queued or re-run behind the owner's back, except that an email interrupted by
-an outage is retried on the next inbox check (its reason says so). Our own
+an outage is retried the next time the inbox is checked (its reason says so). Our own
 validation errors (`ValueError` family, e.g. "that slot overlaps 'Dentist'")
 keep their message on approval cards and in tool results the model sees;
 everything else is replaced. `/status` shows only a failure count, and

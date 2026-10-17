@@ -42,7 +42,7 @@ EXPANDABLE_AFTER = 600  # longer quotes start collapsed
 # Every command, in menu order: (command, argument shown on /help, short description).
 # The /help card and Telegram's "/" suggestion menu (setMyCommands) both come from this list.
 BOT_COMMANDS = [
-    ("run", "", "Trigger immediate inbox check"),
+    ("check", "", "Check the inbox now (I never check it on my own)"),
     ("status", "", "What's waiting for you and how Socio is doing"),
     ("approvals", "", "Review pending decision cards"),
     ("memories", "", "View your saved rules and standing preferences"),
@@ -59,7 +59,7 @@ BOT_COMMANDS = [
     ("help", "", "Show what I can do and these commands"),
 ]
 # Other names for the same command: shown next to it on /help, and in the "/" menu.
-COMMAND_ALIASES = {"schedules": ["routines"], "reset": ["clear"], "help": ["start"]}
+COMMAND_ALIASES = {"check": ["run"], "schedules": ["routines"], "reset": ["clear"], "help": ["start"]}
 
 
 def commands_html() -> str:
@@ -90,7 +90,7 @@ I triage your inbox, coordinate your calendar, and manage your documents with st
 ⚡ <b>Core Capabilities:</b>
 
 📬 <b>Email Triage &amp; Drafting</b>
-• Scans new threads in the background.
+• Checks new threads when you ask: <code>/check</code> or "check my emails".
 • Filters noise, newsletters, and automated no-replies.
 • Prepares professional context-aware replies for your 1-tap review.
 
@@ -134,6 +134,28 @@ CAPABILITY_QUESTION = re.compile(
 
 def is_capability_question(text: str) -> bool:
     return bool(CAPABILITY_QUESTION.match(text or ""))
+
+
+# "check my emails", "run inbox sweep", "scan the inbox now", "any new emails?", "mail check karo": the whole
+# message asks for an inbox check (the inbox is only checked on request, developer decision 2026-10-17). A
+# request with more in it ("check any email from Priya waiting for a reply") stays an instruction for the agent.
+_MAILBOX = r"(?:inbox|e-?mails?|mails?|gmail|mailbox)"
+INBOX_CHECK_REQUEST = re.compile(
+    r"^\s*(?:(?:hi|hello|hey|ok|okay)\b[\s,!.]*)?(?:socio\b[\s,!.]*)?"
+    r"(?:(?:please|pls|can you|could you|would you)\s+)?"
+    rf"(?:(?:check|scan|sweep|process|run)\s+(?:my\s+|the\s+)?{_MAILBOX}(?:\s+(?:sweep|check))?"
+    r"|run\s+(?:an?\s+|the\s+)?(?:inbox|e-?mail|mail)\s+(?:sweep|check)"
+    r"|(?:inbox|e-?mail|mail)\s+(?:sweep|check)"
+    r"|(?:any|got any)\s+new\s+(?:e-?mails?|mails?)"
+    r"|(?:inbox|e-?mail|mails?)\s+check\s+karo)"
+    r"(?:\s+(?:now|please|pls|for me|right now))*"
+    r"[\s?!.]*$",
+    re.IGNORECASE,
+)
+
+
+def is_inbox_check_request(text: str) -> bool:
+    return bool(INBOX_CHECK_REQUEST.match(text or ""))
 
 
 # A message that only closes the conversation ("Okay", "Thanks!", "hmm", "ok cool 👍"):

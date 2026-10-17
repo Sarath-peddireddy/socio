@@ -37,6 +37,9 @@ once. If anything changed since the card was made, Socio stops and tells him bef
 
 ### From your inbox
 
+Socio reads your inbox **only when you ask**: `/check`, or a message like *"check my emails"*. It never wakes up
+on its own to scan it.
+
 | Incoming email                                                              | What Socio does                                                                                                                                                                                                                            |
 |-----------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | "Can we schedule a 30-min interview?"                                       | Proposes the exact time they asked for if you're free (otherwise the earliest free slot, weekdays 11 AM–4 PM IST). On approval it books the meeting with the sender invited and a Google Meet link, and replies with the time and the link |
@@ -215,7 +218,8 @@ merged version, and offers **Replace Old Rule**, **Merge into One**, **Keep Both
   ends quietly ("Proposal rejected. No changes were made."). Tell it a rule in chat ("remember: I never take calls
   before noon") or use `/remember`; a one-off note ("I'm busy today") is kept for 24 hours only. See what it knows
   with `/memories`, remove something with `/forget`. Memories are embedded with a small local model and never
-  leave your machine, and they are never stored in your Docs or Sheets.
+  leave your machine (the ONNX runtime's own usage telemetry is switched off), and they are never stored in your
+  Docs or Sheets.
 - **Contradicting rules** become a Rule Conflict card instead of being saved (see Arjun's day above).
 - **Corrections.** Reply to a rejected card with what was wrong ("it should have been one email to both") and
   Socio keeps it as a lesson for similar requests (the two newest relevant ones). Listed in `/memories`; remove
@@ -341,8 +345,9 @@ timezone, and its next run time in UTC. The bot checks for due jobs every 60 sec
 library: the next run is computed with Python's `zoneinfo`. Each run first *claims* its slot with one
 conditional `UPDATE`, so a crash, a restart, or a second process can never run the same slot twice, and a failed
 run is not retried behind your back (the next slot runs normally). While a routine runs it cannot create or
-cancel routines, so a job can never schedule itself in a loop. The same loop also runs the inbox check every
-`AGENT_POLL_MINUTES`, the daily database cleanup, and the Google Tasks due-date check.
+cancel routines, so a job can never schedule itself in a loop. The same loop runs the daily database cleanup.
+The inbox is never on a timer: it is checked when you ask (`/check`), and that check also refreshes the Google
+Tasks due-date tracker.
 
 **Time and budgets.** One frozen "today" per request, copied into every worker thread. Model calls time out at
 60 s, Google calls at 30 s, and each worker has a 180 s budget (`AGENT_WORKER_TIMEOUT`); a timed-out worker
@@ -415,7 +420,7 @@ all gitignored. If the bot reports **Google Sign-In Needed**, run `--google-logi
 
 | Command                                                          | What it does                                                 |
 |------------------------------------------------------------------|--------------------------------------------------------------|
-| `/run`                                                           | Check the inbox now                                          |
+| `/check` (or `/run`, or just "check my emails")                  | Check the inbox now, then refresh Google Tasks               |
 | `/dryrun`                                                        | Check the inbox without sending, booking, or saving anything |
 | `/status`                                                        | Outcomes, open approvals, recent failures                    |
 | `/approvals`                                                     | Open approval cards                                          |
@@ -425,7 +430,7 @@ all gitignored. If the bot reports **Google Sign-In Needed**, run `--google-logi
 | `/schedules` (or `/routines`)                                    | Your routines, with Cancel buttons                           |
 | `/help` (or `/start`)                                            | Overview of what Socio does                                  |
 
-Typing `/` in the chat shows every command. The inbox is also checked every `AGENT_POLL_MINUTES`. Each approval
+Typing `/` in the chat shows every command. The inbox is checked only when you ask. Each approval
 arrives as one card with its buttons, named by subject, name, or time (never internal numbers). A message that
 only closes the chat ("Okay", "Thanks") gets a thumbs-up reaction, not a reply.
 
@@ -510,7 +515,7 @@ All settings live in `.env` (copy [`.env.example`](.env.example)). Never commit 
 | `AGENT_OWNER_NAME`                                                | Name used to sign emails                                                                                                                                          |
 | `TELEGRAM_BOT_TOKEN`                                              | Bot token from @BotFather                                                                                                                                         |
 | `TELEGRAM_OWNER_CHAT_ID`                                          | The only chat allowed to use the bot                                                                                                                              |
-| `AGENT_POLL_MINUTES`                                              | Inbox check interval for the bot (0 = off)                                                                                                                        |
+| `AGENT_POLL_MINUTES`                                              | Leave at 0 (default): the inbox is checked only when you ask. A number N makes Socio check it on its own every N minutes                                          |
 
 </details>
 

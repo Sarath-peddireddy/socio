@@ -5,6 +5,12 @@ The model (snowflake/snowflake-arctic-embed-s, 384 dimensions, ~130 MB) is
 downloaded once into .cache/fastembed (or AGENT_MODEL_CACHE) and loaded lazily.
 It was chosen over bge-small and all-MiniLM because it alone matched time-of-day
 preferences ("no calls before noon") to requests ("sync at 10am?") in a test set.
+
+onnxruntime's own usage telemetry (Microsoft 1DS, HTTPS uploads on Linux) is switched off twice: the
+ORT_DISABLE_TELEMETRY variable is set when this module loads, before fastembed or onnxruntime can be
+imported through it (with it set, onnxruntime never starts its telemetry client), and
+disable_telemetry_events() runs before the model's session is created, in case something else imported
+onnxruntime first. Developer decision 2026-10-17: no data to Microsoft.
 """
 
 from __future__ import annotations
@@ -14,7 +20,10 @@ import threading
 from pathlib import Path
 from typing import Protocol
 
-import numpy as np
+# Must come before any onnxruntime import (fastembed imports it).
+os.environ["ORT_DISABLE_TELEMETRY"] = "1"
+
+import numpy as np  # noqa: E402
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +45,14 @@ class Embedder(Protocol):
     def embed_query(self, text: str) -> np.ndarray: ...
 
 
+def disable_onnx_telemetry() -> None:
+    """Turn off onnxruntime's telemetry events before any inference session exists."""
+
+    import onnxruntime
+
+    onnxruntime.disable_telemetry_events()
+
+
 def _normalized(vector) -> np.ndarray:
     vector = np.asarray(vector, dtype=np.float32)
     norm = float(np.linalg.norm(vector))
@@ -53,6 +70,7 @@ class FastEmbedder:
 
     def _get_model(self):
         if self._model is None:
+            disable_onnx_telemetry()
             from fastembed import TextEmbedding
 
             self._model = TextEmbedding(self.model_name, cache_dir=str(self.cache_dir))
